@@ -10,16 +10,22 @@
 static Token *cur(Parser *p) {
     return &p->lex->tokens[p->pos];
 }
+static TokenKind cur_kind(Parser *p) { return cur(p)->kind; }
 
+static bool check(Parser *p, TokenKind k) { return cur_kind(p) == k; }
 static Token *peek_at(Parser *p, size_t offset) {
     size_t idx = p->pos + offset;
     if (idx >= p->lex->count) idx = p->lex->count - 1;
     return &p->lex->tokens[idx];
 }
+static bool looks_like_shorthand_for(Parser *p) {
+    return check(p, TK_IDENT) &&
+           peek_at(p, 1)->kind == TK_LBRACKET &&
+           peek_at(p, 2)->kind == TK_IDENT &&
+           peek_at(p, 3)->kind == TK_RBRACKET &&
+           peek_at(p, 4)->kind == TK_GT;
+}
 
-static TokenKind cur_kind(Parser *p) { return cur(p)->kind; }
-
-static bool check(Parser *p, TokenKind k) { return cur_kind(p) == k; }
 
 static Token *advance(Parser *p) {
     Token *t = cur(p);
@@ -945,9 +951,42 @@ Stmt *parse_stmt(Parser *p) {
      * Shorthand for:     expr[ident] > stmt ;
      * Detected after parsing the left expression.
      */
+    /* shorthand for: collection[iter] > body
+     * Must be detected before parse_expr(), otherwise '>' is parsed
+     * as the normal comparison operator. */
+    if (looks_like_shorthand_for(p)) {
+        Expr *obj = parse_postfix(p);
+
+        if (obj->kind == EXPR_SUBSCRIPT &&
+            obj->as.subscript.key->kind == EXPR_IDENT &&
+            check(p, TK_GT)) {
+
+            advance(p);   /* consume > */
+
+            xf_Str *iter = xf_str_retain(obj->as.subscript.key->as.ident.name);
+            Expr *collection = obj->as.subscript.obj;
+            obj->as.subscript.obj = NULL;
+            ast_expr_free(obj);
+
+            sym_push(p->syms, SCOPE_LOOP);
+            sym_declare(p->syms, iter, SYM_VAR, XF_TYPE_VOID, loc);
+            Stmt *body = check(p, TK_LBRACE) ? parse_block(p) : parse_stmt(p);
+            sym_pop(p->syms);
+
+            Stmt *s = ast_for_short(collection, iter, body, loc);
+            xf_str_release(iter);
+            match_tok(p, TK_SEMICOLON);
+            return s;
+        }
+
+        ast_expr_free(obj);
+        parser_error(p, "invalid shorthand for");
+        return NULL;
+    }
+
+    /* shorthand while / normal expr stmt */
     Expr *expr = parse_expr(p);
 
-    /* cond <> body — shorthand while */
     if (match_tok(p, TK_DIAMOND)) {
         Stmt *body = check(p, TK_LBRACE)
                          ? parse_block(p)
@@ -956,29 +995,9 @@ Stmt *parse_stmt(Parser *p) {
         return ast_while_short(expr, body, loc);
     }
 
-    /* collection[iter] > body — shorthand for */
-    if (expr->kind == EXPR_SUBSCRIPT && check(p, TK_GT) &&
-        expr->as.subscript.key->kind == EXPR_IDENT) {
-        advance(p);   /* consume > */
-        xf_Str *iter = xf_str_retain(expr->as.subscript.key->as.ident.name);
-        Expr *obj = expr->as.subscript.obj;
-        expr->as.subscript.obj = NULL;
-        ast_expr_free(expr);
-
-        sym_push(p->syms, SCOPE_LOOP);
-        sym_declare(p->syms, iter, SYM_VAR, XF_TYPE_VOID, loc);
-        Stmt *body = check(p, TK_LBRACE) ? parse_block(p) : parse_stmt(p);
-        sym_pop(p->syms);
-
-        Stmt *s = ast_for_short(obj, iter, body, loc);
-        xf_str_release(iter);
-        match_tok(p, TK_SEMICOLON);
-        return s;
-    }
-
     match_tok(p, TK_SEMICOLON);
     return ast_expr_stmt(expr, loc);
-}
+    }
 
 
 /* ============================================================
@@ -1051,7 +1070,36 @@ TopLevel *parse_rule(Parser *p) {
      *   expr[k] > s   → shorthand for    (TOP_STMT)
      *   expr ;        → bare expression  (TOP_STMT)
      * Parse the expression first, then dispatch on what follows. */
-    Expr *pattern = parse_expr(p);
+      if (looks_like_shorthand_for(p)) {
+        Expr *obj = parse_postfix(p);
+
+        if (obj->kind == EXPR_SUBSCRIPT &&
+            obj->as.subscript.key->kind == EXPR_IDENT &&
+            check(p, TK_GT)) {
+
+            advance(p);   /* consume > */
+
+            xf_Str *iter = xf_str_retain(obj->as.subscript.key->as.ident.name);
+            Expr *collection = obj->as.subscript.obj;
+            obj->as.subscript.obj = NULL;
+            ast_expr_free(obj);
+
+            sym_push(p->syms, SCOPE_LOOP);
+            sym_declare(p->syms, iter, SYM_VAR, XF_TYPE_VOID, loc);
+            Stmt *body = check(p, TK_LBRACE) ? parse_block(p) : parse_stmt(p);
+            sym_pop(p->syms);
+
+            Stmt *s = ast_for_short(collection, iter, body, loc);
+            xf_str_release(iter);
+            match_tok(p, TK_SEMICOLON);
+            return ast_top_stmt(s, loc);
+        }
+
+        ast_expr_free(obj);
+        parser_error(p, "invalid shorthand for");
+        return NULL;
+    }
+      Expr *pattern = parse_expr(p);
 
     /* pattern { body } — true pattern-action rule */
     if (check(p, TK_LBRACE)) {

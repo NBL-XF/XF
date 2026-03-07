@@ -492,9 +492,9 @@ static Token *next(Lexer *l) {
             t = make_tok(l, TK_EQ, start, loc); l->after_value = false; break;
 
         case '!':
-            if (match(l, '=')) { t = make_tok(l, TK_BANG_EQ,    start, loc); break; }
-            if (match(l, '~')) { t = make_tok(l, TK_BANG_TILDE, start, loc); break; }
-            t = make_tok(l, TK_BANG, start, loc); break;
+            if (match(l, '=')) { t = make_tok(l, TK_BANG_EQ,    start, loc); l->after_value = false; break; }
+            if (match(l, '~')) { t = make_tok(l, TK_BANG_TILDE, start, loc); l->after_value = false; break; }
+            t = make_tok(l, TK_BANG, start, loc); l->after_value = false; break;
 
         case '<':
             if (match(l, '=')) {

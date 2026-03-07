@@ -1,31 +1,6 @@
 * **XF Roadmap**
-
-  * **0.4.X — Generic Operations**
-
-    * `core.generics`
-
-      * contains
-      * length
-    * **Goal**
-
-      * Create cross-type utility layer
-
-  * **0.5.X — Data Structures**
-
-    * `core.ds`
-
-      * column
-      * row
-      * sort
-      * agg
-      * merge
-      * keys
-      * values
-      * filter
-    * **Goal**
-
-      * Structured data manipulation
-
+*** inline forloop
+*** fn return in arr
   * **0.6.X — Regex Engine**
 
     * `core.regex`

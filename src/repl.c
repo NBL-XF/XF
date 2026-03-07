@@ -11,7 +11,7 @@
 #include <errno.h>
 #include <ctype.h>
 
-#define XF_VERSION "0.4.4"
+#define XF_VERSION "0.5.9"
 #define PROMPT_NORMAL ">> "
 #define PROMPT_CONT   ".. "
 

@@ -5,6 +5,10 @@
 #include <math.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <regex.h>
+#include <strings.h>
 static inline xf_Value propagate_err(xf_Value v) { return v; }
 void interp_init(Interp *it, SymTable *syms, VM *vm) {
     memset(it, 0, sizeof(*it));
@@ -23,6 +27,84 @@ void interp_error(Interp *it, Loc loc, const char *fmt, ...) {
     fprintf(stdout, "  %s\r\n", msg);
     fprintf(stdout, "  at %s:%u:%u\r\n", loc.source, loc.line, loc.col);
     fprintf(stdout, "──────────────────────────────────────────\r\n");
+}
+static void xf_print_value(FILE *out, xf_Value v) {
+    switch (v.state) {
+        case XF_STATE_OK:
+            break;
+        default:
+            fputs(XF_STATE_NAMES[v.state], out);
+            return;
+    }
+
+    switch (v.type) {
+        case XF_TYPE_NUM:
+            fprintf(out, "%.15g", v.data.num);
+            return;
+
+        case XF_TYPE_STR:
+            fputs(v.data.str ? v.data.str->data : "", out);
+            return;
+
+        case XF_TYPE_ARR: {
+            fputc('[', out);
+            if (v.data.arr) {
+                for (size_t i = 0; i < v.data.arr->len; i++) {
+                    if (i > 0) fputs(", ", out);
+                    xf_print_value(out, v.data.arr->items[i]);
+                }
+            }
+            fputc(']', out);
+            return;
+        }
+
+        case XF_TYPE_MAP: {
+            fputc('{', out);
+            if (v.data.map) {
+                for (size_t i = 0; i < v.data.map->order_len; i++) {
+                    if (i > 0) fputs(", ", out);
+                    xf_Str *k = v.data.map->order[i];
+                    fputs(k ? k->data : "", out);
+                    fputc(':', out);
+                    xf_Value mv = xf_map_get(v.data.map, k);
+                    xf_print_value(out, mv);
+                }
+            }
+            fputc('}', out);
+            return;
+        }
+
+        case XF_TYPE_SET: {
+            fputc('{', out);
+            if (v.data.map) {
+                for (size_t i = 0; i < v.data.map->order_len; i++) {
+                    if (i > 0) fputs(", ", out);
+                    xf_Str *k = v.data.map->order[i];
+                    fputs(k ? k->data : "", out);
+                }
+            }
+            fputc('}', out);
+            return;
+        }
+
+        case XF_TYPE_FN:
+            fputs("<fn>", out);
+            return;
+
+        case XF_TYPE_VOID:
+            fputs("void", out);
+            return;
+
+        default: {
+            xf_Value sv = xf_coerce_str(v);
+            if (sv.state == XF_STATE_OK && sv.data.str) {
+                fputs(sv.data.str->data, out);
+            } else {
+                fputs(XF_TYPE_NAMES[v.type], out);
+            }
+            return;
+        }
+    }
 }
 void interp_type_err(Interp *it, Loc loc,
                      const char *op, uint8_t got, uint8_t expected) {
@@ -379,7 +461,7 @@ xf_Value interp_call_builtin(Interp *it, const char *name,
         if (s.state != XF_STATE_OK) return s;
         return xf_val_ok_num((double)s.data.str->len);
     }
-    if (strcmp(name,"toupper")==0 && argc==1) {
+    if ((strcmp(name,"toupper")==0 || strcmp(name,"upper")==0) && argc==1) {
         xf_Value s = xf_coerce_str(args[0]);
         if (s.state != XF_STATE_OK) return s;
         char *buf = strdup(s.data.str->data);
@@ -387,7 +469,7 @@ xf_Value interp_call_builtin(Interp *it, const char *name,
         xf_Str *r = xf_str_from_cstr(buf); free(buf);
         xf_Value v = xf_val_ok_str(r); xf_str_release(r); return v;
     }
-    if (strcmp(name,"tolower")==0 && argc==1) {
+    if ((strcmp(name,"tolower")==0 || strcmp(name,"lower")==0) && argc==1) {
         xf_Value s = xf_coerce_str(args[0]);
         if (s.state != XF_STATE_OK) return s;
         char *buf = strdup(s.data.str->data);
@@ -486,6 +568,11 @@ xf_Value interp_call_builtin(Interp *it, const char *name,
     if (strcmp(name,"push")==0 && argc==2) {
         if (args[0].state==XF_STATE_OK&&args[0].type==XF_TYPE_ARR&&args[0].data.arr)
             xf_arr_push(args[0].data.arr, args[1]);
+        else if (args[0].state==XF_STATE_OK&&args[0].type==XF_TYPE_SET&&args[0].data.map) {
+            xf_Value ks=xf_coerce_str(args[1]);
+            if (ks.state==XF_STATE_OK&&ks.data.str)
+                xf_map_set(args[0].data.map, ks.data.str, xf_val_ok_num(1.0));
+        }
         return args[0];
     }
     if (strcmp(name,"pop")==0 && argc==1) {
@@ -799,14 +886,57 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
             case BINOP_MSUB: return arr_broadcast(a, b, 1);
             case BINOP_MMUL: return mat_mul(a, b);
             case BINOP_MDIV: return arr_broadcast(a, b, 3);
-            case BINOP_PIPE_CMD: {
-                xf_Value cmd=xf_coerce_str(b); if(cmd.state!=XF_STATE_OK||!cmd.data.str) return xf_val_nav(XF_TYPE_STR);
-                FILE *fp=popen(cmd.data.str->data,"r+"); if(!fp) return xf_val_nav(XF_TYPE_STR);
-                xf_Value sv=xf_coerce_str(a); if(sv.state==XF_STATE_OK&&sv.data.str) fwrite(sv.data.str->data,1,sv.data.str->len,fp);
-                char buf[65536]; size_t n=0; int c; while(n<sizeof(buf)-1&&(c=fgetc(fp))!=EOF)buf[n++]=(char)c; buf[n]='\0'; pclose(fp);
-                while(n>0&&(buf[n-1]=='\n'||buf[n-1]=='\r'))buf[--n]='\0';
-                xf_Str *r=xf_str_from_cstr(buf); xf_Value rv=xf_val_ok_str(r); xf_str_release(r); return rv;
-            }
+case BINOP_PIPE_CMD: {
+    xf_Value cmd = xf_coerce_str(b);
+    if (cmd.state != XF_STATE_OK || !cmd.data.str)
+        return xf_val_nav(XF_TYPE_STR);
+
+    xf_Value sv = xf_coerce_str(a);
+    if (sv.state != XF_STATE_OK || !sv.data.str)
+        return xf_val_nav(XF_TYPE_STR);
+
+    char tmpname[] = "/tmp/xf_pipe_XXXXXX";
+    int fd = mkstemp(tmpname);
+    if (fd < 0)
+        return xf_val_nav(XF_TYPE_STR);
+
+    FILE *tf = fdopen(fd, "w");
+    if (!tf) {
+        close(fd);
+        unlink(tmpname);
+        return xf_val_nav(XF_TYPE_STR);
+    }
+
+    fwrite(sv.data.str->data, 1, sv.data.str->len, tf);
+    fclose(tf); /* important: flush + close so child sees EOF */
+
+    char shellcmd[8192];
+    snprintf(shellcmd, sizeof(shellcmd), "%s < '%s'", cmd.data.str->data, tmpname);
+
+    FILE *fp = popen(shellcmd, "r");
+    if (!fp) {
+        unlink(tmpname);
+        return xf_val_nav(XF_TYPE_STR);
+    }
+
+    char buf[65536];
+    size_t n = 0;
+    int c;
+    while (n < sizeof(buf) - 1 && (c = fgetc(fp)) != EOF)
+        buf[n++] = (char)c;
+    buf[n] = '\0';
+
+    pclose(fp);
+    unlink(tmpname);
+
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+        buf[--n] = '\0';
+
+    xf_Str *r = xf_str_from_cstr(buf);
+    xf_Value rv = xf_val_ok_str(r);
+    xf_str_release(r);
+    return rv;
+}
             case BINOP_EQ:        return make_bool(val_cmp(a,b)==0);
             case BINOP_NEQ:       return make_bool(val_cmp(a,b)!=0);
             case BINOP_LT:        return make_bool(val_cmp(a,b)<0);
@@ -816,15 +946,23 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
             case BINOP_SPACESHIP: return xf_val_ok_num((double)val_cmp(a,b));
             case BINOP_CONCAT:    return val_concat(a,b);
             case BINOP_MATCH: {
-                xf_Value sa=xf_coerce_str(a),sb=xf_coerce_str(b);
-                if(sa.state!=XF_STATE_OK||sb.state!=XF_STATE_OK) return make_bool(false);
-                return make_bool(strstr(sa.data.str->data,sb.data.str->data)!=NULL);
-            }
-            case BINOP_NMATCH: {
-                xf_Value sa=xf_coerce_str(a),sb=xf_coerce_str(b);
-                if(sa.state!=XF_STATE_OK||sb.state!=XF_STATE_OK) return make_bool(true);
-                return make_bool(strstr(sa.data.str->data,sb.data.str->data)==NULL);
-            }
+    xf_Value sa = xf_coerce_str(a), sb = xf_coerce_str(b);
+    if (sa.state != XF_STATE_OK || sb.state != XF_STATE_OK)
+        return make_bool(false);
+
+    return make_bool(strcasestr(sa.data.str->data,
+                                sb.data.str->data) != NULL);
+}
+
+case BINOP_NMATCH: {
+    xf_Value sa = xf_coerce_str(a), sb = xf_coerce_str(b);
+    if (sa.state != XF_STATE_OK || sb.state != XF_STATE_OK)
+        return make_bool(true);
+
+    return make_bool(strcasestr(sa.data.str->data,
+                                sb.data.str->data) == NULL);
+}
+                      
             default: return xf_val_nav(XF_TYPE_VOID);
         }
     }
@@ -858,99 +996,116 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
     case EXPR_CALL: {
         xf_Value args[64];
         size_t argc = e->as.call.argc < 64 ? e->as.call.argc : 64;
+
+        /* evaluate args once */
+        for (size_t i = 0; i < argc; i++)
+            args[i] = interp_eval_expr(it, e->as.call.args[i]);
+
+        /* method call: obj.method(...) */
         if (e->as.call.callee->kind == EXPR_MEMBER) {
             xf_Value obj = interp_eval_expr(it, e->as.call.callee->as.member.obj);
             const char *mname = e->as.call.callee->as.member.field->data;
-            for (size_t i = 0; i < argc; i++)
-                args[i] = interp_eval_expr(it, e->as.call.args[i]);
+
             xf_Value margs[65];
             margs[0] = obj;
-            for (size_t i = 0; i < argc; i++) margs[i+1] = args[i];
+            for (size_t i = 0; i < argc; i++) margs[i + 1] = args[i];
             size_t margc = argc + 1;
+
             xf_Value mr = interp_call_builtin(it, mname, margs, margc < 65 ? margc : 64);
             if (mr.state != XF_STATE_NAV) return mr;
+
             xf_Value callee = interp_eval_expr(it, e->as.call.callee);
             if (callee.type == XF_TYPE_FN && callee.state == XF_STATE_OK && callee.data.fn) {
                 xf_Fn *fn = callee.data.fn;
+
                 if (!fn->is_native) {
                     Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
                     fn_sc->fn_ret_type = fn->return_type;
+
                     for (size_t i = 0; i < fn->param_count; i++) {
                         xf_Value av = i < argc ? args[i] : xf_val_undef(fn->params[i].type);
-                        Symbol *ps = sym_declare(it->syms, fn->params[i].name, SYM_PARAM, fn->params[i].type, e->loc);
-                        if (ps) { ps->value = av; ps->state = av.state; ps->is_defined = true; }
+                        Symbol *ps = sym_declare(it->syms, fn->params[i].name,
+                                                 SYM_PARAM, fn->params[i].type, e->loc);
+                        if (ps) {
+                            ps->value = av;
+                            ps->state = av.state;
+                            ps->is_defined = true;
+                        }
                     }
+
                     it->returning = false;
                     interp_eval_stmt(it, (Stmt *)fn->body);
                     xf_Value ret = it->returning ? it->return_val : xf_val_null();
                     it->returning = false;
-                    Scope *popped = sym_pop(it->syms); scope_free(popped);
+
+                    Scope *popped = sym_pop(it->syms);
+                    scope_free(popped);
+
+                    if (fn->return_type != XF_TYPE_VOID && ret.state == XF_STATE_NULL)
+                        ret = xf_val_nav(fn->return_type);
+
                     return ret;
                 }
-                if (fn->is_native && fn->native_v) return fn->native_v(args, argc);
+
+                if (fn->is_native && fn->native_v)
+                    return fn->native_v(args, argc);
             }
+
             interp_error(it, e->loc, "unknown method '.%s'", mname);
             return xf_val_nav(XF_TYPE_VOID);
         }
+
+        /* bare identifier: try builtin first */
         if (e->as.call.callee->kind == EXPR_IDENT) {
             const char *name = e->as.call.callee->as.ident.name->data;
-            for (size_t i = 0; i < argc; i++)
-                args[i] = interp_eval_expr(it, e->as.call.args[i]);
             xf_Value r = interp_call_builtin(it, name, args, argc);
             if (r.state != XF_STATE_NAV) return r;
-            Symbol *sym = sym_lookup(it->syms, name, strlen(name));
-            if (sym && sym->kind == SYM_FN &&
-                sym->value.state == XF_STATE_OK &&
-                sym->value.type  == XF_TYPE_FN  &&
-                sym->value.data.fn) {
-                xf_Fn *fn = sym->value.data.fn;
-                Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
-                fn_sc->fn_ret_type = fn->return_type;
-                for (size_t i = 0; i < fn->param_count; i++) {
-                    xf_Value av = i < argc ? args[i] : xf_val_undef(fn->params[i].type);
-                    Symbol *ps = sym_declare(it->syms, fn->params[i].name, SYM_PARAM, fn->params[i].type, e->loc);
-                    if (ps) { ps->value = av; ps->state = av.state; ps->is_defined = true; }
-                }
-                it->returning = false;
-                interp_eval_stmt(it, (Stmt *)fn->body);
-                xf_Value ret = it->returning ? it->return_val : xf_val_null();
-                it->returning = false;
-                Scope *popped = sym_pop(it->syms); scope_free(popped);
-                if (fn->return_type != XF_TYPE_VOID && ret.state == XF_STATE_NULL)
-                    ret = xf_val_nav(fn->return_type);
-                return ret;
-            }
-            interp_error(it, e->loc, "undefined function '%s'", name);
-            return xf_val_nav(XF_TYPE_VOID);
         }
+
+        /* generic callable value */
         xf_Value callee = interp_eval_expr(it, e->as.call.callee);
-        for (size_t i = 0; i < argc; i++)
-            args[i] = interp_eval_expr(it, e->as.call.args[i]);
+
         if (callee.type == XF_TYPE_FN && callee.state == XF_STATE_OK &&
             callee.data.fn && !callee.data.fn->is_native) {
             xf_Fn *fn = callee.data.fn;
+
             Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
             fn_sc->fn_ret_type = fn->return_type;
+
             for (size_t i = 0; i < fn->param_count; i++) {
                 xf_Value av = i < argc ? args[i] : xf_val_undef(fn->params[i].type);
-                Symbol *ps = sym_declare(it->syms, fn->params[i].name, SYM_PARAM, fn->params[i].type, e->loc);
-                if (ps) { ps->value = av; ps->state = av.state; ps->is_defined = true; }
+                Symbol *ps = sym_declare(it->syms, fn->params[i].name,
+                                         SYM_PARAM, fn->params[i].type, e->loc);
+                if (ps) {
+                    ps->value = av;
+                    ps->state = av.state;
+                    ps->is_defined = true;
+                }
             }
+
             it->returning = false;
             interp_eval_stmt(it, (Stmt *)fn->body);
             xf_Value ret = it->returning ? it->return_val : xf_val_null();
             it->returning = false;
-            Scope *popped = sym_pop(it->syms); scope_free(popped);
+
+            Scope *popped = sym_pop(it->syms);
+            scope_free(popped);
+
+            if (fn->return_type != XF_TYPE_VOID && ret.state == XF_STATE_NULL)
+                ret = xf_val_nav(fn->return_type);
+
             return ret;
         }
+
         if (callee.type == XF_TYPE_FN && callee.state == XF_STATE_OK &&
             callee.data.fn && callee.data.fn->is_native && callee.data.fn->native_v) {
             return callee.data.fn->native_v(args, argc);
         }
+
         interp_error(it, e->loc, "call to unresolved function");
         return xf_val_nav(XF_TYPE_VOID);
     }
-    case EXPR_STATE: {
+        case EXPR_STATE: {
         xf_Value v = interp_eval_expr(it, e->as.introspect.operand);
         return xf_val_ok_num((double)v.state);
     }
@@ -968,6 +1123,13 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
                 return xf_val_ok_num(v.data.arr ? (double)v.data.arr->len : 0.0);
             case XF_TYPE_MAP:
             case XF_TYPE_SET:
+                return xf_val_ok_num(v.data.map ? (double)v.data.map->order_len : 0.0);
+            case XF_TYPE_MODULE:
+                if (v.data.mod) {
+                    xf_Value r = xf_module_get(v.data.mod, "length");
+                    if (r.state != XF_STATE_NAV) return r;
+                }
+                interp_error(it, e->loc, "module has no member 'length'");
                 return xf_val_nav(XF_TYPE_NUM);
             default:
                 interp_error(it, e->loc, ".len not defined for type '%s'",
@@ -978,25 +1140,24 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
     case EXPR_CAST: {
         xf_Value v = interp_eval_expr(it, e->as.cast.operand);
         if (v.state != XF_STATE_OK) return v;
+
         uint8_t target = e->as.cast.to_type;
         if (v.type == target) return v;
+
         switch (target) {
-            case XF_TYPE_NUM: {
-                xf_Value r = xf_coerce_num(v);
-                if (r.state == XF_STATE_NAV)
-                    interp_error(it, e->loc, "cannot cast %s to num",
-                                 XF_TYPE_NAMES[v.type]);
-                return r;
-            }
+            case XF_TYPE_NUM:
+                return xf_coerce_num(v);
+
             case XF_TYPE_STR:
                 return xf_coerce_str(v);
+
             default:
                 interp_error(it, e->loc, "cast to '%s' is not supported",
                              XF_TYPE_NAMES[target]);
                 return xf_val_nav(target);
         }
     }
-    case EXPR_MEMBER: {
+        case EXPR_MEMBER: {
         xf_Value obj = interp_eval_expr(it, e->as.member.obj);
         const char *field = e->as.member.field->data;
         if (obj.state == XF_STATE_OK &&
@@ -1029,6 +1190,13 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
             return interp_call_builtin(it, name, &left, 1);
         }
         return left;
+    }
+    case EXPR_FN: {
+        xf_Fn *fn = build_fn(NULL, e->as.fn.return_type,
+                              e->as.fn.params, e->as.fn.param_count,
+                              e->as.fn.body);
+        e->as.fn.body = NULL;
+        return xf_val_ok_fn(fn);
     }
     default:
         interp_error(it, e->loc, "unhandled expression kind %d", e->kind);
@@ -1073,7 +1241,16 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
         return init;
     }
     case STMT_FN_DECL: {
-        sym_declare(it->syms, s->as.fn_decl.name, SYM_FN, XF_TYPE_FN, s->loc);
+        xf_Fn *fn = build_fn(s->as.fn_decl.name, s->as.fn_decl.return_type,
+                              s->as.fn_decl.params, s->as.fn_decl.param_count,
+                              s->as.fn_decl.body);
+        s->as.fn_decl.body = NULL;
+        xf_Value fv = xf_val_ok_fn(fn);
+        Symbol *sym = sym_lookup_local(it->syms,
+                          s->as.fn_decl.name->data, s->as.fn_decl.name->len);
+        if (!sym)
+            sym = sym_declare(it->syms, s->as.fn_decl.name, SYM_FN, XF_TYPE_FN, s->loc);
+        if (sym) { sym->value = fv; sym->state = XF_STATE_OK; sym->is_defined = true; }
         return xf_val_null();
     }
     case STMT_IF: {
@@ -1116,12 +1293,68 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
     }
     case STMT_FOR: {
         xf_Value col = interp_eval_expr(it, s->as.for_stmt.collection);
-        (void)col;
+        if (col.state != XF_STATE_OK) return col;
+        xf_Str *iter_name = s->as.for_stmt.iter;
+        Stmt   *body      = s->as.for_stmt.body;
+
+        if (col.type == XF_TYPE_ARR && col.data.arr) {
+            xf_arr_t *a = col.data.arr;
+            for (size_t i = 0; i < a->len; i++) {
+                sym_push(it->syms, SCOPE_LOOP);
+                Symbol *iv = sym_declare(it->syms, iter_name, SYM_VAR, XF_TYPE_VOID, s->loc);
+                if (iv) { iv->value = a->items[i]; iv->state = a->items[i].state; iv->is_defined = true; }
+                interp_eval_stmt(it, body);
+                sym_pop(it->syms);
+                if (it->nexting) { it->nexting = false; continue; }
+                if (it->returning || it->exiting || it->had_error) break;
+            }
+        } else if ((col.type == XF_TYPE_MAP || col.type == XF_TYPE_SET) && col.data.map) {
+            xf_map_t *m = col.data.map;
+            for (size_t i = 0; i < m->order_len; i++) {
+                xf_Str *key = m->order[i];
+                xf_Value kv = xf_val_ok_str(key);
+                sym_push(it->syms, SCOPE_LOOP);
+                Symbol *iv = sym_declare(it->syms, iter_name, SYM_VAR, XF_TYPE_STR, s->loc);
+                if (iv) { iv->value = kv; iv->state = XF_STATE_OK; iv->is_defined = true; }
+                interp_eval_stmt(it, body);
+                sym_pop(it->syms);
+                if (it->nexting) { it->nexting = false; continue; }
+                if (it->returning || it->exiting || it->had_error) break;
+            }
+        }
         return xf_val_null();
     }
     case STMT_FOR_SHORT: {
         xf_Value col = interp_eval_expr(it, s->as.for_short.collection);
-        (void)col;
+        if (col.state != XF_STATE_OK) return col;
+        xf_Str *iter_name = s->as.for_short.iter;
+        Stmt   *body      = s->as.for_short.body;
+
+        if (col.type == XF_TYPE_ARR && col.data.arr) {
+            xf_arr_t *a = col.data.arr;
+            for (size_t i = 0; i < a->len; i++) {
+                sym_push(it->syms, SCOPE_LOOP);
+                Symbol *iv = sym_declare(it->syms, iter_name, SYM_VAR, XF_TYPE_VOID, s->loc);
+                if (iv) { iv->value = a->items[i]; iv->state = a->items[i].state; iv->is_defined = true; }
+                interp_eval_stmt(it, body);
+                sym_pop(it->syms);
+                if (it->nexting) { it->nexting = false; continue; }
+                if (it->returning || it->exiting || it->had_error) break;
+            }
+        } else if ((col.type == XF_TYPE_MAP || col.type == XF_TYPE_SET) && col.data.map) {
+            xf_map_t *m = col.data.map;
+            for (size_t i = 0; i < m->order_len; i++) {
+                xf_Str *key = m->order[i];
+                xf_Value kv = xf_val_ok_str(key);
+                sym_push(it->syms, SCOPE_LOOP);
+                Symbol *iv = sym_declare(it->syms, iter_name, SYM_VAR, XF_TYPE_STR, s->loc);
+                if (iv) { iv->value = kv; iv->state = XF_STATE_OK; iv->is_defined = true; }
+                interp_eval_stmt(it, body);
+                sym_pop(it->syms);
+                if (it->nexting) { it->nexting = false; continue; }
+                if (it->returning || it->exiting || it->had_error) break;
+            }
+        }
         return xf_val_null();
     }
     case STMT_RETURN:
@@ -1136,28 +1369,26 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
     case STMT_EXIT:
         it->exiting = true;
         return xf_val_null();
-    case STMT_PRINT: {
-        xf_Value vals[64];
-        size_t count = s->as.print.count < 64 ? s->as.print.count : 64;
-        for (size_t i = 0; i < count; i++)
-            vals[i] = interp_eval_expr(it, s->as.print.args[i]);
-        uint8_t mode = it->vm->rec.out_mode;
-        if (mode != XF_OUTFMT_TEXT) {
-            print_structured(it, vals, count, mode);
-        } else {
-            for (size_t i = 0; i < count; i++) {
-                if (i > 0) fputs(it->vm->rec.ofs, stdout);
-                xf_Value sv = xf_coerce_str(vals[i]);
-                if (sv.state == XF_STATE_OK && sv.data.str)
-                    fputs(sv.data.str->data, stdout);
-                else
-                    fputs(XF_STATE_NAMES[vals[i].state], stdout);
-            }
-            fputs(it->vm->rec.ors, stdout);
+        case STMT_PRINT: {
+    xf_Value vals[64];
+    size_t count = s->as.print.count < 64 ? s->as.print.count : 64;
+
+    for (size_t i = 0; i < count; i++)
+        vals[i] = interp_eval_expr(it, s->as.print.args[i]);
+
+    uint8_t mode = it->vm->rec.out_mode;
+    if (mode != XF_OUTFMT_TEXT) {
+        print_structured(it, vals, count, mode);
+    } else {
+        for (size_t i = 0; i < count; i++) {
+            if (i > 0) fputs(it->vm->rec.ofs, stdout);
+            xf_print_value(stdout, vals[i]);
         }
-        return xf_val_null();
+        fputs(it->vm->rec.ors, stdout);
     }
-    case STMT_PRINTF: {
+    return xf_val_null();
+}
+        case STMT_PRINTF: {
         if (s->as.printf_stmt.count == 0) return xf_val_null();
         xf_Value fmtv = interp_eval_expr(it, s->as.printf_stmt.args[0]);
         xf_Value fmts = xf_coerce_str(fmtv);
@@ -1225,6 +1456,7 @@ xf_Value interp_eval_top(Interp *it, TopLevel *top) {
             xf_Fn *fn = build_fn(top->as.fn.name, top->as.fn.return_type,
                                   top->as.fn.params, top->as.fn.param_count,
                                   top->as.fn.body);
+            top->as.fn.body = NULL;
             xf_Value fv = xf_val_ok_fn(fn);
             Symbol *sym = sym_lookup_local(it->syms,
                               top->as.fn.name->data, top->as.fn.name->len);
