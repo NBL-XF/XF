@@ -1,4 +1,5 @@
 #include "../include/symTable.h"
+#include "../include/value.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,8 +21,10 @@ static Scope *scope_new(ScopeKind kind, Scope *parent, uint8_t fn_ret) {
 void scope_free(Scope *sc) {
     if (!sc) return;
     for (size_t i = 0; i < sc->capacity; i++) {
-        if (sc->entries[i].name)
+        if (sc->entries[i].name) {
             xf_str_release(sc->entries[i].name);
+            xf_value_release(sc->entries[i].value);  /* drop owned ref */
+        }
     }
     free(sc->entries);
     free(sc);
@@ -155,9 +158,9 @@ Symbol *sym_declare(SymTable *st, xf_Str *name, SymKind kind,
     Symbol *sym  = scope_insert(st->current, name);
     sym->kind     = kind;
     sym->type     = type;
-    sym->state    = XF_STATE_UNDETERMINED;
+    sym->state    = XF_STATE_UNDEF;
     sym->decl_loc = loc;
-    sym->value    = xf_val_undetermined(type);
+    sym->value    = xf_val_undef(type);
     return sym;
 }
 
@@ -193,7 +196,8 @@ bool sym_assign(SymTable *st, xf_Str *name, xf_Value val) {
                  "'%s' is immutable", name->data);
         return false;
     }
-    sym->value      = val;
+    xf_value_release(sym->value);  /* drop old owned ref */
+    sym->value      = val;          /* steal new owned ref */
     sym->state      = val.state;
     sym->is_defined = true;
     return true;
@@ -328,4 +332,3 @@ void sym_print_all(const SymTable *st) {
         sc = sc->parent;
     }
 }
-

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <regex.h>
 
 /* ============================================================
  * String implementation
@@ -167,6 +168,64 @@ xf_value_t xf_val_native_fn(const char *name, uint8_t ret_type,
     return xf_val_ok_fn(f);
 }
 
+/* ── fn retain / release ───────────────────────────────────── */
+xf_fn_t *xf_fn_retain(xf_fn_t *f) {
+    if (f) atomic_fetch_add(&f->refcount, 1);
+    return f;
+}
+void xf_fn_release(xf_fn_t *f) {
+    if (!f || atomic_fetch_sub(&f->refcount, 1) != 1) return;
+    xf_str_release(f->name);
+    /* params and body are owned by the AST, not by the fn value */
+    free(f);
+}
+
+/* ── regex retain / release ─────────────────────────────────── */
+xf_regex_t *xf_regex_retain(xf_regex_t *r) {
+    if (r) atomic_fetch_add(&r->refcount, 1);
+    return r;
+}
+void xf_regex_release(xf_regex_t *r) {
+    if (!r || atomic_fetch_sub(&r->refcount, 1) != 1) return;
+    xf_str_release(r->pattern);
+    /* compiled is a POSIX regex_t allocated inline; regfree then free */
+    if (r->compiled) {
+        regfree((regex_t *)r->compiled);
+        free(r->compiled);
+    }
+    free(r);
+}
+
+/* ── value_retain / value_release ───────────────────────────── */
+xf_Value xf_value_retain(xf_Value v) {
+    if (v.state != XF_STATE_OK) return v;
+    switch (v.type) {
+        case XF_TYPE_STR:    xf_str_retain(v.data.str);       break;
+        case XF_TYPE_ARR:    xf_arr_retain(v.data.arr);       break;
+        case XF_TYPE_MAP:
+        case XF_TYPE_SET:    xf_map_retain(v.data.map);       break;
+        case XF_TYPE_FN:     xf_fn_retain(v.data.fn);         break;
+        case XF_TYPE_REGEX:  xf_regex_retain(v.data.re);      break;
+        case XF_TYPE_MODULE: xf_module_retain(v.data.mod);    break;
+        default: break;
+    }
+    return v;
+}
+void xf_value_release(xf_Value v) {
+    if (v.state != XF_STATE_OK) return;
+    switch (v.type) {
+        case XF_TYPE_STR:    xf_str_release(v.data.str);      break;
+        case XF_TYPE_ARR:    xf_arr_release(v.data.arr);      break;
+        case XF_TYPE_MAP:
+        case XF_TYPE_SET:    xf_map_release(v.data.map);      break;
+        case XF_TYPE_FN:     xf_fn_release(v.data.fn);        break;
+        case XF_TYPE_REGEX:  xf_regex_release(v.data.re);     break;
+        case XF_TYPE_MODULE: xf_module_release(v.data.mod);   break;
+        default: break;
+    }
+}
+
+
 xf_value_t xf_val_ok_re(xf_regex_t *r) {
     return (xf_value_t){ .state = XF_STATE_OK,
                          .type  = XF_TYPE_REGEX,
@@ -195,6 +254,8 @@ xf_arr_t *xf_arr_retain(xf_arr_t *a) {
 
 void xf_arr_release(xf_arr_t *a) {
     if (!a || atomic_fetch_sub(&a->refcount, 1) != 1) return;
+    for (size_t i = 0; i < a->len; i++)
+        xf_value_release(a->items[i]);
     free(a->items);
     free(a);
 }
@@ -222,7 +283,8 @@ void xf_arr_set(xf_arr_t *a, size_t idx, xf_value_t v) {
             a->items[i] = xf_val_nav(XF_TYPE_VOID);
         a->cap = new_cap;
     }
-    a->items[idx] = v;
+    if (idx < a->len) xf_value_release(a->items[idx]);  /* release old */
+    a->items[idx] = v;   /* steal new */
     if (idx >= a->len) a->len = idx + 1;
 }
 
@@ -252,6 +314,7 @@ xf_value_t xf_arr_shift(xf_arr_t *a) {
 
 void xf_arr_delete(xf_arr_t *a, size_t idx) {
     if (!a || idx >= a->len) return;
+    xf_value_release(a->items[idx]);  /* release item being removed */
     memmove(a->items + idx, a->items + idx + 1, (a->len - idx - 1) * sizeof(xf_value_t));
     a->len--;
 }
@@ -308,8 +371,12 @@ xf_map_t *xf_map_retain(xf_map_t *m) {
 
 void xf_map_release(xf_map_t *m) {
     if (!m || atomic_fetch_sub(&m->refcount, 1) != 1) return;
-    for (size_t i = 0; i < m->cap; i++)
-        if (m->slots[i].key) xf_str_release(m->slots[i].key);
+    for (size_t i = 0; i < m->cap; i++) {
+        if (m->slots[i].key) {
+            xf_str_release(m->slots[i].key);
+            xf_value_release(m->slots[i].val);  /* release val */
+        }
+    }
     free(m->slots);
     free(m->order);
     free(m);
@@ -336,8 +403,10 @@ void xf_map_set(xf_map_t *m, xf_str_t *key, xf_value_t val) {
             m->order_cap = nc;
         }
         m->order[m->order_len++] = m->slots[idx].key;
+    } else {
+        xf_value_release(m->slots[idx].val);  /* release old val on overwrite */
     }
-    m->slots[idx].val = val;
+    m->slots[idx].val = val;  /* steal new val */
 }
 
 bool xf_map_delete(xf_map_t *m, const xf_str_t *key) {
@@ -351,7 +420,9 @@ bool xf_map_delete(xf_map_t *m, const xf_str_t *key) {
         idx = (idx + 1) & mask;
     }
     xf_str_t *dead_key = m->slots[idx].key;
+    xf_value_release(m->slots[idx].val);  /* release val before clearing slot */
     m->slots[idx].key = NULL;
+    m->slots[idx].val = xf_val_nav(XF_TYPE_VOID);  /* clear val */
     m->used--;
     /* Robin Hood backshift */
     size_t j = (idx + 1) & mask;
@@ -406,9 +477,6 @@ xf_value_t xf_val_undef(uint8_t type) {
     return (xf_value_t){ .state = XF_STATE_UNDEF, .type = type };
 }
 
-xf_value_t xf_val_undetermined(uint8_t type) {
-    return (xf_value_t){ .state = XF_STATE_UNDETERMINED, .type = type };
-}
 
 
 /* ============================================================
@@ -416,15 +484,7 @@ xf_value_t xf_val_undetermined(uint8_t type) {
  * ============================================================ */
 
 bool xf_collapse(xf_atomic_value_t *av, xf_value_t resolved) {
-    uint8_t expected = XF_STATE_UNDETERMINED;
-    if (atomic_compare_exchange_strong(&av->state, &expected,
-                                       resolved.state)) {
-        av->type = resolved.type;
-        memcpy(&av->data, &resolved.data, sizeof(av->data));
-        av->err  = resolved.err;
-        return true;
-    }
-    expected = XF_STATE_UNDEF;
+    uint8_t expected = XF_STATE_UNDEF;
     if (atomic_compare_exchange_strong(&av->state, &expected,
                                        resolved.state)) {
         av->type = resolved.type;
@@ -501,15 +561,14 @@ bool xf_can_coerce(xf_value_t v, uint8_t target_type) {
  * ============================================================ */
 
 uint8_t xf_dominant_state(xf_value_t a, xf_value_t b) {
-    /* ERR > NAV > UNDETERMINED > UNDEF > VOID > NULL > OK */
+    /* ERR > NAV > UNDEF > VOID > NULL > OK */
     static const uint8_t priority[XF_STATE_COUNT] = {
-        [XF_STATE_OK]           = 0,
-        [XF_STATE_NULL]         = 1,
-        [XF_STATE_VOID]         = 2,
-        [XF_STATE_UNDEF]        = 3,
-        [XF_STATE_UNDETERMINED] = 4,
-        [XF_STATE_NAV]          = 5,
-        [XF_STATE_ERR]          = 6,
+        [XF_STATE_OK]   = 0,
+        [XF_STATE_NULL] = 1,
+        [XF_STATE_VOID] = 2,
+        [XF_STATE_UNDEF]= 3,
+        [XF_STATE_NAV]  = 4,
+        [XF_STATE_ERR]  = 5,
     };
     return priority[a.state] >= priority[b.state] ? a.state : b.state;
 }
@@ -694,6 +753,8 @@ xf_module_t *xf_module_retain(xf_module_t *m) {
 void xf_module_release(xf_module_t *m) {
     if (!m) return;
     if (atomic_fetch_sub(&m->refcount, 1) != 1) return;
+    for (size_t i = 0; i < m->count; i++)
+        xf_value_release(m->entries[i].val);
     free(m->entries);
     free(m);
 }

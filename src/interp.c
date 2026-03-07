@@ -770,7 +770,7 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
                          e->as.ident.name->data);
             return xf_val_nav(XF_TYPE_VOID);
         }
-        return s->value;
+        return xf_value_retain(s->value);  /* return owned ref — caller steals */
     }
     case EXPR_FIELD: {
         int n = e->as.field.index;
@@ -802,32 +802,34 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
     case EXPR_SUBSCRIPT: {
         xf_Value obj = interp_eval_expr(it, e->as.subscript.obj);
         xf_Value key = interp_eval_expr(it, e->as.subscript.key);
-        if (obj.state != XF_STATE_OK) return obj;
-        if (key.state != XF_STATE_OK) return key;
+        if (obj.state != XF_STATE_OK) { xf_value_release(key); return obj; }
+        if (key.state != XF_STATE_OK) { xf_value_release(obj); return key; }
+        xf_Value _sub_result = xf_val_nav(XF_TYPE_VOID);
         if (obj.type == XF_TYPE_ARR) {
             xf_Value ni = xf_coerce_num(key);
-            if (ni.state != XF_STATE_OK || !obj.data.arr)
-                return xf_val_nav(XF_TYPE_VOID);
-            return xf_arr_get(obj.data.arr, (size_t)ni.data.num);
-        }
-        if (obj.type == XF_TYPE_MAP) {
+            if (ni.state == XF_STATE_OK && obj.data.arr)
+                _sub_result = xf_value_retain(xf_arr_get(obj.data.arr, (size_t)ni.data.num));
+        } else if (obj.type == XF_TYPE_MAP) {
             xf_Value sk = xf_coerce_str(key);
-            if (sk.state != XF_STATE_OK || !obj.data.map)
-                return xf_val_nav(XF_TYPE_VOID);
-            return xf_map_get(obj.data.map, sk.data.str);
-        }
-        if (obj.type == XF_TYPE_STR && obj.data.str) {
+            if (sk.state == XF_STATE_OK && sk.data.str && obj.data.map)
+                _sub_result = xf_value_retain(xf_map_get(obj.data.map, sk.data.str));
+        } else if (obj.type == XF_TYPE_STR && obj.data.str) {
             xf_Value ni = xf_coerce_num(key);
-            if (ni.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_STR);
-            size_t idx = (size_t)ni.data.num;
-            if (idx >= obj.data.str->len) return xf_val_nav(XF_TYPE_STR);
-            char ch[2] = { obj.data.str->data[idx], '\0' };
-            xf_Str *cs = xf_str_new(ch, 1);
-            xf_Value rv = xf_val_ok_str(cs); xf_str_release(cs); return rv;
+            if (ni.state == XF_STATE_OK) {
+                size_t idx = (size_t)ni.data.num;
+                if (idx < obj.data.str->len) {
+                    char ch[2] = { obj.data.str->data[idx], '\0' };
+                    xf_Str *cs = xf_str_new(ch, 1);
+                    _sub_result = xf_val_ok_str(cs); xf_str_release(cs);
+                } else { _sub_result = xf_val_nav(XF_TYPE_STR); }
+            } else { _sub_result = xf_val_nav(XF_TYPE_STR); }
+        } else {
+            interp_error(it, e->loc, "subscript on non-indexable type '%s'",
+                         XF_TYPE_NAMES[obj.type]);
         }
-        interp_error(it, e->loc, "subscript on non-indexable type '%s'",
-                     XF_TYPE_NAMES[obj.type]);
-        return xf_val_nav(XF_TYPE_VOID);
+        xf_value_release(obj);
+        xf_value_release(key);
+        return _sub_result;
     }
     case EXPR_SVAR: {
         return xf_val_ok_str(xf_str_from_cstr(""));
@@ -873,13 +875,19 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
     case EXPR_BINARY: {
         if (e->as.binary.op == BINOP_AND) {
             xf_Value a = interp_eval_expr(it, e->as.binary.left);
-            if (!is_truthy(a)) return make_bool(false);
-            return make_bool(is_truthy(interp_eval_expr(it, e->as.binary.right)));
+            bool _ta = is_truthy(a); xf_value_release(a);
+            if (!_ta) return make_bool(false);
+            xf_Value b = interp_eval_expr(it, e->as.binary.right);
+            bool _tb = is_truthy(b); xf_value_release(b);
+            return make_bool(_tb);
         }
         if (e->as.binary.op == BINOP_OR) {
             xf_Value a = interp_eval_expr(it, e->as.binary.left);
-            if (is_truthy(a)) return make_bool(true);
-            return make_bool(is_truthy(interp_eval_expr(it, e->as.binary.right)));
+            bool _ta = is_truthy(a); xf_value_release(a);
+            if (_ta) return make_bool(true);
+            xf_Value b = interp_eval_expr(it, e->as.binary.right);
+            bool _tb = is_truthy(b); xf_value_release(b);
+            return make_bool(_tb);
         }
         xf_Value a = interp_eval_expr(it, e->as.binary.left);
         xf_Value b = interp_eval_expr(it, e->as.binary.right);
@@ -990,7 +998,9 @@ case BINOP_PIPE_CMD: {
     }
     case EXPR_TERNARY: {
         xf_Value cond = interp_eval_expr(it, e->as.ternary.cond);
-        return is_truthy(cond)
+        bool _cond_truthy = is_truthy(cond);
+        xf_value_release(cond);
+        return _cond_truthy
                ? interp_eval_expr(it, e->as.ternary.then)
                : interp_eval_expr(it, e->as.ternary.els);
     }
@@ -1012,7 +1022,7 @@ case BINOP_PIPE_CMD: {
         xf_Value rhs = interp_eval_expr(it, e->as.walrus.value);
         Symbol *s = sym_declare(it->syms, e->as.walrus.name,
                                 SYM_VAR, e->as.walrus.type, e->loc);
-        if (s) { s->value = rhs; s->state = rhs.state; s->is_defined = true; }
+        if (s) { xf_value_release(s->value); s->value = rhs; s->state = rhs.state; s->is_defined = true; }
         return rhs;
     }
     case EXPR_CALL: {
@@ -1060,8 +1070,7 @@ case BINOP_PIPE_CMD: {
                     xf_Value ret = it->returning ? it->return_val : xf_val_null();
                     it->returning = false;
 
-                    Scope *popped = sym_pop(it->syms);
-                    scope_free(popped);
+                    scope_free(sym_pop(it->syms));
 
                     if (fn->return_type != XF_TYPE_VOID && ret.state == XF_STATE_NULL)
                         ret = xf_val_nav(fn->return_type);
@@ -1110,8 +1119,7 @@ case BINOP_PIPE_CMD: {
             xf_Value ret = it->returning ? it->return_val : xf_val_null();
             it->returning = false;
 
-            Scope *popped = sym_pop(it->syms);
-            scope_free(popped);
+            scope_free(sym_pop(it->syms));
 
             if (fn->return_type != XF_TYPE_VOID && ret.state == XF_STATE_NULL)
                 ret = xf_val_nav(fn->return_type);
@@ -1237,11 +1245,14 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
             last = interp_eval_stmt(it, s->as.block.stmts[i]);
             if (it->returning || it->exiting || it->nexting || it->had_error) break;
         }
-        sym_pop(it->syms);
+        scope_free(sym_pop(it->syms));
         return last;
     }
-    case STMT_EXPR:
-        return interp_eval_expr(it, s->as.expr.expr);
+    case STMT_EXPR: {
+        xf_Value _expr_val = interp_eval_expr(it, s->as.expr.expr);
+        xf_value_release(_expr_val);
+        return xf_val_null();
+    }
     case STMT_VAR_DECL: {
         xf_Value init = s->as.var_decl.init
                          ? interp_eval_expr(it, s->as.var_decl.init)
@@ -1259,7 +1270,7 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
         if (!sym)
             sym = sym_declare(it->syms, s->as.var_decl.name,
                               SYM_VAR, s->as.var_decl.type, s->loc);
-        if (sym) { sym->value = init; sym->state = init.state; sym->is_defined = true; }
+        if (sym) { xf_value_release(sym->value); sym->value = init; sym->state = init.state; sym->is_defined = true; }
         return init;
     }
     case STMT_FN_DECL: {
@@ -1272,7 +1283,7 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
                           s->as.fn_decl.name->data, s->as.fn_decl.name->len);
         if (!sym)
             sym = sym_declare(it->syms, s->as.fn_decl.name, SYM_FN, XF_TYPE_FN, s->loc);
-        if (sym) { sym->value = fv; sym->state = XF_STATE_OK; sym->is_defined = true; }
+        if (sym) { xf_value_release(sym->value); sym->value = fv; sym->state = XF_STATE_OK; sym->is_defined = true; }
         return xf_val_null();
     }
     case STMT_IF: {
@@ -1281,14 +1292,14 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
             if (is_truthy(cond)) {
                 sym_push(it->syms, SCOPE_BLOCK);
                 xf_Value r = interp_eval_stmt(it, s->as.if_stmt.branches[i].body);
-                sym_pop(it->syms);
+                scope_free(sym_pop(it->syms));
                 return r;
             }
         }
         if (s->as.if_stmt.els) {
             sym_push(it->syms, SCOPE_BLOCK);
             xf_Value r = interp_eval_stmt(it, s->as.if_stmt.els);
-            sym_pop(it->syms);
+            scope_free(sym_pop(it->syms));
             return r;
         }
         return xf_val_null();
@@ -1300,7 +1311,7 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
             if (it->nexting) { it->nexting = false; continue; }
             if (it->returning || it->exiting || it->had_error) break;
         }
-        sym_pop(it->syms);
+        scope_free(sym_pop(it->syms));
         return xf_val_null();
     }
     case STMT_WHILE_SHORT: {
@@ -1310,7 +1321,7 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
             if (it->nexting) { it->nexting = false; continue; }
             if (it->returning || it->exiting || it->had_error) break;
         }
-        sym_pop(it->syms);
+        scope_free(sym_pop(it->syms));
         return xf_val_null();
     }
     case STMT_FOR: {
@@ -1326,7 +1337,7 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
                 Symbol *iv = sym_declare(it->syms, iter_name, SYM_VAR, XF_TYPE_VOID, s->loc);
                 if (iv) { iv->value = a->items[i]; iv->state = a->items[i].state; iv->is_defined = true; }
                 interp_eval_stmt(it, body);
-                sym_pop(it->syms);
+                scope_free(sym_pop(it->syms));
                 if (it->nexting) { it->nexting = false; continue; }
                 if (it->returning || it->exiting || it->had_error) break;
             }
@@ -1339,7 +1350,7 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
                 Symbol *iv = sym_declare(it->syms, iter_name, SYM_VAR, XF_TYPE_STR, s->loc);
                 if (iv) { iv->value = kv; iv->state = XF_STATE_OK; iv->is_defined = true; }
                 interp_eval_stmt(it, body);
-                sym_pop(it->syms);
+                scope_free(sym_pop(it->syms));
                 if (it->nexting) { it->nexting = false; continue; }
                 if (it->returning || it->exiting || it->had_error) break;
             }
@@ -1359,7 +1370,7 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
                 Symbol *iv = sym_declare(it->syms, iter_name, SYM_VAR, XF_TYPE_VOID, s->loc);
                 if (iv) { iv->value = a->items[i]; iv->state = a->items[i].state; iv->is_defined = true; }
                 interp_eval_stmt(it, body);
-                sym_pop(it->syms);
+                scope_free(sym_pop(it->syms));
                 if (it->nexting) { it->nexting = false; continue; }
                 if (it->returning || it->exiting || it->had_error) break;
             }
@@ -1372,7 +1383,7 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
                 Symbol *iv = sym_declare(it->syms, iter_name, SYM_VAR, XF_TYPE_STR, s->loc);
                 if (iv) { iv->value = kv; iv->state = XF_STATE_OK; iv->is_defined = true; }
                 interp_eval_stmt(it, body);
-                sym_pop(it->syms);
+                scope_free(sym_pop(it->syms));
                 if (it->nexting) { it->nexting = false; continue; }
                 if (it->returning || it->exiting || it->had_error) break;
             }
@@ -1408,13 +1419,16 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
         }
         fputs(it->vm->rec.ors, stdout);
     }
+    for (size_t i = 0; i < count; i++) xf_value_release(vals[i]);
     return xf_val_null();
 }
         case STMT_PRINTF: {
         if (s->as.printf_stmt.count == 0) return xf_val_null();
         xf_Value fmtv = interp_eval_expr(it, s->as.printf_stmt.args[0]);
         xf_Value fmts = xf_coerce_str(fmtv);
-        if (fmts.state != XF_STATE_OK || !fmts.data.str) return xf_val_null();
+        if (fmts.state != XF_STATE_OK || !fmts.data.str) {
+            xf_value_release(fmtv); return xf_val_null();
+        }
         xf_Value args[64];
         size_t argc = s->as.printf_stmt.count < 64 ? s->as.printf_stmt.count : 64;
         args[0] = fmtv;
@@ -1423,6 +1437,7 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
         char buf[8192];
         xf_sprintf_impl(buf, sizeof(buf), fmts.data.str->data, args, argc);
         fputs(buf, stdout);
+        for (size_t i = 0; i < argc; i++) xf_value_release(args[i]);
         return xf_val_null();
     }
     case STMT_OUTFMT:
@@ -1446,12 +1461,16 @@ xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
                 if (ks.state == XF_STATE_OK && ks.data.str)
                     xf_map_delete(obj.data.map, ks.data.str);
             }
+            xf_value_release(obj);
+            xf_value_release(key);
         }
         return xf_val_null();
     }
-    case STMT_SPAWN:
-        interp_eval_expr(it, s->as.spawn.call);
+    case STMT_SPAWN: {
+        xf_Value _spawn_val = interp_eval_expr(it, s->as.spawn.call);
+        xf_value_release(_spawn_val);
         return xf_val_null();
+    }
     case STMT_JOIN:
         return xf_val_null();
     case STMT_SUBST:
@@ -1484,7 +1503,7 @@ xf_Value interp_eval_top(Interp *it, TopLevel *top) {
                               top->as.fn.name->data, top->as.fn.name->len);
             if (!sym)
                 sym = sym_declare(it->syms, top->as.fn.name, SYM_FN, XF_TYPE_FN, top->loc);
-            if (sym) { sym->value = fv; sym->state = XF_STATE_OK; sym->is_defined = true; }
+            if (sym) { xf_value_release(sym->value); sym->value = fv; sym->state = XF_STATE_OK; sym->is_defined = true; }
             return xf_val_null();
         }
         case TOP_STMT:

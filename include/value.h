@@ -18,7 +18,7 @@
  * unless state is OK or VOID.
  *
  * State transitions are ONE-WAY and ATOMIC:
- *   UNDETERMINED → UNDEF → {OK, ERR, NAV, NULL, VOID}
+ *   UNDEF → {OK, ERR, NAV, NULL, VOID}
  *   Terminal states never transition again.
  * ============================================================ */
 
@@ -32,10 +32,9 @@
 #define XF_STATE_VOID          2   /* no return expected, value leaked     */
 #define XF_STATE_NULL          3   /* no return expected, none given       */
 #define XF_STATE_NAV           4   /* return expected, nothing returned    */
-#define XF_STATE_UNDEF         5   /* exists, not yet resolved            */
-#define XF_STATE_UNDETERMINED  6   /* not yet processed (pre-collapse)    */
+#define XF_STATE_UNDEF         5   /* declared but not yet assigned        */
 
-#define XF_STATE_COUNT         7
+#define XF_STATE_COUNT         6
 
 /* is state terminal (no further collapse possible) */
 #define XF_STATE_IS_TERMINAL(s) \
@@ -51,11 +50,11 @@
 
 /* is state unresolved */
 #define XF_STATE_IS_PENDING(s) \
-    ((s) == XF_STATE_UNDETERMINED || (s) == XF_STATE_UNDEF)
+    ((s) == XF_STATE_UNDEF)
 
 /* human-readable state names */
 static const char *const XF_STATE_NAMES[XF_STATE_COUNT] = {
-    "OK", "ERR", "VOID", "NULL", "NAV", "UNDEF", "UNDETERMINED"
+    "OK", "ERR", "VOID", "NULL", "NAV", "UNDEF"
 };
 
 
@@ -311,7 +310,11 @@ xf_value_t xf_val_ok_map(xf_map_t *m);
 xf_value_t xf_val_ok_set(xf_set_t *s);
 xf_value_t xf_val_ok_arr(xf_arr_t *a);
 xf_value_t xf_val_ok_fn(xf_fn_t *f);
+xf_fn_t    *xf_fn_retain(xf_fn_t *f);
+void        xf_fn_release(xf_fn_t *f);
 xf_value_t xf_val_ok_re(xf_regex_t *r);
+xf_regex_t *xf_regex_retain(xf_regex_t *r);
+void        xf_regex_release(xf_regex_t *r);
 
 xf_value_t xf_val_err(xf_err_t *e, uint8_t type);
 xf_value_t xf_val_nav(uint8_t expected_type);
@@ -320,11 +323,21 @@ xf_value_t xf_val_void(xf_value_t inner);
 
 /* pending state constructors */
 xf_value_t xf_val_undef(uint8_t type);
-xf_value_t xf_val_undetermined(uint8_t type);
 
 /* convenience */
 #define XF_NULL  (xf_val_null())
 #define XF_UNDEF (xf_val_undef(XF_TYPE_VOID))
+
+/* ── ownership helpers ───────────────────────────────────────
+ * xf_value_retain  — retain underlying heap object, returns v
+ * xf_value_release — release underlying heap object
+ *
+ * Ownership rule: every xf_Value stored in permanent storage
+ * (symbol, arr slot, map slot) owns exactly one reference.
+ * Use retain/release to manage those references.
+ * ----------------------------------------------------------- */
+xf_Value xf_value_retain(xf_Value v);
+void     xf_value_release(xf_Value v);
 
 
 /* ------------------------------------------------------------
@@ -378,7 +391,7 @@ bool xf_can_coerce(xf_value_t v, uint8_t target_type);
  * State propagation helpers
  *
  * When operating on values, state takes priority over type.
- * ERR/NAV propagate. UNDEF/UNDETERMINED block.
+ * ERR/NAV propagate. UNDEF blocks.
  * ------------------------------------------------------------ */
 
 /* given two values, return the dominant state */

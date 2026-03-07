@@ -393,7 +393,9 @@ static xf_Value cs_sprintf(xf_Value *args, size_t argc) {
  * core.os native functions
  * ============================================================ */
 
-static xf_Value csy_exec(xf_Value *args, size_t argc) {
+/* execute(cmd) — run a shell command, return exit code.
+ * Equivalent to sh -c cmd; waits for completion. */
+static xf_Value csy_execute(xf_Value *args, size_t argc) {
     NEED(1);
     const char *cmd; size_t cmdlen;
     if (!arg_str(args, argc, 0, &cmd, &cmdlen)) return propagate(args, argc);
@@ -422,6 +424,30 @@ static xf_Value csy_env(xf_Value *args, size_t argc) {
     return make_str_val(val, strlen(val));
 }
 
+
+
+/* free(val) — manual GC hint.
+ *
+ * Usage:  x = core.os.free(x)
+ *
+ * Returns null. The assignment back to x triggers sym_assign which
+ * releases the symtable's own reference to the old value. Combined
+ * with EXPR_CALL's arg-release (phase 2), this drops all references
+ * and frees the underlying heap object immediately.
+ *
+ * Pre phase-2: only the symtable ref is dropped (via the assignment).
+ * Post phase-2: both the call-site ref and the symtable ref are dropped.
+ *
+ * Either way, the idiom is always:  x = core.os.free(x)
+ * Do NOT write:  core.os.free(x)  — without the assignment, x still
+ * holds its symtable reference and nothing is freed.
+ *
+ * Works with any heap-allocated type: str, arr, map, set, fn, regex.
+ * No-op for num and other scalar types (nothing to free).           */
+static xf_Value csy_free(xf_Value *args, size_t argc) {
+    (void)args; (void)argc;
+    return xf_val_null();
+}
 
 /* ============================================================
  * Module construction + registration
@@ -925,7 +951,8 @@ static xf_Value csy_run_lines(xf_Value *args, size_t argc) {
 static xf_module_t *build_os(void) {
     xf_module_t *m = xf_module_new("core.os");
 
-    FN("exec",      XF_TYPE_NUM,  csy_exec);
+    FN("execute",   XF_TYPE_NUM,  csy_execute);  /* run cmd, return exit code */
+    FN("exec",      XF_TYPE_NUM,  csy_execute);  /* alias for backwards compat */
     FN("exit",      XF_TYPE_VOID, csy_exit);
     FN("time",      XF_TYPE_NUM,  csy_time);
     FN("env",       XF_TYPE_STR,  csy_env);
@@ -935,6 +962,7 @@ static xf_module_t *build_os(void) {
     FN("lines",     XF_TYPE_ARR,  csy_lines);
     FN("run",       XF_TYPE_STR,  csy_run);
     FN("run_lines", XF_TYPE_ARR,  csy_run_lines);
+    FN("free",      XF_TYPE_VOID, csy_free);     /* manual GC: x = core.os.free(x) */
 
     return m;
 }
@@ -2467,7 +2495,7 @@ static xf_Value cd_sort(xf_Value *args, size_t argc) {
 
     /* copy the items array so we can sort without mutating the original */
     xf_arr_t *out = xf_arr_new();
-    for (size_t i = 0; i < ds->len; i++) xf_arr_push(out, ds->items[i]);
+    for (size_t i = 0; i < ds->len; i++) xf_arr_push(out, xf_value_retain(ds->items[i]));
 
     g_sort_ctx.key = col;
     g_sort_ctx.dir = dir;
@@ -2540,13 +2568,13 @@ static xf_Value cd_merge(xf_Value *args, size_t argc) {
 
     if (!join_mode) {
         /* simple concat */
-        for (size_t i = 0; i < ds1->len; i++) xf_arr_push(out, ds1->items[i]);
-        for (size_t i = 0; i < ds2->len; i++) xf_arr_push(out, ds2->items[i]);
+        for (size_t i = 0; i < ds1->len; i++) xf_arr_push(out, xf_value_retain(ds1->items[i]));
+        for (size_t i = 0; i < ds2->len; i++) xf_arr_push(out, xf_value_retain(ds2->items[i]));
     } else {
         /* left join on jkey: for each row in ds1 find matching row in ds2 */
         for (size_t i = 0; i < ds1->len; i++) {
             xf_map_t *r1 = ds_row_map(ds1, i);
-            if (!r1) { xf_arr_push(out, ds1->items[i]); continue; }
+            if (!r1) { xf_arr_push(out, xf_value_retain(ds1->items[i])); continue; }
 
             xf_Value jv1 = ds_cell(r1, jkey);
             xf_Value js1 = xf_coerce_str(jv1);
@@ -2568,14 +2596,14 @@ static xf_Value cd_merge(xf_Value *args, size_t argc) {
 
             if (!matched) {
                 /* no match — just include the ds1 row as-is */
-                xf_arr_push(out, ds1->items[i]);
+                xf_arr_push(out, xf_value_retain(ds1->items[i]));
             } else {
                 /* merge row maps: start with all keys from r1, overlay r2 */
                 xf_map_t *merged = xf_map_new();
                 for (size_t k = 0; k < r1->order_len; k++)
-                    xf_map_set(merged, r1->order[k], xf_map_get(r1, r1->order[k]));
+                    xf_map_set(merged, r1->order[k], xf_value_retain(xf_map_get(r1, r1->order[k])));
                 for (size_t k = 0; k < matched->order_len; k++)
-                    xf_map_set(merged, matched->order[k], xf_map_get(matched, matched->order[k]));
+                    xf_map_set(merged, matched->order[k], xf_value_retain(xf_map_get(matched, matched->order[k])));
                 xf_Value mv = xf_val_ok_map(merged);
                 xf_arr_push(out, mv);
                 (void)merged; /* map not retained by val_ok_map; do not release */
@@ -2661,7 +2689,7 @@ static xf_Value cd_values(xf_Value *args, size_t argc) {
         if (!row) { xf_arr_push(out, xf_val_nav(XF_TYPE_ARR)); continue; }
         xf_arr_t *rv = xf_arr_new();
         for (size_t k = 0; k < row->order_len; k++)
-            xf_arr_push(rv, xf_map_get(row, row->order[k]));
+            xf_arr_push(rv, xf_value_retain(xf_map_get(row, row->order[k])));
         xf_Value vv = xf_val_ok_arr(rv);
         xf_arr_push(out, vv);
         xf_arr_release(rv);
@@ -2697,12 +2725,12 @@ static xf_Value cd_filter(xf_Value *args, size_t argc) {
             if (cell.state != XF_STATE_OK) continue;
             xf_Value cs = xf_coerce_str(cell);
             if (cs.state != XF_STATE_OK || !cs.data.str || cs.data.str->len == 0) continue;
-            xf_arr_push(out, ds->items[i]);
+            xf_arr_push(out, xf_value_retain(ds->items[i]));
         } else {
             xf_Value cs = xf_coerce_str(cell);
             if (cs.state != XF_STATE_OK || !cs.data.str) continue;
             if (match_s && strcmp(cs.data.str->data, match_s) == 0)
-                xf_arr_push(out, ds->items[i]);
+                xf_arr_push(out, xf_value_retain(ds->items[i]));
         }
     }
     xf_Value v = xf_val_ok_arr(out);
