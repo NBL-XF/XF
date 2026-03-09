@@ -24,7 +24,6 @@ static const Keyword keywords[] = {
     { "NULL",          TK_KW_NULL   },
     { "VOID",          TK_KW_VOID_S },
     { "UNDEF",         TK_KW_UNDEF  },
-    { "UNDETERMINED",  TK_KW_UNDET  },
     { "BEGIN",         TK_KW_BEGIN  },
     { "END",           TK_KW_END    },
     { "if",            TK_KW_IF     },
@@ -41,6 +40,7 @@ static const Keyword keywords[] = {
     { "join",          TK_KW_JOIN   },
     { "next",          TK_KW_NEXT   },
     { "exit",          TK_KW_EXIT   },
+    { "break",         TK_KW_BREAK  },
     { "delete",        TK_KW_DELETE },
     { "import",        TK_KW_IMPORT },
     { "NR",            TK_VAR_NR    },
@@ -50,6 +50,7 @@ static const Keyword keywords[] = {
     { "RS",            TK_VAR_RS    },
     { "OFS",           TK_VAR_OFS   },
     { "ORS",           TK_VAR_ORS   },
+    { "OFMT",          TK_VAR_OFMT  },
 };
 #define KEYWORD_COUNT (sizeof(keywords) / sizeof(keywords[0]))
 
@@ -400,7 +401,7 @@ static Token scan_ident(Lexer *l, size_t start, Loc loc) {
     l->after_value = (kind == TK_IDENT     || kind == TK_KW_OK  ||
                       kind == TK_KW_ERR    || kind == TK_KW_NAV ||
                       kind == TK_KW_NULL   || kind == TK_KW_VOID_S ||
-                      kind == TK_KW_UNDEF  || kind == TK_KW_UNDET);
+                      kind == TK_KW_UNDEF);
     return t;
 }
 
@@ -638,7 +639,6 @@ const char *xf_token_kind_name(TokenKind kind) {
         case TK_KW_NULL:      return "kw:NULL";
         case TK_KW_VOID_S:    return "kw:VOID";
         case TK_KW_UNDEF:     return "kw:UNDEF";
-        case TK_KW_UNDET:     return "kw:UNDETERMINED";
         case TK_KW_BEGIN:     return "kw:BEGIN";
         case TK_KW_END:       return "kw:END";
         case TK_KW_IF:        return "kw:if";
@@ -655,6 +655,7 @@ const char *xf_token_kind_name(TokenKind kind) {
         case TK_KW_JOIN:      return "kw:join";
         case TK_KW_NEXT:      return "kw:next";
         case TK_KW_EXIT:      return "kw:exit";
+        case TK_KW_BREAK:     return "kw:break";
         case TK_KW_DELETE:    return "kw:delete";
         case TK_KW_IMPORT:    return "kw:import";
         case TK_FIELD:        return "FIELD";
@@ -669,6 +670,7 @@ const char *xf_token_kind_name(TokenKind kind) {
         case TK_VAR_RS:       return "RS";
         case TK_VAR_OFS:      return "OFS";
         case TK_VAR_ORS:      return "ORS";
+        case TK_VAR_OFMT:     return "OFMT";
         case TK_PLUS:         return "+";
         case TK_MINUS:        return "-";
         case TK_STAR:         return "*";

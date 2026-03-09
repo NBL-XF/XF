@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <pthread.h>
 
 /* ============================================================
  * xf VM — stack-based bytecode virtual machine
@@ -187,6 +189,15 @@ typedef struct {
     uint8_t   out_mode;      /* XF_OUTFMT_* — current output mode   */
     char    **headers;       /* field name strings for JSON (owned) */
     size_t    header_count;
+    bool      headers_set;   /* true once headers have been populated */
+
+    /* ── implicit match/context variables ────────────────────────────── *
+     * Populated after ~ / !~ matches and at record boundaries.         *
+     * vm_set_match(), vm_set_err(), vm_set_file() manage these.        */
+    char      current_file[512]; /* $file     — input filename         */
+    xf_Value  last_match;        /* $match    — full matched text      */
+    xf_Value  last_captures;     /* $captures — arr of group strings   */
+    xf_Value  last_err;          /* $err      — last error message str */
 } RecordCtx;
 
 
@@ -219,8 +230,21 @@ typedef struct VM {
     uint32_t   next_id;
     int        max_jobs;
 
+    /* print redirect file handle cache
+     * Maps destination path → open FILE* so that successive print
+     * statements to the same file don't open/close on every record.
+     * Entries are flushed and closed by vm_redir_flush(). */
+#define VM_REDIR_MAX 32
+    struct {
+        char  path[256];  /* destination path or command */
+        FILE *fp;
+        bool  is_pipe;
+    } redir[VM_REDIR_MAX];
+    size_t redir_count;
+
     /* record context */
     RecordCtx  rec;
+    pthread_mutex_t rec_mu;    /* guards rec during split_record */
 
     /* pattern-action rule chunks (interp fills these) */
     Chunk    **rules;          /* compiled rule bodies           */
@@ -257,6 +281,21 @@ uint32_t  vm_alloc_global(VM *vm, xf_Value init);
 
 void      vm_error(VM *vm, const char *fmt, ...);
 void      vm_dump_stack(const VM *vm);
+
+/* redirect file handle cache */
+FILE     *vm_redir_open(VM *vm, const char *path, int op); /* op: 1=write,2=append,3=pipe */
+void      vm_redir_flush(VM *vm);   /* flush+close all cached handles */
+
+/* JSON header population: parse first record as column headers */
+void      vm_capture_headers(VM *vm); /* call after split_record on NR==1 when JSON mode */
+
+/* Record context snapshot — used by worker threads to get a private
+ * copy of the current record without holding rec_mu during fn execution.
+ * vm_rec_snapshot: deep-copies buf, re-pointers fields, retains xf_Values.
+ * vm_rec_snapshot_free: releases owned memory (buf, headers, xf_Values).
+ * Both are safe to call from any thread; snapshot takes rec_mu briefly. */
+void      vm_rec_snapshot(VM *vm, RecordCtx *snap);
+void      vm_rec_snapshot_free(RecordCtx *snap);
 
 const char *opcode_name(OpCode op);
 

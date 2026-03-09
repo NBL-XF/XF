@@ -289,6 +289,7 @@ typedef enum {
     STMT_RETURN,      /* return expr ;                          */
     STMT_NEXT,        /* next ;   (advance to next record)      */
     STMT_EXIT,        /* exit ;   (exit program)                */
+    STMT_BREAK,       /* break ;  (exit innermost loop)         */
 
     /* ── I/O ──────────────────────────────────────────────── */
     STMT_PRINT,       /* print expr, expr, ... ;                */
@@ -388,7 +389,8 @@ struct Stmt {
         struct {
             Expr  **args;
             size_t  count;
-            Expr   *redirect;  /* > file, >> file, | cmd — NULL = stdout */
+            Expr   *redirect;    /* target — NULL = stdout                */
+            uint8_t redirect_op; /* 0=none 1=>file 2=>>append 3=|pipe    */
         } print;
 
         /* STMT_PRINTF — same shape; first arg is the format string */
@@ -396,6 +398,7 @@ struct Stmt {
             Expr  **args;
             size_t  count;
             Expr   *redirect;
+            uint8_t redirect_op;
         } printf_stmt;
 
         /* STMT_OUTFMT */
@@ -542,8 +545,9 @@ Stmt *ast_for_short(Expr *collection, xf_Str *iter, Stmt *body, Loc loc);
 Stmt *ast_return(Expr *value, Loc loc);
 Stmt *ast_next(Loc loc);
 Stmt *ast_exit(Loc loc);
-Stmt *ast_print(Expr **args, size_t count, Expr *redirect, Loc loc);
-Stmt *ast_printf_stmt(Expr **args, size_t count, Expr *redirect, Loc loc);
+Stmt *ast_break(Loc loc);
+Stmt *ast_print(Expr **args, size_t count, Expr *redirect, uint8_t redirect_op, Loc loc);
+Stmt *ast_printf_stmt(Expr **args, size_t count, Expr *redirect, uint8_t redirect_op, Loc loc);
 Stmt *ast_outfmt(uint8_t mode, Loc loc);
 Stmt *ast_import(xf_Str *path, Loc loc);
 Stmt *ast_delete(Expr *target, Loc loc);

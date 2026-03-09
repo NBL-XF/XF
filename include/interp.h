@@ -39,10 +39,24 @@ typedef struct {
     bool      returning;
     xf_Value  return_val;
 
-    /* nexting / exiting */
+    /* nexting / exiting / breaking */
     bool      nexting;
     bool      exiting;
+    bool      breaking;   /* break — exit innermost loop only */
+
+    /* implicit vars: $err, populated by interp_error */
+    xf_Value  last_err;   /* XF_STATE_NULL when no error has occurred */
+
+    /* per-thread record context snapshot (set by worker threads).
+     * When use_rec_snap is true, all $N/$0/NR/NF/FS/OFS/ORS reads
+     * and writes go through rec_snap instead of vm->rec, so worker
+     * threads never race with the main thread's split_record. */
+    bool       use_rec_snap;
+    RecordCtx  rec_snap;
 } Interp;
+
+/* Route record context reads/writes through snapshot when in worker thread */
+#define IT_REC(it) ((it)->use_rec_snap ? &(it)->rec_snap : &(it)->vm->rec)
 
 
 /* ------------------------------------------------------------
@@ -107,4 +121,3 @@ void interp_type_err(Interp *it, Loc loc,
                      const char *op, uint8_t got, uint8_t expected);
 
 #endif /* XF_INTERP_H */
-

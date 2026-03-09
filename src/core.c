@@ -1,3 +1,7 @@
+/* enable M_PI, popen, strdup on glibc */
+#if defined(__linux__) || defined(__CYGWIN__)
+#  define _GNU_SOURCE
+#endif
 #include "../include/core.h"
 #include "../include/value.h"
 #include "../include/symTable.h"
@@ -19,6 +23,24 @@
 static xf_module_t *build_ds(void);
 static xf_module_t *build_edit(void);
 static xf_module_t *build_format(void);
+static xf_module_t *build_process(void);
+
+/* ── XF-function execution callback (set by interp.c at startup) */
+static xf_fn_caller_t g_fn_caller    = NULL;
+static void          *g_fn_caller_vm  = NULL;
+static void          *g_fn_caller_syms = NULL;  /* parent SymTable for global visibility */
+
+void core_set_fn_caller(void *vm, void *syms, xf_fn_caller_t caller) {
+    g_fn_caller_vm   = vm;
+    g_fn_caller_syms = syms;
+    g_fn_caller      = caller;
+}
+/* forward decl: regex helpers used by core.str and core.generics
+ * (defined in the core.regex section further down) */
+#include <regex.h>
+#define CR_MAX_GROUPS 32
+static bool cr_compile(const char *pat, int cflags,
+                        regex_t *out, char *errmsg, size_t errmsg_len);
 /* require arg i to be OK num, else propagate / return NAV */
 static bool arg_num(xf_Value *args, size_t argc, size_t i, double *out) {
     if (i >= argc) return false;
@@ -118,9 +140,6 @@ static xf_Value cm_clamp(xf_Value *args, size_t argc) {
 }
 
 static xf_Value cm_rand(xf_Value *args, size_t argc) {
-    
-    argc=argc-1;
-    if(args) argc=argc+1;
     return xf_val_ok_num((double)rand() / (double)RAND_MAX);
 }
 
@@ -239,24 +258,78 @@ static xf_Value cs_substr(xf_Value *args, size_t argc) {
     return make_str_val(s + start, take);
 }
 
+/* ── regex-aware pattern extraction ───────────────────────────────────────
+ * Extract a pattern string + POSIX cflags from args[pat_idx].
+ * Accepts:
+ *   - XF_TYPE_STR  → plain substring / literal pattern
+ *   - XF_TYPE_REGEX → .pattern string + .flags mapped to REG_* flags
+ * Returns false if arg is missing or in wrong state.
+ * Sets *is_regex=true when the arg is a proper regex that needs regcomp. */
+static bool cs_arg_pat(xf_Value *args, size_t argc, size_t pat_idx,
+                        const char **pat_out, int *cflags_out, bool *is_regex) {
+    if (pat_idx >= argc || args[pat_idx].state != XF_STATE_OK) return false;
+    xf_Value pv = args[pat_idx];
+    if (pv.type == XF_TYPE_REGEX && pv.data.re && pv.data.re->pattern) {
+        *pat_out   = pv.data.re->pattern->data;
+        int cf     = REG_EXTENDED;
+        if (pv.data.re->flags & XF_RE_ICASE)     cf |= REG_ICASE;
+        if (pv.data.re->flags & XF_RE_MULTILINE)  cf |= REG_NEWLINE;
+        *cflags_out = cf;
+        *is_regex   = true;
+        return true;
+    }
+    if (pv.type == XF_TYPE_STR && pv.data.str) {
+        *pat_out    = pv.data.str->data;
+        *cflags_out = REG_EXTENDED;
+        *is_regex   = false;
+        return true;
+    }
+    return false;
+}
+
 static xf_Value cs_index(xf_Value *args, size_t argc) {
     NEED(2);
     const char *s; size_t slen;
-    const char *needle; size_t nlen;
-    if (!arg_str(args, argc, 0, &s,      &slen)) return propagate(args, argc);
-    if (!arg_str(args, argc, 1, &needle, &nlen)) return propagate(args, argc);
-    if (nlen == 0) return xf_val_ok_num(0);
-    const char *found = strstr(s, needle);
-    return xf_val_ok_num(found ? (double)(found - s) : -1.0);
+    if (!arg_str(args, argc, 0, &s, &slen)) return propagate(args, argc);
+
+    const char *pat; int cflags; bool is_regex;
+    if (!cs_arg_pat(args, argc, 1, &pat, &cflags, &is_regex))
+        return propagate(args, argc);
+
+    if (!is_regex) {
+        /* plain substring search */
+        if (pat[0] == '\0') return xf_val_ok_num(0);
+        const char *found = strstr(s, pat);
+        return xf_val_ok_num(found ? (double)(found - s) : -1.0);
+    }
+
+    /* regex search — return byte offset of first match or -1 */
+    regex_t re; char errbuf[128];
+    if (!cr_compile(pat, cflags, &re, errbuf, sizeof(errbuf)))
+        return xf_val_nav(XF_TYPE_NUM);
+    regmatch_t pm[1];
+    int rc = regexec(&re, s, 1, pm, 0);
+    regfree(&re);
+    return xf_val_ok_num(rc == 0 ? (double)pm[0].rm_so : -1.0);
 }
 
 static xf_Value cs_contains(xf_Value *args, size_t argc) {
     NEED(2);
     const char *s; size_t slen;
-    const char *needle; size_t nlen;
-    if (!arg_str(args, argc, 0, &s,      &slen)) return propagate(args, argc);
-    if (!arg_str(args, argc, 1, &needle, &nlen)) return propagate(args, argc);
-    return xf_val_ok_num(strstr(s, needle) ? 1.0 : 0.0);
+    if (!arg_str(args, argc, 0, &s, &slen)) return propagate(args, argc);
+
+    const char *pat; int cflags; bool is_regex;
+    if (!cs_arg_pat(args, argc, 1, &pat, &cflags, &is_regex))
+        return propagate(args, argc);
+
+    if (!is_regex) return xf_val_ok_num(strstr(s, pat) ? 1.0 : 0.0);
+
+    regex_t re; char errbuf[128];
+    if (!cr_compile(pat, cflags, &re, errbuf, sizeof(errbuf)))
+        return xf_val_ok_num(0);
+    int rc = regexec(&re, s, 0, NULL, 0);
+    regfree(&re);
+    return xf_val_ok_num(rc == 0 ? 1.0 : 0.0);
 }
 
 static xf_Value cs_starts_with(xf_Value *args, size_t argc) {
@@ -279,25 +352,107 @@ static xf_Value cs_ends_with(xf_Value *args, size_t argc) {
     return xf_val_ok_num(memcmp(s + slen - suflen, suf, suflen) == 0 ? 1.0 : 0.0);
 }
 
+/* ── shared regex replacement helper ────────────────────────── */
+/* Expand \1..\9 back-references in `repl` using the match `pm`.
+ * Writes into `out` (pre-allocated, caller ensures capacity). */
+static size_t cs_expand_backref(const char *subject, const char *repl,
+                                  const regmatch_t *pm, size_t ngroups,
+                                  char *out, size_t out_cap) {
+    size_t w = 0;
+    for (const char *r = repl; *r && w + 1 < out_cap; r++) {
+        if (*r == '\\' && r[1] >= '1' && r[1] <= '9') {
+            size_t gi = (size_t)(r[1] - '0');
+            if (gi < ngroups && pm[gi].rm_so >= 0) {
+                size_t glen = (size_t)(pm[gi].rm_eo - pm[gi].rm_so);
+                if (w + glen < out_cap) {
+                    memcpy(out + w, subject + pm[gi].rm_so, glen);
+                    w += glen;
+                }
+            }
+            r++;  /* skip digit */
+        } else {
+            out[w++] = *r;
+        }
+    }
+    out[w] = '\0';
+    return w;
+}
+
+/* Apply one regex replacement into a dynamic buffer.
+ * Returns new write position. */
+static size_t cs_regex_replace_one(const char *subject, regmatch_t *pm,
+                                    size_t ngroups,
+                                    const char *repl, size_t repl_len,
+                                    char **buf, size_t *cap, size_t wpos) {
+    /* part before match */
+    size_t pre = (size_t)pm[0].rm_so;
+    size_t expanded_max = repl_len * 2 + 256;
+    while (wpos + pre + expanded_max + 1 > *cap) {
+        *cap *= 2;
+        *buf  = realloc(*buf, *cap);
+    }
+    memcpy(*buf + wpos, subject, pre);
+    wpos += pre;
+    /* expanded replacement */
+    char  expbuf[4096];
+    size_t elen = cs_expand_backref(subject, repl, pm, ngroups,
+                                     expbuf, sizeof(expbuf));
+    if (wpos + elen + 1 > *cap) { *cap = (wpos + elen) * 2 + 64; *buf = realloc(*buf, *cap); }
+    memcpy(*buf + wpos, expbuf, elen);
+    wpos += elen;
+    return wpos;
+}
+
 static xf_Value cs_replace(xf_Value *args, size_t argc) {
     NEED(3);
     const char *s; size_t slen;
-    const char *old; size_t oldlen;
     const char *neo; size_t neolen;
     if (!arg_str(args, argc, 0, &s,   &slen))   return propagate(args, argc);
-    if (!arg_str(args, argc, 1, &old, &oldlen)) return propagate(args, argc);
     if (!arg_str(args, argc, 2, &neo, &neolen)) return propagate(args, argc);
-    if (oldlen == 0) return make_str_val(s, slen);
-    const char *found = strstr(s, old);
-    if (!found) return make_str_val(s, slen);
-    size_t prefix = (size_t)(found - s);
-    size_t total  = prefix + neolen + (slen - prefix - oldlen);
-    char *buf = malloc(total + 1);
-    memcpy(buf, s, prefix);
-    memcpy(buf + prefix, neo, neolen);
-    memcpy(buf + prefix + neolen, found + oldlen, slen - prefix - oldlen);
-    buf[total] = '\0';
-    xf_Value v = make_str_val(buf, total);
+
+    const char *pat; int cflags; bool is_regex;
+    if (!cs_arg_pat(args, argc, 1, &pat, &cflags, &is_regex))
+        return propagate(args, argc);
+
+    if (!is_regex) {
+        /* plain substring, first occurrence */
+        size_t oldlen = strlen(pat);
+        if (oldlen == 0) return make_str_val(s, slen);
+        const char *found = strstr(s, pat);
+        if (!found) return make_str_val(s, slen);
+        size_t prefix = (size_t)(found - s);
+        size_t total  = prefix + neolen + (slen - prefix - oldlen);
+        char *buf = malloc(total + 1);
+        memcpy(buf, s, prefix);
+        memcpy(buf + prefix, neo, neolen);
+        memcpy(buf + prefix + neolen, found + oldlen, slen - prefix - oldlen);
+        buf[total] = '\0';
+        xf_Value v = make_str_val(buf, total);
+        free(buf);
+        return v;
+    }
+
+    /* regex: replace first match, support \1..\9 back-refs */
+    regex_t re; char errbuf[128];
+    if (!cr_compile(pat, cflags, &re, errbuf, sizeof(errbuf)))
+        return make_str_val(s, slen);
+    regmatch_t pm[CR_MAX_GROUPS];
+    int rc = regexec(&re, s, CR_MAX_GROUPS, pm, 0);
+    if (rc != 0) { regfree(&re); return make_str_val(s, slen); }
+
+    size_t cap = slen * 2 + 64;
+    char  *buf = malloc(cap);
+    size_t w   = cs_regex_replace_one(s, pm, re.re_nsub + 1,
+                                       neo, neolen, &buf, &cap, 0);
+    /* append tail */
+    size_t tail_start = (size_t)pm[0].rm_eo;
+    size_t tail_len   = slen - tail_start;
+    if (w + tail_len + 1 > cap) { cap = w + tail_len + 64; buf = realloc(buf, cap); }
+    memcpy(buf + w, s + tail_start, tail_len);
+    w += tail_len;
+    buf[w] = '\0';
+    regfree(&re);
+    xf_Value v = make_str_val(buf, w);
     free(buf);
     return v;
 }
@@ -305,39 +460,74 @@ static xf_Value cs_replace(xf_Value *args, size_t argc) {
 static xf_Value cs_replace_all(xf_Value *args, size_t argc) {
     NEED(3);
     const char *s; size_t slen;
-    const char *old; size_t oldlen;
     const char *neo; size_t neolen;
     if (!arg_str(args, argc, 0, &s,   &slen))   return propagate(args, argc);
-    if (!arg_str(args, argc, 1, &old, &oldlen)) return propagate(args, argc);
     if (!arg_str(args, argc, 2, &neo, &neolen)) return propagate(args, argc);
-    if (oldlen == 0) return make_str_val(s, slen);
 
-    /* build result with a dynamic buffer */
-    size_t cap = slen * 2 + 64;
-    char *buf = malloc(cap);
-    size_t wpos = 0;
-    const char *cur = s;
-    const char *end = s + slen;
+    const char *pat; int cflags; bool is_regex;
+    if (!cs_arg_pat(args, argc, 1, &pat, &cflags, &is_regex))
+        return propagate(args, argc);
 
-    while (cur < end) {
-        const char *found = strstr(cur, old);
-        if (!found) {
-            size_t rest = (size_t)(end - cur);
-            if (wpos + rest + 1 > cap) { cap = wpos + rest + 64; buf = realloc(buf, cap); }
-            memcpy(buf + wpos, cur, rest);
-            wpos += rest;
-            break;
+    if (!is_regex) {
+        /* plain substring, all occurrences */
+        size_t oldlen = strlen(pat);
+        if (oldlen == 0) return make_str_val(s, slen);
+        size_t cap = slen * 2 + 64;
+        char *buf = malloc(cap);
+        size_t wpos = 0;
+        const char *cur = s, *end = s + slen;
+        while (cur < end) {
+            const char *found = strstr(cur, pat);
+            if (!found) {
+                size_t rest = (size_t)(end - cur);
+                if (wpos + rest + 1 > cap) { cap = wpos + rest + 64; buf = realloc(buf, cap); }
+                memcpy(buf + wpos, cur, rest);
+                wpos += rest; break;
+            }
+            size_t prefix = (size_t)(found - cur);
+            if (wpos + prefix + neolen + 1 > cap) { cap = (wpos + prefix + neolen) * 2 + 64; buf = realloc(buf, cap); }
+            memcpy(buf + wpos, cur, prefix); wpos += prefix;
+            memcpy(buf + wpos, neo, neolen); wpos += neolen;
+            cur = found + oldlen;
         }
-        size_t prefix = (size_t)(found - cur);
-        if (wpos + prefix + neolen + 1 > cap) { cap = (wpos + prefix + neolen) * 2 + 64; buf = realloc(buf, cap); }
-        memcpy(buf + wpos, cur, prefix);
-        wpos += prefix;
-        memcpy(buf + wpos, neo, neolen);
-        wpos += neolen;
-        cur = found + oldlen;
+        buf[wpos] = '\0';
+        xf_Value v = make_str_val(buf, wpos);
+        free(buf);
+        return v;
     }
-    buf[wpos] = '\0';
-    xf_Value v = make_str_val(buf, wpos);
+
+    /* regex: replace all non-overlapping matches */
+    regex_t re; char errbuf[128];
+    if (!cr_compile(pat, cflags, &re, errbuf, sizeof(errbuf)))
+        return make_str_val(s, slen);
+
+    size_t cap = slen * 2 + 64;
+    char  *buf = malloc(cap);
+    size_t w   = 0;
+    const char *cur = s, *end = s + slen;
+    while (cur < end) {
+        regmatch_t pm[CR_MAX_GROUPS];
+        int rc = regexec(&re, cur, CR_MAX_GROUPS, pm, cur > s ? REG_NOTBOL : 0);
+        if (rc != 0) {
+            /* no more matches — copy tail */
+            size_t rest = (size_t)(end - cur);
+            if (w + rest + 1 > cap) { cap = w + rest + 64; buf = realloc(buf, cap); }
+            memcpy(buf + w, cur, rest); w += rest; break;
+        }
+        w = cs_regex_replace_one(cur, pm, re.re_nsub + 1,
+                                  neo, neolen, &buf, &cap, w);
+        size_t adv = (size_t)pm[0].rm_eo;
+        if (adv == 0) {
+            /* zero-width match guard: emit one char to avoid infinite loop */
+            if (w + 1 >= cap) { cap = cap * 2; buf = realloc(buf, cap); }
+            buf[w++] = *cur++;
+        } else {
+            cur += adv;
+        }
+    }
+    buf[w] = '\0';
+    regfree(&re);
+    xf_Value v = make_str_val(buf, w);
     free(buf);
     return v;
 }
@@ -410,8 +600,6 @@ static xf_Value csy_exit(xf_Value *args, size_t argc) {
 }
 
 static xf_Value csy_time(xf_Value *args, size_t argc) {
-    argc=argc-1;
-    if(args) argc=argc+1;
     return xf_val_ok_num((double)time(NULL));
 }
 
@@ -583,28 +771,105 @@ static xf_Value cg_split(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value src = args[0];
     if (src.state != XF_STATE_OK) return src;
-    if (src.type == XF_TYPE_ARR || src.type == XF_TYPE_MAP ||
-        src.type == XF_TYPE_SET)
-        return xf_val_nav(XF_TYPE_ARR);   /* future: partition overload */
 
+    /* ── partition overload: split(arr|map, n) ──────────────────
+     * Divides a collection into n roughly-equal chunks.
+     * split(arr, 4)  → [[...], [...], [...], [...]]
+     * split(map, 4)  → [{...}, {...}, {...}, {...}]
+     * Used by core.process.split to assign work ranges. */
+    if (src.type == XF_TYPE_ARR && src.data.arr) {
+        double dn;
+        if (!arg_num(args, argc, 1, &dn) || dn < 1) return xf_val_nav(XF_TYPE_ARR);
+        size_t n    = (size_t)dn;
+        xf_arr_t *in = src.data.arr;
+        size_t    sz  = in->len;
+        xf_arr_t *out = xf_arr_new();
+        size_t    per = (sz + n - 1) / n;   /* ceil(sz/n) */
+        for (size_t i = 0; i < n; i++) {
+            size_t   from = i * per;
+            size_t   to   = from + per < sz ? from + per : sz;
+            xf_arr_t *chunk = xf_arr_new();
+            for (size_t j = from; j < to; j++) xf_arr_push(chunk, in->items[j]);
+            xf_Value cv = xf_val_ok_arr(chunk); xf_arr_release(chunk);
+            xf_arr_push(out, cv);
+            if (to >= sz) break;
+        }
+        xf_Value v = xf_val_ok_arr(out); xf_arr_release(out);
+        return v;
+    }
+    if (src.type == XF_TYPE_MAP && src.data.map) {
+        double dn;
+        if (!arg_num(args, argc, 1, &dn) || dn < 1) return xf_val_nav(XF_TYPE_ARR);
+        size_t n     = (size_t)dn;
+        xf_map_t *in = src.data.map;
+        size_t    sz  = in->order_len;
+        xf_arr_t *out = xf_arr_new();
+        size_t    per = (sz + n - 1) / n;
+        for (size_t i = 0; i < n; i++) {
+            size_t    from  = i * per;
+            size_t    to    = from + per < sz ? from + per : sz;
+            xf_map_t *chunk = xf_map_new();
+            for (size_t j = from; j < to; j++) {
+                xf_Str  *key = in->order[j];
+                xf_Value val = xf_map_get(in, key);
+                xf_map_set(chunk, key, val);
+            }
+            xf_Value cv = xf_val_ok_map(chunk); xf_map_release(chunk);
+            xf_arr_push(out, cv);
+            if (to >= sz) break;
+        }
+        xf_Value v = xf_val_ok_arr(out); xf_arr_release(out);
+        return v;
+    }
+
+    /* ── string split overload ───────────────────────────────────
+     * split(str, sep)        → plain delimiter split
+     * split(str, /pattern/)  → regex-aware split              */
     const char *s; size_t slen;
-    const char *sep; size_t seplen;
-    if (!arg_str(args, argc, 0, &s,   &slen))   return propagate(args, argc);
-    if (!arg_str(args, argc, 1, &sep, &seplen)) return propagate(args, argc);
+    if (!arg_str(args, argc, 0, &s, &slen)) return propagate(args, argc);
+
+    const char *pat; int cflags; bool is_regex;
+    if (!cs_arg_pat(args, argc, 1, &pat, &cflags, &is_regex))
+        return propagate(args, argc);
 
     xf_arr_t *out = xf_arr_new();
-    if (seplen == 0) {
-        for (size_t i = 0; i < slen; i++) xf_arr_push(out, make_str_val(s + i, 1));
-    } else {
-        const char *p = s, *end = s + slen;
-        while (p <= end) {
-            const char *found = (p < end) ? strstr(p, sep) : NULL;
-            const char *seg_end = found ? found : end;
-            xf_arr_push(out, make_str_val(p, (size_t)(seg_end - p)));
-            if (!found) break;
-            p = found + seplen;
+
+    if (!is_regex) {
+        size_t seplen = strlen(pat);
+        if (seplen == 0) {
+            for (size_t i = 0; i < slen; i++) xf_arr_push(out, make_str_val(s + i, 1));
+        } else {
+            const char *p = s, *end = s + slen;
+            while (p <= end) {
+                const char *found = (p < end) ? strstr(p, pat) : NULL;
+                const char *seg_end = found ? found : end;
+                xf_arr_push(out, make_str_val(p, (size_t)(seg_end - p)));
+                if (!found) break;
+                p = found + seplen;
+            }
         }
+    } else {
+        /* regex split */
+        regex_t re; char errbuf[128];
+        if (!cr_compile(pat, cflags, &re, errbuf, sizeof(errbuf))) {
+            xf_arr_release(out);
+            return xf_val_nav(XF_TYPE_ARR);
+        }
+        const char *cur = s, *end = s + slen;
+        while (cur <= end) {
+            regmatch_t pm[1];
+            int rc = regexec(&re, cur, 1, pm, cur > s ? REG_NOTBOL : 0);
+            if (rc != 0 || pm[0].rm_so == pm[0].rm_eo) {
+                /* no match or zero-width: emit rest */
+                xf_arr_push(out, make_str_val(cur, (size_t)(end - cur)));
+                break;
+            }
+            xf_arr_push(out, make_str_val(cur, (size_t)pm[0].rm_so));
+            cur += pm[0].rm_eo;
+        }
+        regfree(&re);
     }
+
     xf_Value v = xf_val_ok_arr(out);
     xf_arr_release(out);
     return v;
@@ -1004,8 +1269,6 @@ static xf_module_t *build_os(void) {
  *     → arr of substrings split on the pattern
  * ============================================================ */
 
-#include <regex.h>
-
 /* ── internal helpers ──────────────────────────────────────── */
 
 /* parse flags from a trailing string arg, e.g. "gim" */
@@ -1033,8 +1296,6 @@ static bool cr_compile(const char *pat, int cflags,
     }
     return true;
 }
-
-#define CR_MAX_GROUPS 32
 
 /* build a single match-result map from a subject string + regmatch array */
 static xf_Value cr_build_match_map(const char *subject, regmatch_t *pm,
@@ -2321,6 +2582,292 @@ static xf_module_t *build_format(void) {
     return m;
 }
 
+/* ============================================================
+ * core.process — parallel data processing
+ *
+ * Designed to split an arr-of-maps dataset across worker
+ * functions running in separate pthreads, then collect and
+ * flatten the results.
+ *
+ * API:
+ *   core.process.worker(fn, data)
+ *     → map {fn:<fn>, data:<arr>}
+ *     Packages a function with the chunk of data it will process.
+ *
+ *   core.process.split(data, n)
+ *     → arr of n arr chunks  (ceil-division of rows)
+ *     Identical to core.generics.split(arr, n) — provided here
+ *     for ergonomic co-location with the rest of the process API.
+ *
+ *   core.process.assign(chunk, workerFn)
+ *     → semi-relational result map:
+ *       {
+ *         "columns": arr of column-name strings,
+ *         "rows":    map of { row_index_str → map of { col_name → value } }
+ *       }
+ *     Runs workerFn(row) for each row in the chunk.  If workerFn
+ *     returns a map it is merged into the result; if it returns a
+ *     scalar the value is stored under the key "result".
+ *     Row indices are 0-based strings ("0", "1", …).
+ *
+ *   core.process.run(workers)
+ *     → arr of result values, one per worker, in original order.
+ *     workers is an arr of maps as returned by core.process.worker.
+ *     Each worker is dispatched to its own pthread; results are
+ *     joined in order and returned as an arr.
+ *     If max_jobs == 1 (default) falls back to sequential execution.
+ *
+ * Thread safety:
+ *   Each worker thread gets a private copy of its data chunk and
+ *   calls fn->native_v directly (no interpreter re-entry).
+ *   For XF-language worker functions (non-native), execution falls
+ *   back to sequential on the calling thread.
+ * ============================================================ */
+
+#include <pthread.h>
+
+/* ── process worker thread context ──────────────────────────── */
+
+typedef struct {
+    xf_fn_t  *fn;       /* borrowed ref — owned by caller for lifetime of run */
+    xf_arr_t *chunk;    /* owned ref to the data chunk */
+    xf_Value  result;   /* written by thread before exit */
+    bool      done;
+} ProcCtx;
+
+static void *cp_thread_fn(void *arg) {
+    ProcCtx *ctx = (ProcCtx *)arg;
+    xf_fn_t *fn  = ctx->fn;
+    xf_Value chunk_val = xf_val_ok_arr(ctx->chunk);
+
+    if (!fn) {
+        ctx->result = xf_val_null();
+    } else if (fn->is_native && fn->native_v) {
+        ctx->result = fn->native_v(&chunk_val, 1);
+    } else if (g_fn_caller && g_fn_caller_vm) {
+        /* XF-language fn: delegate to interpreter callback */
+        ctx->result = g_fn_caller(g_fn_caller_vm, g_fn_caller_syms, fn, &chunk_val, 1);
+    } else {
+        /* callback not registered yet — fall back to NAV */
+        ctx->result = xf_val_nav(XF_TYPE_FN);
+    }
+    ctx->done = true;
+    return NULL;
+}
+
+/* ── cp_worker(fn, data) → map {fn, data} ───────────────────── */
+static xf_Value cp_worker(xf_Value *args, size_t argc) {
+    NEED(2);
+    if (args[0].state != XF_STATE_OK || args[0].type != XF_TYPE_FN)
+        return xf_val_nav(XF_TYPE_MAP);
+    if (args[1].state != XF_STATE_OK || args[1].type != XF_TYPE_ARR)
+        return xf_val_nav(XF_TYPE_MAP);
+
+    xf_map_t *m = xf_map_new();
+    xf_Str *k_fn   = xf_str_from_cstr("fn");
+    xf_Str *k_data = xf_str_from_cstr("data");
+    xf_map_set(m, k_fn,   args[0]);
+    xf_map_set(m, k_data, args[1]);
+    xf_str_release(k_fn);
+    xf_str_release(k_data);
+    xf_Value v = xf_val_ok_map(m);
+    xf_map_release(m);
+    return v;
+}
+
+/* ── cp_split(data, n) → arr of n chunks ────────────────────── */
+/* Identical to cg_split(arr, n) — partition overload. */
+static xf_Value cp_split(xf_Value *args, size_t argc) {
+    NEED(2);
+    if (args[0].state != XF_STATE_OK || args[0].type != XF_TYPE_ARR || !args[0].data.arr)
+        return xf_val_nav(XF_TYPE_ARR);
+    double dn;
+    if (!arg_num(args, argc, 1, &dn) || dn < 1) return xf_val_nav(XF_TYPE_ARR);
+
+    xf_arr_t *in  = args[0].data.arr;
+    size_t    n   = (size_t)dn;
+    size_t    sz  = in->len;
+    size_t    per = (sz + n - 1) / n;   /* ceil(sz/n) */
+    xf_arr_t *out = xf_arr_new();
+    for (size_t i = 0; i < n; i++) {
+        size_t    from  = i * per;
+        size_t    to    = from + per < sz ? from + per : sz;
+        xf_arr_t *chunk = xf_arr_new();
+        for (size_t j = from; j < to; j++) xf_arr_push(chunk, in->items[j]);
+        xf_Value cv = xf_val_ok_arr(chunk); xf_arr_release(chunk);
+        xf_arr_push(out, cv);
+        if (to >= sz) break;
+    }
+    xf_Value v = xf_val_ok_arr(out); xf_arr_release(out);
+    return v;
+}
+
+/* ── cp_assign(chunk, fn) → arr of maps ─────────────────────────
+ *
+ * Applies fn(row) to every row in chunk and returns a plain
+ * arr-of-maps dataset — compatible with ds.flatten, ds.sort, etc.
+ *
+ * Merge rules per row:
+ *   fn returns map  → original row merged with fn output
+ *                     (fn keys overwrite original keys)
+ *   fn returns arr  → row stored as-is, arr appended under "_result"
+ *   fn returns scalar → row stored with scalar under "_result"
+ *   fn omitted/null → row stored as-is (identity transform)
+ *
+ * fn may be native or XF-language (XF fns require core_set_fn_caller
+ * to have been called by the interpreter at startup).
+ */
+static xf_Value cp_assign(xf_Value *args, size_t argc) {
+    NEED(1);
+    if (!args[0].data.arr || args[0].state != XF_STATE_OK ||
+        args[0].type != XF_TYPE_ARR) return xf_val_nav(XF_TYPE_ARR);
+    xf_arr_t *chunk = args[0].data.arr;
+
+    /* resolve fn — native or XF-language, or NULL */
+    xf_fn_t *fn = NULL;
+    bool fn_is_xf = false;
+    if (argc >= 2 && args[1].state == XF_STATE_OK &&
+        args[1].type == XF_TYPE_FN && args[1].data.fn) {
+        fn = args[1].data.fn;
+        fn_is_xf = !fn->is_native;
+    }
+
+    xf_arr_t *out = xf_arr_new();
+
+    for (size_t r = 0; r < chunk->len; r++) {
+        xf_Value row_in = chunk->items[r];
+
+        /* apply fn */
+        xf_Value row_out = xf_val_nav(XF_TYPE_VOID);
+        if (fn) {
+            if (fn->is_native && fn->native_v) {
+                row_out = fn->native_v(&row_in, 1);
+            } else if (fn_is_xf && g_fn_caller && g_fn_caller_vm) {
+                row_out = g_fn_caller(g_fn_caller_vm, g_fn_caller_syms, fn, &row_in, 1);
+            }
+        }
+
+        /* build output row map starting from original row */
+        xf_map_t *out_row = xf_map_new();
+
+        /* copy original row fields first */
+        if (row_in.state == XF_STATE_OK && row_in.type == XF_TYPE_MAP && row_in.data.map) {
+            xf_map_t *orig = row_in.data.map;
+            for (size_t k = 0; k < orig->order_len; k++)
+                xf_map_set(out_row, orig->order[k],
+                           xf_value_retain(xf_map_get(orig, orig->order[k])));
+        }
+
+        if (!fn || row_out.state != XF_STATE_OK) {
+            /* no fn / fn errored: output is original row */
+        } else if (row_out.type == XF_TYPE_MAP && row_out.data.map) {
+            /* fn returned map: overlay its keys (overwrite originals) */
+            xf_map_t *rm = row_out.data.map;
+            for (size_t k = 0; k < rm->order_len; k++)
+                xf_map_set(out_row, rm->order[k],
+                           xf_value_retain(xf_map_get(rm, rm->order[k])));
+            xf_value_release(row_out);
+        } else {
+            /* scalar or arr: store under "_result" */
+            xf_Str *k_res = xf_str_from_cstr("_result");
+            xf_map_set(out_row, k_res, row_out);
+            xf_str_release(k_res);
+        }
+
+        xf_Value out_val = xf_val_ok_map(out_row);
+        xf_arr_push(out, out_val);
+        xf_map_release(out_row);
+    }
+
+    xf_Value v = xf_val_ok_arr(out);
+    xf_arr_release(out);
+    return v;
+}
+
+/* ── cp_run(workers) → arr of results ───────────────────────── */
+/*
+ * workers: arr of maps {fn:<fn>, data:<arr>}
+ * Dispatches each worker to a pthread (if fn is native).
+ * Non-native fn workers run sequentially on the calling thread.
+ * Returns arr of result values in original worker order.
+ */
+#define CP_MAX_WORKERS 256
+static xf_Value cp_run(xf_Value *args, size_t argc) {
+    NEED(1);
+    if (args[0].state != XF_STATE_OK || args[0].type != XF_TYPE_ARR || !args[0].data.arr)
+        return xf_val_nav(XF_TYPE_ARR);
+    xf_arr_t *workers = args[0].data.arr;
+    size_t    nw      = workers->len < CP_MAX_WORKERS ? workers->len : CP_MAX_WORKERS;
+
+    /* allocate ctx array and thread id array on the stack */
+    ProcCtx  *ctxs = calloc(nw, sizeof(ProcCtx));
+    pthread_t *tids = calloc(nw, sizeof(pthread_t));
+
+    xf_Str *k_fn   = xf_str_from_cstr("fn");
+    xf_Str *k_data = xf_str_from_cstr("data");
+
+    /* launch threads */
+    for (size_t i = 0; i < nw; i++) {
+        xf_Value wv = workers->items[i];
+        if (wv.state != XF_STATE_OK || wv.type != XF_TYPE_MAP || !wv.data.map) {
+            ctxs[i].result = xf_val_nav(XF_TYPE_VOID);
+            ctxs[i].done   = true;
+            tids[i]        = 0;
+            continue;
+        }
+        xf_map_t *wm   = wv.data.map;
+        xf_Value  fv   = xf_map_get(wm, k_fn);
+        xf_Value  dv   = xf_map_get(wm, k_data);
+
+        xf_fn_t  *fn   = (fv.state == XF_STATE_OK && fv.type == XF_TYPE_FN) ? fv.data.fn : NULL;
+        xf_arr_t *data = (dv.state == XF_STATE_OK && dv.type == XF_TYPE_ARR) ? dv.data.arr : NULL;
+
+        ctxs[i].fn     = fn;
+        ctxs[i].chunk  = data ? (xf_arr_retain(data), data) : xf_arr_new();
+        ctxs[i].done   = false;
+        ctxs[i].result = xf_val_null();
+
+        if (fn) {
+            /* dispatch to thread — cp_thread_fn handles both native and XF fns */
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+            pthread_create(&tids[i], &attr, cp_thread_fn, &ctxs[i]);
+            pthread_attr_destroy(&attr);
+        } else {
+            tids[i]        = 0;
+            ctxs[i].result = xf_val_null();
+            ctxs[i].done   = true;
+        }
+    }
+
+    /* join threads and collect results */
+    xf_arr_t *out = xf_arr_new();
+    for (size_t i = 0; i < nw; i++) {
+        if (tids[i]) pthread_join(tids[i], NULL);
+        xf_arr_push(out, ctxs[i].result);
+        xf_arr_release(ctxs[i].chunk);
+    }
+
+    xf_str_release(k_fn);
+    xf_str_release(k_data);
+    free(ctxs);
+    free(tids);
+
+    xf_Value v = xf_val_ok_arr(out);
+    xf_arr_release(out);
+    return v;
+}
+
+static xf_module_t *build_process(void) {
+    xf_module_t *m = xf_module_new("core.process");
+    FN("worker", XF_TYPE_MAP, cp_worker);
+    FN("split",  XF_TYPE_ARR, cp_split);
+    FN("assign", XF_TYPE_ARR, cp_assign);
+    FN("run",    XF_TYPE_ARR, cp_run);
+    return m;
+}
+
 void core_register(SymTable *st) {
     xf_module_t *math_m     = build_math();
     xf_module_t *str_m      = build_str();
@@ -2330,6 +2877,7 @@ void core_register(SymTable *st) {
     xf_module_t *edit_m     = build_edit();
     xf_module_t *format_m   = build_format();
     xf_module_t *regex_m    = build_regex();
+    xf_module_t *process_m  = build_process();
 
     /* build the top-level core module */
     xf_module_t *core_m = xf_module_new("core");
@@ -2341,6 +2889,7 @@ void core_register(SymTable *st) {
     xf_module_set(core_m, "regex",    xf_val_ok_module(regex_m));
     xf_module_set(core_m, "edit",     xf_val_ok_module(edit_m));
     xf_module_set(core_m, "format",   xf_val_ok_module(format_m));
+    xf_module_set(core_m, "process",  xf_val_ok_module(process_m));
 
     /* release local refs — core_m retains them internally */
     xf_module_release(math_m);
@@ -2351,6 +2900,7 @@ void core_register(SymTable *st) {
     xf_module_release(regex_m);
     xf_module_release(edit_m);
     xf_module_release(format_m);
+    xf_module_release(process_m);
 
     /* register core as a global symbol */
     xf_Value core_val = xf_val_ok_module(core_m);
@@ -2438,8 +2988,8 @@ static xf_Value cd_column(xf_Value *args, size_t argc) {
     for (size_t i = 0; i < ds->len; i++) {
         xf_map_t *row = ds_row_map(ds, i);
         if (!row) { xf_arr_push(out, xf_val_nav(XF_TYPE_VOID)); continue; }
-        xf_arr_push(out, ds_cell(row, col));
-    }
+xf_arr_push(out, xf_value_retain(ds_cell(row, col)));
+        }
     xf_Value v = xf_val_ok_arr(out);
     xf_arr_release(out);
     return v;
@@ -2455,7 +3005,7 @@ static xf_Value cd_row(xf_Value *args, size_t argc) {
     if (!arg_num(args, argc, 1, &di)) return propagate(args, argc);
     size_t idx = (size_t)(di < 0 ? 0 : di);
     if (idx >= ds->len) return xf_val_nav(XF_TYPE_MAP);
-    return ds->items[idx];
+return xf_value_retain(ds->items[idx]);
 }
 
 /* ── sort(ds, key [, "desc"]) → arr ─────────────────────── */
@@ -2467,7 +3017,8 @@ typedef struct {
     int         dir;  /* +1 = asc, -1 = desc */
 } SortCtx;
 
-static SortCtx g_sort_ctx;
+static SortCtx         g_sort_ctx;
+static pthread_mutex_t g_sort_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static int ds_sort_cmp(const void *a, const void *b) {
     const xf_Value *ra = (const xf_Value *)a;
@@ -2497,9 +3048,12 @@ static xf_Value cd_sort(xf_Value *args, size_t argc) {
     xf_arr_t *out = xf_arr_new();
     for (size_t i = 0; i < ds->len; i++) xf_arr_push(out, xf_value_retain(ds->items[i]));
 
+    /* g_sort_ctx is file-scope; guard with mutex so concurrent sorts don't race */
+    pthread_mutex_lock(&g_sort_mu);
     g_sort_ctx.key = col;
     g_sort_ctx.dir = dir;
     qsort(out->items, out->len, sizeof(xf_Value), ds_sort_cmp);
+    pthread_mutex_unlock(&g_sort_mu);
 
     xf_Value v = xf_val_ok_arr(out);
     xf_arr_release(out);
@@ -2542,9 +3096,8 @@ static xf_Value cd_agg(xf_Value *args, size_t argc) {
         } else {
             ba = bucket.data.arr;
         }
-
-        xf_Value push_val = has_akey ? ds_cell(row, akey) : ds->items[i];
-        xf_arr_push(ba, push_val);
+xf_Value push_val = has_akey ? ds_cell(row, akey) : ds->items[i];
+xf_arr_push(ba, xf_value_retain(push_val));
     }
 
     xf_Value rv = xf_val_ok_map(out);
@@ -2636,8 +3189,8 @@ static xf_Value cd_index(xf_Value *args, size_t argc) {
         /* only insert if key not already present (first-wins) */
         xf_Value existing = xf_map_get(out, ks.data.str);
         if (existing.state != XF_STATE_OK)
-            xf_map_set(out, ks.data.str, ds->items[i]);
-    }
+xf_map_set(out, ks.data.str, xf_value_retain(ds->items[i]));
+        }
     xf_Value v = xf_val_ok_map(out);
     return v;
 }
@@ -2660,8 +3213,8 @@ static xf_Value cd_keys(xf_Value *args, size_t argc) {
             xf_Value existing = xf_map_get(seen, kname);
             if (existing.state != XF_STATE_OK) {
                 xf_map_set(seen, kname, xf_val_ok_num(1.0));
-                xf_arr_push(out, xf_val_ok_str(kname));
-            }
+xf_arr_push(out, xf_val_ok_str(xf_str_retain(kname)));
+                        }
         }
     }
     xf_map_release(seen);
@@ -2756,8 +3309,8 @@ static xf_Value cd_transpose(xf_Value *args, size_t argc) {
             xf_Str *kname = row->order[k];
             if (xf_map_get(seen, kname).state != XF_STATE_OK) {
                 xf_map_set(seen, kname, xf_val_ok_num(1.0));
-                xf_arr_push(cols, xf_val_ok_str(kname));
-            }
+xf_arr_push(cols, xf_val_ok_str(xf_str_retain(kname)));
+                        }
         }
     }
     xf_map_release(seen);
@@ -2770,8 +3323,8 @@ static xf_Value cd_transpose(xf_Value *args, size_t argc) {
         for (size_t i = 0; i < ds->len; i++) {
             xf_map_t *row = ds_row_map(ds, i);
             xf_Value cell = row ? ds_cell(row, cname->data) : xf_val_nav(XF_TYPE_VOID);
-            xf_arr_push(col_arr, cell);
-        }
+xf_arr_push(col_arr, xf_value_retain(cell));
+                }
         xf_Value cv = xf_val_ok_arr(col_arr);
         xf_map_set(out, cname, cv);
         xf_arr_release(col_arr);
@@ -2779,6 +3332,479 @@ static xf_Value cd_transpose(xf_Value *args, size_t argc) {
     xf_arr_release(cols);
 
     xf_Value v = xf_val_ok_map(out);
+    return v;
+}
+
+/* ── flatten(value [, deep]) → arr or map ────────────────────
+ *
+ * General-purpose flatten. Behaviour by input type:
+ *
+ *   arr of arr      → single flat arr (one level, or deep if arg2 truthy)
+ *   arr of map      → single flat dataset (union of columns, rows re-indexed)
+ *   arr of scalars  → returned as-is (already flat)
+ *   map of arr      → all sub-array values concatenated into one arr
+ *   map of map      → all sub-map key/value pairs merged into one map
+ *   scalar          → wrapped in a single-element arr
+ *
+ * The second argument (any truthy value) enables recursive deep flatten
+ * for the arr-of-arr case. Deep flatten for datasets is always one level
+ * (merging nested rows into a single dataset doesn't recurse further).
+ */
+static xf_Value cd_flatten_arr_deep(xf_arr_t *a, bool deep);  /* forward */
+
+static xf_Value cd_flatten_arr_deep(xf_arr_t *in, bool deep) {
+    xf_arr_t *out = xf_arr_new();
+    for (size_t i = 0; i < in->len; i++) {
+        xf_Value v = in->items[i];
+        if (v.state == XF_STATE_OK && v.type == XF_TYPE_ARR && v.data.arr) {
+            if (deep) {
+                xf_Value sub = cd_flatten_arr_deep(v.data.arr, true);
+                if (sub.state == XF_STATE_OK && sub.type == XF_TYPE_ARR && sub.data.arr) {
+                    for (size_t j = 0; j < sub.data.arr->len; j++)
+                        xf_arr_push(out, xf_value_retain(sub.data.arr->items[j]));
+                    xf_value_release(sub);
+                }
+            } else {
+                for (size_t j = 0; j < v.data.arr->len; j++)
+                    xf_arr_push(out, xf_value_retain(v.data.arr->items[j]));
+            }
+        } else {
+            xf_arr_push(out, xf_value_retain(v));
+        }
+    }
+    xf_Value r = xf_val_ok_arr(out);
+    xf_arr_release(out);
+    return r;
+}
+
+static xf_Value cd_flatten(xf_Value *args, size_t argc) {
+    NEED(1);
+    xf_Value src = args[0];
+    if (src.state != XF_STATE_OK) return src;
+
+    bool deep = (argc >= 2 && args[1].state == XF_STATE_OK &&
+                 ((args[1].type == XF_TYPE_NUM  && args[1].data.num  != 0.0) ||
+                  (args[1].type == XF_TYPE_STR  && args[1].data.str  &&
+                   args[1].data.str->len > 0)));
+
+    /* ── arr input ───────────────────────────────────────────── */
+    if (src.type == XF_TYPE_ARR && src.data.arr) {
+        xf_arr_t *in  = src.data.arr;
+        if (in->len == 0) return xf_val_ok_arr(xf_arr_new());
+
+        /* peek: are the elements maps (dataset rows)? */
+        bool all_maps = true;
+        for (size_t i = 0; i < in->len && all_maps; i++) {
+            xf_Value v = in->items[i];
+            if (!(v.state == XF_STATE_OK && v.type == XF_TYPE_MAP)) all_maps = false;
+        }
+
+        if (all_maps) {
+            /* dataset flatten: merge all rows into one arr-of-map, union columns */
+            xf_arr_t *out = xf_arr_new();
+            for (size_t i = 0; i < in->len; i++)
+                xf_arr_push(out, xf_value_retain(in->items[i]));
+            xf_Value v = xf_val_ok_arr(out);
+            xf_arr_release(out);
+            return v;
+        }
+
+        /* are elements arrays-of-arrays (nested dataset chunks)? */
+        bool all_arr_of_map = true;
+        for (size_t i = 0; i < in->len && all_arr_of_map; i++) {
+            xf_Value v = in->items[i];
+            if (!(v.state == XF_STATE_OK && v.type == XF_TYPE_ARR && v.data.arr)) {
+                all_arr_of_map = false; break;
+            }
+            /* check inner elements are maps */
+            for (size_t j = 0; j < v.data.arr->len && all_arr_of_map; j++) {
+                xf_Value inner = v.data.arr->items[j];
+                if (!(inner.state == XF_STATE_OK && inner.type == XF_TYPE_MAP))
+                    all_arr_of_map = false;
+            }
+        }
+
+        if (all_arr_of_map) {
+            /* arr of dataset chunks → one merged dataset */
+            xf_arr_t *out = xf_arr_new();
+            for (size_t i = 0; i < in->len; i++) {
+                xf_arr_t *chunk = in->items[i].data.arr;
+                for (size_t j = 0; j < chunk->len; j++)
+                    xf_arr_push(out, xf_value_retain(chunk->items[j]));
+            }
+            xf_Value v = xf_val_ok_arr(out);
+            xf_arr_release(out);
+            return v;
+        }
+
+        /* general arr flatten */
+        return cd_flatten_arr_deep(in, deep);
+    }
+
+    /* ── map input ───────────────────────────────────────────── */
+    if (src.type == XF_TYPE_MAP && src.data.map) {
+        xf_map_t *in = src.data.map;
+
+        /* are values arrays? → concatenate all sub-arrays */
+        bool vals_are_arrs = true;
+        for (size_t i = 0; i < in->order_len && vals_are_arrs; i++) {
+            xf_Value v = xf_map_get(in, in->order[i]);
+            if (!(v.state == XF_STATE_OK && v.type == XF_TYPE_ARR)) vals_are_arrs = false;
+        }
+        if (vals_are_arrs) {
+            xf_arr_t *out = xf_arr_new();
+            for (size_t i = 0; i < in->order_len; i++) {
+                xf_Value v = xf_map_get(in, in->order[i]);
+                if (v.state == XF_STATE_OK && v.type == XF_TYPE_ARR && v.data.arr)
+                    for (size_t j = 0; j < v.data.arr->len; j++)
+                        xf_arr_push(out, xf_value_retain(v.data.arr->items[j]));
+            }
+            xf_Value r = xf_val_ok_arr(out); xf_arr_release(out); return r;
+        }
+
+        /* are values maps? → merge all sub-maps into one map (later keys win) */
+        bool vals_are_maps = true;
+        for (size_t i = 0; i < in->order_len && vals_are_maps; i++) {
+            xf_Value v = xf_map_get(in, in->order[i]);
+            if (!(v.state == XF_STATE_OK && v.type == XF_TYPE_MAP)) vals_are_maps = false;
+        }
+        if (vals_are_maps) {
+            xf_map_t *out = xf_map_new();
+            for (size_t i = 0; i < in->order_len; i++) {
+                xf_Value v = xf_map_get(in, in->order[i]);
+                if (v.state == XF_STATE_OK && v.type == XF_TYPE_MAP && v.data.map) {
+                    xf_map_t *sm = v.data.map;
+                    for (size_t j = 0; j < sm->order_len; j++)
+                        xf_map_set(out, sm->order[j],
+                                   xf_value_retain(xf_map_get(sm, sm->order[j])));
+                }
+            }
+            xf_Value r = xf_val_ok_map(out); xf_map_release(out); return r;
+        }
+
+        /* mixed/scalar values: return arr of all map values */
+        xf_arr_t *out = xf_arr_new();
+        for (size_t i = 0; i < in->order_len; i++)
+            xf_arr_push(out, xf_value_retain(xf_map_get(in, in->order[i])));
+        xf_Value r = xf_val_ok_arr(out); xf_arr_release(out); return r;
+    }
+
+    /* ── scalar fallback: wrap in single-element arr ─────────── */
+    xf_arr_t *out = xf_arr_new();
+    xf_arr_push(out, xf_value_retain(src));
+    xf_Value r = xf_val_ok_arr(out); xf_arr_release(out); return r;
+}
+
+/* ── agg_parallel(ds, group_key [, agg_key [, fn [, n]]]) → map ──
+ *
+ * Like agg() but parallelised across n pthreads (default 4).
+ *
+ * Optional fn(row) → row transform is applied to each row before
+ * the grouping key is extracted.  fn may be native or XF-language
+ * (requires core_set_fn_caller to have been called).
+ *
+ * Arg positions:
+ *   0  ds        arr-of-maps dataset (required)
+ *   1  group_key column name to group by (required)
+ *   2  agg_key   column name to collect values from (optional)
+ *   3  fn        per-row transform fn (optional; detected by type)
+ *   4  n         thread count (optional num, default 4)
+ *
+ * If arg 3 is a num it is treated as n (fn omitted).
+ * Merge: for each group key, concatenate partial sub-arrays.
+ * Falls back to single-threaded agg() when n <= 1.
+ */
+#define CD_PAGG_MAX 64
+
+typedef struct {
+    xf_arr_t   *chunk;       /* owned by caller; thread reads only */
+    const char *gkey;        /* group key string — borrowed         */
+    const char *akey;        /* agg key or NULL — borrowed          */
+    xf_fn_t    *fn;          /* optional transform fn (borrowed)    */
+    xf_map_t   *result;      /* written by thread before exit       */
+    bool        done;
+} PaggCtx;
+
+static void *cd_pagg_thread(void *arg) {
+    PaggCtx  *ctx = (PaggCtx *)arg;
+    xf_arr_t *ds  = ctx->chunk;
+    xf_fn_t  *fn  = ctx->fn;
+
+    xf_map_t *out = xf_map_new();
+    for (size_t i = 0; i < ds->len; i++) {
+        xf_Value row_v = ds->items[i];
+
+        /* optional per-row transform */
+        if (fn) {
+            xf_Value xformed = xf_val_nav(XF_TYPE_VOID);
+            if (fn->is_native && fn->native_v) {
+                xformed = fn->native_v(&row_v, 1);
+            } else if (g_fn_caller && g_fn_caller_vm) {
+                xformed = g_fn_caller(g_fn_caller_vm, g_fn_caller_syms, fn, &row_v, 1);
+            }
+            if (xformed.state == XF_STATE_OK && xformed.type == XF_TYPE_MAP)
+                row_v = xformed;  /* use transformed row; caller still owns original */
+        }
+
+        xf_map_t *row = (row_v.state == XF_STATE_OK && row_v.type == XF_TYPE_MAP)
+                        ? row_v.data.map : NULL;
+        if (!row) continue;
+
+        xf_Value gval = ds_cell(row, ctx->gkey);
+        xf_Value gs   = xf_coerce_str(gval);
+        if (gs.state != XF_STATE_OK || !gs.data.str) { xf_value_release(gs); continue; }
+        xf_Str *gstr = gs.data.str;
+
+        xf_Value bucket = xf_map_get(out, gstr);
+        xf_arr_t *ba;
+        if (bucket.state != XF_STATE_OK || bucket.type != XF_TYPE_ARR || !bucket.data.arr) {
+            ba = xf_arr_new();
+            xf_map_set(out, gstr, xf_val_ok_arr(ba));
+            xf_arr_release(ba);
+            ba = xf_map_get(out, gstr).data.arr;
+        } else {
+            ba = bucket.data.arr;
+        }
+
+        /* collect agg value from (possibly transformed) row */
+        xf_Value push_val = ctx->akey ? ds_cell(row, ctx->akey) : row_v;
+        xf_arr_push(ba, xf_value_retain(push_val));
+        xf_value_release(gs);
+    }
+    ctx->result = out;
+    ctx->done   = true;
+    return NULL;
+}
+
+static xf_Value cd_agg_parallel(xf_Value *args, size_t argc) {
+    NEED(2);
+    xf_arr_t *ds;
+    if (!ds_arg_arr(args, argc, 0, &ds)) return propagate(args, argc);
+    const char *gkey; size_t glen;
+    if (!arg_str(args, argc, 1, &gkey, &glen)) return propagate(args, argc);
+
+    /* arg 2: optional agg_key (str) */
+    const char *akey = NULL; size_t alen = 0;
+    if (argc >= 3 && args[2].state == XF_STATE_OK && args[2].type == XF_TYPE_STR)
+        arg_str(args, argc, 2, &akey, &alen);
+
+    /* arg 3: optional transform fn (fn type) or thread count (num) */
+    xf_fn_t *fn = NULL;
+    if (argc >= 4 && args[3].state == XF_STATE_OK && args[3].type == XF_TYPE_FN)
+        fn = args[3].data.fn;
+
+    /* arg 3 or 4: thread count */
+    double dn = 4.0;
+    if (argc >= 4 && args[3].state == XF_STATE_OK && args[3].type == XF_TYPE_NUM)
+        dn = args[3].data.num;
+    else if (argc >= 5)
+        arg_num(args, argc, 4, &dn);
+    size_t n = (size_t)(dn < 1 ? 1 : dn > CD_PAGG_MAX ? CD_PAGG_MAX : dn);
+
+    /* single-threaded fast-path (no fn transform on this path) */
+    if (n <= 1 && !fn) {
+        xf_Value sub[3]; sub[0] = args[0]; sub[1] = args[1];
+        if (akey) sub[2] = args[2];
+        return cd_agg(sub, akey ? 3 : 2);
+    }
+
+    size_t sz  = ds->len;
+    size_t per = (sz + n - 1) / n;
+
+    PaggCtx    ctxs[CD_PAGG_MAX];
+    pthread_t  tids[CD_PAGG_MAX];
+    xf_arr_t  *chunks[CD_PAGG_MAX];
+    size_t     nthreads = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        size_t from = i * per;
+        size_t to   = from + per < sz ? from + per : sz;
+        if (from >= sz) break;
+
+        xf_arr_t *chunk = xf_arr_new();
+        for (size_t j = from; j < to; j++) xf_arr_push(chunk, xf_value_retain(ds->items[j]));
+        chunks[nthreads] = chunk;
+
+        ctxs[nthreads].chunk  = chunk;
+        ctxs[nthreads].gkey   = gkey;
+        ctxs[nthreads].akey   = akey;
+        ctxs[nthreads].fn     = fn;
+        ctxs[nthreads].result = NULL;
+        ctxs[nthreads].done   = false;
+
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+        pthread_create(&tids[nthreads], &attr, cd_pagg_thread, &ctxs[nthreads]);
+        pthread_attr_destroy(&attr);
+        nthreads++;
+    }
+
+    for (size_t i = 0; i < nthreads; i++) pthread_join(tids[i], NULL);
+
+    /* merge: for each group key concatenate partial sub-arrays */
+    xf_map_t *merged = xf_map_new();
+    for (size_t i = 0; i < nthreads; i++) {
+        xf_map_t *partial = ctxs[i].result;
+        if (!partial) { xf_arr_release(chunks[i]); continue; }
+        for (size_t k = 0; k < partial->order_len; k++) {
+            xf_Str  *gstr    = partial->order[k];
+            xf_Value src_bkt = xf_map_get(partial, gstr);
+            if (src_bkt.state != XF_STATE_OK || src_bkt.type != XF_TYPE_ARR || !src_bkt.data.arr)
+                continue;
+            xf_Value dst_bkt = xf_map_get(merged, gstr);
+            xf_arr_t *da;
+            if (dst_bkt.state != XF_STATE_OK || dst_bkt.type != XF_TYPE_ARR || !dst_bkt.data.arr) {
+                da = xf_arr_new();
+                xf_map_set(merged, gstr, xf_val_ok_arr(da));
+                xf_arr_release(da);
+                da = xf_map_get(merged, gstr).data.arr;
+            } else {
+                da = dst_bkt.data.arr;
+            }
+            xf_arr_t *sa = src_bkt.data.arr;
+            for (size_t j = 0; j < sa->len; j++)
+                xf_arr_push(da, xf_value_retain(sa->items[j]));
+        }
+        xf_map_release(partial);
+        xf_arr_release(chunks[i]);
+    }
+
+    return xf_val_ok_map(merged);
+}
+
+/* ── stream(sources, fn [, n]) → arr ─────────────────────────
+ *
+ * Multi-stream orchestration.  sources is an arr of:
+ *   - strings  → read file line-by-line → arr of maps {line, nr, file}
+ *   - arrays   → used directly as a dataset chunk
+ *
+ * fn is a native function applied to each source chunk.
+ * Up to n pthreads are dispatched (default: one per source).
+ * Results are collected in source order and flattened into one
+ * dataset via cd_flatten logic.
+ *
+ * Useful for processing multiple files in parallel:
+ *   arr results = core.ds.stream(["a.csv","b.csv","c.csv"], my_fn)
+ */
+typedef struct {
+    xf_arr_t *chunk;    /* owned: the data passed to fn */
+    xf_fn_t  *fn;       /* borrowed native fn */
+    xf_Value  result;
+    bool      done;
+} StreamCtx;
+
+static void *cd_stream_thread(void *arg) {
+    StreamCtx *ctx = (StreamCtx *)arg;
+    xf_fn_t   *fn  = ctx->fn;
+    xf_Value chunk_val = xf_val_ok_arr(ctx->chunk);
+
+    if (fn->is_native && fn->native_v) {
+        ctx->result = fn->native_v(&chunk_val, 1);
+    } else if (g_fn_caller && g_fn_caller_vm) {
+        ctx->result = g_fn_caller(g_fn_caller_vm, g_fn_caller_syms, fn, &chunk_val, 1);
+    } else {
+        ctx->result = xf_val_nav(XF_TYPE_FN);
+    }
+    ctx->done = true;
+    return NULL;
+}
+
+/* read a text file into arr of maps {line, nr, file} */
+static xf_arr_t *cd_stream_read_file(const char *path) {
+    FILE *fp = fopen(path, "r");
+    xf_arr_t *out = xf_arr_new();
+    if (!fp) return out;
+    char   line[65536];
+    size_t nr = 0;
+    xf_Str *k_line = xf_str_from_cstr("line");
+    xf_Str *k_nr   = xf_str_from_cstr("nr");
+    xf_Str *k_file = xf_str_from_cstr("file");
+    xf_Str *vfile  = xf_str_from_cstr(path);
+    while (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+        xf_map_t *row = xf_map_new();
+        xf_Str *vline = xf_str_new(line, len);
+        xf_map_set(row, k_line, xf_val_ok_str(vline));
+        xf_map_set(row, k_nr,   xf_val_ok_num((double)++nr));
+        xf_map_set(row, k_file, xf_val_ok_str(vfile));
+        xf_str_release(vline);
+        xf_arr_push(out, xf_val_ok_map(row));
+        xf_map_release(row);
+    }
+    fclose(fp);
+    xf_str_release(k_line); xf_str_release(k_nr);
+    xf_str_release(k_file); xf_str_release(vfile);
+    return out;
+}
+
+#define CD_STREAM_MAX 256
+
+static xf_Value cd_stream(xf_Value *args, size_t argc) {
+    NEED(2);
+    if (args[0].state != XF_STATE_OK || args[0].type != XF_TYPE_ARR || !args[0].data.arr)
+        return xf_val_nav(XF_TYPE_ARR);
+    if (args[1].state != XF_STATE_OK || args[1].type != XF_TYPE_FN || !args[1].data.fn)
+        return xf_val_nav(XF_TYPE_ARR);
+
+    xf_arr_t *sources = args[0].data.arr;
+    xf_fn_t  *fn      = args[1].data.fn;
+    size_t    nsrc    = sources->len < CD_STREAM_MAX ? sources->len : CD_STREAM_MAX;
+
+    StreamCtx *ctxs = calloc(nsrc, sizeof(StreamCtx));
+    pthread_t *tids = calloc(nsrc, sizeof(pthread_t));
+
+    /* build chunks and launch threads */
+    for (size_t i = 0; i < nsrc; i++) {
+        xf_Value sv = sources->items[i];
+        xf_arr_t *chunk = NULL;
+
+        if (sv.state == XF_STATE_OK && sv.type == XF_TYPE_STR && sv.data.str) {
+            /* string → read file */
+            chunk = cd_stream_read_file(sv.data.str->data);
+        } else if (sv.state == XF_STATE_OK && sv.type == XF_TYPE_ARR && sv.data.arr) {
+            /* arr → use directly (retain) */
+            chunk = xf_arr_retain(sv.data.arr);
+        } else {
+            /* wrap scalar in single-element arr */
+            chunk = xf_arr_new();
+            xf_arr_push(chunk, xf_value_retain(sv));
+        }
+
+        ctxs[i].chunk  = chunk;
+        ctxs[i].fn     = fn;
+        ctxs[i].result = xf_val_null();
+        ctxs[i].done   = false;
+
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+        pthread_create(&tids[i], &attr, cd_stream_thread, &ctxs[i]);
+        pthread_attr_destroy(&attr);
+    }
+
+    /* join threads, collect results into flat arr */
+    xf_arr_t *collected = xf_arr_new();
+    for (size_t i = 0; i < nsrc; i++) {
+        pthread_join(tids[i], NULL);
+        xf_Value r = ctxs[i].result;
+        /* flatten one level: if result is arr push its elements */
+        if (r.state == XF_STATE_OK && r.type == XF_TYPE_ARR && r.data.arr) {
+            for (size_t j = 0; j < r.data.arr->len; j++)
+                xf_arr_push(collected, xf_value_retain(r.data.arr->items[j]));
+            xf_value_release(r);
+        } else {
+            xf_arr_push(collected, r);
+        }
+        xf_arr_release(ctxs[i].chunk);
+    }
+
+    free(ctxs);
+    free(tids);
+
+    xf_Value v = xf_val_ok_arr(collected);
+    xf_arr_release(collected);
     return v;
 }
 
@@ -2792,8 +3818,11 @@ static xf_module_t *build_ds(void) {
     FN("index",     XF_TYPE_MAP, cd_index);
     FN("keys",      XF_TYPE_ARR, cd_keys);
     FN("values",    XF_TYPE_ARR, cd_values);
-    FN("filter",    XF_TYPE_ARR, cd_filter);
-    FN("transpose", XF_TYPE_MAP, cd_transpose);
+    FN("filter",       XF_TYPE_ARR, cd_filter);
+    FN("transpose",    XF_TYPE_MAP, cd_transpose);
+    FN("flatten",      XF_TYPE_ARR, cd_flatten);
+    FN("agg_parallel", XF_TYPE_MAP, cd_agg_parallel);
+    FN("stream",       XF_TYPE_ARR, cd_stream);
     return m;
 }
 /* ============================================================

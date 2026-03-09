@@ -527,23 +527,28 @@ xf_value_t xf_coerce_num(xf_value_t v) {
 
 xf_value_t xf_coerce_str(xf_value_t v) {
     if (v.state != XF_STATE_OK) return v;
-    if (v.type == XF_TYPE_STR)  return v;
+
+    if (v.type == XF_TYPE_STR)
+        return xf_value_retain(v);
 
     char buf[64];
     if (v.type == XF_TYPE_NUM) {
-        /* integer if whole number, float otherwise */
         if (v.data.num == (long long)v.data.num)
             snprintf(buf, sizeof(buf), "%lld", (long long)v.data.num);
         else
             snprintf(buf, sizeof(buf), "%.14g", v.data.num);
-        xf_str_t *s = xf_str_from_cstr(buf);
-        return xf_val_ok_str(s);
-    }
-    /* map/set/arr/fn/regex — return their type name as string */
-    xf_str_t *s = xf_str_from_cstr(XF_TYPE_NAMES[v.type]);
-    return xf_val_ok_str(s);
-}
 
+        xf_str_t *s = xf_str_from_cstr(buf);
+        xf_value_t out = xf_val_ok_str(s);
+        xf_str_release(s);
+        return out;
+    }
+
+    xf_str_t *s = xf_str_from_cstr(XF_TYPE_NAMES[v.type]);
+    xf_value_t out = xf_val_ok_str(s);
+    xf_str_release(s);
+    return out;
+}
 bool xf_can_coerce(xf_value_t v, uint8_t target_type) {
     if (v.type == target_type)  return true;
     if (target_type == XF_TYPE_STR) return true; /* everything stringifies */

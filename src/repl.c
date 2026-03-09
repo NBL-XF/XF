@@ -11,7 +11,7 @@
 #include <errno.h>
 #include <ctype.h>
 
-#define XF_VERSION "0.8.4"
+#define XF_VERSION "0.9.9"
 #define PROMPT_NORMAL ">> "
 #define PROMPT_CONT   ".. "
 
@@ -520,7 +520,24 @@ void repl_free(Repl *r) {
 }
 
 void repl_run(Repl *r) {
-    write_str("xf " XF_VERSION "  (:help for commands, :quit to exit)\r\n");
+printf(
+" #************             **********************#\r\n"
+"   ***********            *********************#\r\n"
+"    #**********         *********************#\r\n"
+"      **********       *********************\r\n"
+"        ********      *******\r\n"
+"         #********* *** *********\r\n"
+"           ********** ***********\r\n"
+"             ********* **********\r\n"
+"          *** #********* ********\r\n"
+"        ******* **********\r\n"
+"      *********      *********\r\n"
+"    **********        *********\r\n"
+"   **********           **********\r\n"
+" ***********             ****#******\r\n"
+"************              ************\r\n"
+);
+        write_str("xf " XF_VERSION "  (:help for commands, :quit to exit)\r\n");
 
     /* accumulate multi-line input */
     char   src_buf[65536];

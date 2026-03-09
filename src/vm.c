@@ -1,4 +1,10 @@
+#if defined(__linux__) || defined(__CYGWIN__)
+#  define _GNU_SOURCE
+#endif
+#include "../include/value.h"
 #include "../include/vm.h"
+#include "../include/ast.h"
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -256,9 +262,14 @@ void vm_init(VM *vm, int max_jobs) {
     strcpy(vm->rec.ofs,  " ");
     strcpy(vm->rec.ors,  "\n");
     strcpy(vm->rec.ofmt, "%.6g");
-    vm->rec.out_mode     = 0;
-    vm->rec.headers      = NULL;
-    vm->rec.header_count = 0;
+    vm->rec.out_mode       = 0;
+    vm->rec.headers        = NULL;
+    vm->rec.header_count   = 0;
+    vm->rec.current_file[0]= '\0';
+    vm->rec.last_match     = xf_val_null();
+    vm->rec.last_captures  = xf_val_null();
+
+    pthread_mutex_init(&vm->rec_mu, NULL);
 }
 
 void vm_free(VM *vm) {
@@ -266,10 +277,60 @@ void vm_free(VM *vm) {
     free(vm->rec.buf);
     for (size_t i = 0; i < vm->rec.header_count; i++) free(vm->rec.headers[i]);
     free(vm->rec.headers);
+    xf_value_release(vm->rec.last_match);
+    xf_value_release(vm->rec.last_captures);
+    vm_redir_flush(vm);   /* close any cached redirect handles */
+    pthread_mutex_destroy(&vm->rec_mu);
     /* rule chunks freed by interp */
     free(vm->rules);
     free(vm->patterns);
     memset(vm, 0, sizeof(*vm));
+}
+
+/* ============================================================
+ * Redirect file handle cache
+ * ============================================================ */
+
+/* Return (or open and cache) the FILE* for a redirect destination.
+ * op: 1=write(>), 2=append(>>), 3=pipe(|)
+ * Returns NULL on failure.
+ * Write-mode (op==1) files are opened ONCE and kept open; subsequent
+ * print statements append to the already-open file, which matches
+ * POSIX awk semantics where ">" opens fresh only at program start. */
+FILE *vm_redir_open(VM *vm, const char *path, int op) {
+    /* search cache first */
+    for (size_t i = 0; i < vm->redir_count; i++) {
+        if (strcmp(vm->redir[i].path, path) == 0)
+            return vm->redir[i].fp;
+    }
+    /* not cached — open */
+    FILE *fp = NULL;
+    bool  is_pipe = (op == 3);
+    if (op == 3)      fp = popen(path, "w");
+    else if (op == 2) fp = fopen(path, "a");
+    else              fp = fopen(path, "w");
+    if (!fp) return NULL;
+    /* cache if room */
+    if (vm->redir_count < VM_REDIR_MAX) {
+        size_t n = vm->redir_count++;
+        strncpy(vm->redir[n].path, path, sizeof(vm->redir[n].path) - 1);
+        vm->redir[n].fp       = fp;
+        vm->redir[n].is_pipe  = is_pipe;
+    }
+    return fp;
+}
+
+/* Flush and close all cached redirect handles.
+ * Called at program exit and between pattern-action cycles when needed. */
+void vm_redir_flush(VM *vm) {
+    for (size_t i = 0; i < vm->redir_count; i++) {
+        if (!vm->redir[i].fp) continue;
+        fflush(vm->redir[i].fp);
+        if (vm->redir[i].is_pipe) pclose(vm->redir[i].fp);
+        else                      fclose(vm->redir[i].fp);
+        vm->redir[i].fp = NULL;
+    }
+    vm->redir_count = 0;
 }
 
 
@@ -347,7 +408,42 @@ void vm_dump_stack(const VM *vm) {
  * Record splitting
  * ============================================================ */
 
+/* ============================================================
+ * JSON header population
+ * ============================================================ */
+
+/* Capture the current fields as column header names.
+ * Call this after the first record is split when outfmt is JSON.
+ * The captured strings are stripped of surrounding whitespace. */
+void vm_capture_headers(VM *vm) {
+    if (vm->rec.headers_set) return;
+    /* free any old headers */
+    for (size_t i = 0; i < vm->rec.header_count; i++) free(vm->rec.headers[i]);
+    free(vm->rec.headers);
+    vm->rec.headers      = NULL;
+    vm->rec.header_count = 0;
+
+    size_t n = vm->rec.field_count;
+    if (n == 0) { vm->rec.headers_set = true; return; }
+
+    vm->rec.headers = malloc(sizeof(char *) * n);
+    for (size_t i = 0; i < n; i++) {
+        const char *f = vm->rec.fields[i];
+        /* trim leading whitespace */
+        while (*f == ' ' || *f == '\t') f++;
+        size_t len = strlen(f);
+        /* trim trailing whitespace */
+        while (len > 0 && (f[len-1] == ' ' || f[len-1] == '\t')) len--;
+        vm->rec.headers[i] = malloc(len + 1);
+        memcpy(vm->rec.headers[i], f, len);
+        vm->rec.headers[i][len] = '\0';
+    }
+    vm->rec.header_count = n;
+    vm->rec.headers_set  = true;
+}
+
 static void split_record(VM *vm, const char *rec, size_t len) {
+    pthread_mutex_lock(&vm->rec_mu);
     free(vm->rec.buf);
     vm->rec.buf     = malloc(len + 1);
     memcpy(vm->rec.buf, rec, len);
@@ -385,6 +481,7 @@ static void split_record(VM *vm, const char *rec, size_t len) {
     vm->rec.field_count = fc;
     vm->rec.nr++;
     vm->rec.fnr++;
+    pthread_mutex_unlock(&vm->rec_mu);
 }
 
 
@@ -729,6 +826,13 @@ done:
 
 VMResult vm_feed_record(VM *vm, const char *rec, size_t len) {
     split_record(vm, rec, len);
+
+    /* JSON mode: capture first record as column headers, skip rule eval */
+    if (vm->rec.out_mode == XF_OUTFMT_JSON && !vm->rec.headers_set) {
+        vm_capture_headers(vm);
+        return VM_OK;
+    }
+
     for (size_t i = 0; i < vm->rule_count; i++) {
         /* pattern check */
         if (vm->patterns) {
@@ -756,4 +860,70 @@ VMResult vm_run_begin(VM *vm) {
 VMResult vm_run_end(VM *vm) {
     if (!vm->end_chunk) return VM_OK;
     return vm_run_chunk(vm, vm->end_chunk);
+}
+
+/* ============================================================
+ * Record context snapshot
+ * Used by worker threads to get a stable private copy of the
+ * current record without holding rec_mu during fn execution.
+ * ============================================================ */
+
+void vm_rec_snapshot(VM *vm, RecordCtx *snap) {
+    pthread_mutex_lock(&vm->rec_mu);
+
+    /* scalar / fixed-size fields — plain copy */
+    snap->buf_len      = vm->rec.buf_len;
+    snap->field_count  = vm->rec.field_count;
+    snap->nr           = vm->rec.nr;
+    snap->fnr          = vm->rec.fnr;
+    snap->out_mode     = vm->rec.out_mode;
+    snap->headers_set  = vm->rec.headers_set;
+    memcpy(snap->fs,   vm->rec.fs,   sizeof(snap->fs));
+    memcpy(snap->rs,   vm->rec.rs,   sizeof(snap->rs));
+    memcpy(snap->ofs,  vm->rec.ofs,  sizeof(snap->ofs));
+    memcpy(snap->ors,  vm->rec.ors,  sizeof(snap->ors));
+    memcpy(snap->ofmt, vm->rec.ofmt, sizeof(snap->ofmt));
+    memcpy(snap->current_file, vm->rec.current_file, sizeof(snap->current_file));
+
+    /* deep copy buf and re-point fields into the new buf */
+    if (vm->rec.buf && vm->rec.buf_len > 0) {
+        snap->buf = malloc(vm->rec.buf_len + 1);
+        memcpy(snap->buf, vm->rec.buf, vm->rec.buf_len + 1);
+        for (size_t i = 0; i < vm->rec.field_count; i++) {
+            if (vm->rec.fields[i])
+                snap->fields[i] = snap->buf + (vm->rec.fields[i] - vm->rec.buf);
+            else
+                snap->fields[i] = NULL;
+        }
+    } else {
+        snap->buf = NULL;
+        memset(snap->fields, 0, sizeof(snap->fields));
+    }
+
+    /* deep copy headers */
+    if (vm->rec.headers && vm->rec.header_count > 0) {
+        snap->headers = malloc(sizeof(char *) * vm->rec.header_count);
+        snap->header_count = vm->rec.header_count;
+        for (size_t i = 0; i < vm->rec.header_count; i++)
+            snap->headers[i] = vm->rec.headers[i] ? strdup(vm->rec.headers[i]) : NULL;
+    } else {
+        snap->headers      = NULL;
+        snap->header_count = 0;
+    }
+
+    /* retain ref-counted xf_Values */
+    snap->last_match    = xf_value_retain(vm->rec.last_match);
+    snap->last_captures = xf_value_retain(vm->rec.last_captures);
+    snap->last_err      = xf_val_null();
+
+    pthread_mutex_unlock(&vm->rec_mu);
+}
+
+void vm_rec_snapshot_free(RecordCtx *snap) {
+    free(snap->buf);
+    for (size_t i = 0; i < snap->header_count; i++) free(snap->headers[i]);
+    free(snap->headers);
+    xf_value_release(snap->last_match);
+    xf_value_release(snap->last_captures);
+    memset(snap, 0, sizeof(*snap));
 }

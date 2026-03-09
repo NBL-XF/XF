@@ -287,22 +287,25 @@ Stmt *ast_return(Expr *value, Loc loc) {
     return s;
 }
 
-Stmt *ast_next(Loc loc) { return stmt_alloc(STMT_NEXT, loc); }
-Stmt *ast_exit(Loc loc) { return stmt_alloc(STMT_EXIT, loc); }
+Stmt *ast_next(Loc loc)  { return stmt_alloc(STMT_NEXT,  loc); }
+Stmt *ast_exit(Loc loc)  { return stmt_alloc(STMT_EXIT,  loc); }
+Stmt *ast_break(Loc loc) { return stmt_alloc(STMT_BREAK, loc); }
 
-Stmt *ast_print(Expr **args, size_t count, Expr *redirect, Loc loc) {
+Stmt *ast_print(Expr **args, size_t count, Expr *redirect, uint8_t redirect_op, Loc loc) {
     Stmt *s = stmt_alloc(STMT_PRINT, loc);
-    s->as.print.args     = args;
-    s->as.print.count    = count;
-    s->as.print.redirect = redirect;
+    s->as.print.args        = args;
+    s->as.print.count       = count;
+    s->as.print.redirect    = redirect;
+    s->as.print.redirect_op = redirect_op;
     return s;
 }
 
-Stmt *ast_printf_stmt(Expr **args, size_t count, Expr *redirect, Loc loc) {
+Stmt *ast_printf_stmt(Expr **args, size_t count, Expr *redirect, uint8_t redirect_op, Loc loc) {
     Stmt *s = stmt_alloc(STMT_PRINTF, loc);
-    s->as.printf_stmt.args     = args;
-    s->as.printf_stmt.count    = count;
-    s->as.printf_stmt.redirect = redirect;
+    s->as.printf_stmt.args        = args;
+    s->as.printf_stmt.count       = count;
+    s->as.printf_stmt.redirect    = redirect;
+    s->as.printf_stmt.redirect_op = redirect_op;
     return s;
 }
 

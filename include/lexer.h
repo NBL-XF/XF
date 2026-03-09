@@ -50,7 +50,6 @@ typedef enum {
     TK_KW_NULL,       /* NULL                                   */
     TK_KW_VOID_S,     /* VOID  (state, distinct from void type) */
     TK_KW_UNDEF,      /* UNDEF                                  */
-    TK_KW_UNDET,      /* UNDETERMINED                           */
 
     /* ── control keywords ──────────────────────────────────── */
     TK_KW_BEGIN,      /* BEGIN                                  */
@@ -69,6 +68,7 @@ typedef enum {
     TK_KW_JOIN,       /* join                                   */
     TK_KW_NEXT,       /* next                                   */
     TK_KW_EXIT,       /* exit                                   */
+    TK_KW_BREAK,      /* break                                  */
     TK_KW_DELETE,     /* delete                                 */
     TK_KW_IMPORT,     /* import                                 */
 
@@ -85,6 +85,7 @@ typedef enum {
     TK_VAR_RS,        /* RS   record separator                  */
     TK_VAR_OFS,       /* OFS  output field separator            */
     TK_VAR_ORS,       /* ORS  output record separator           */
+    TK_VAR_OFMT,      /* OFMT number output format              */
 
     /* ── arithmetic operators ──────────────────────────────── */
     TK_PLUS,          /* +                                      */

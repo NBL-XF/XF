@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
- 
+
 #include "../include/value.h"
 #include "../include/lexer.h"
 #include "../include/ast.h"
@@ -23,7 +23,7 @@
  *   xf -f script.xf input.txt file with input
  * ============================================================ */
 
-#define XF_VERSION "0.8.4"
+#define XF_VERSION "0.9.9"
 
 
 /* ------------------------------------------------------------

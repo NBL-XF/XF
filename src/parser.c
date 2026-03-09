@@ -262,11 +262,11 @@ if (t->kind == TK_LBRACKET) {
         return ast_svar(t->kind, loc);
     }
 
-    /* built-in record vars: NR NF FNR FS RS OFS ORS */
+    /* built-in record vars: NR NF FNR FS RS OFS ORS OFMT */
     if (t->kind == TK_VAR_NR  || t->kind == TK_VAR_NF  ||
         t->kind == TK_VAR_FNR || t->kind == TK_VAR_FS  ||
         t->kind == TK_VAR_RS  || t->kind == TK_VAR_OFS ||
-        t->kind == TK_VAR_ORS) {
+        t->kind == TK_VAR_ORS || t->kind == TK_VAR_OFMT) {
         advance(p);
         return ast_ivar(t->kind, loc);
     }
@@ -716,15 +716,15 @@ Stmt *parse_print(Parser *p) {
         if (!match_tok(p, TK_COMMA)) break;
     }
 
-    /* optional redirect */
+    /* optional redirect: > file  >> file  | cmd */
     Expr *redirect = NULL;
-    if (check(p, TK_GT) || check(p, TK_GT_GT) || check(p, TK_PIPE)) {
-        advance(p);
-        redirect = parse_expr(p);
-    }
+    uint8_t redirect_op = 0;
+    if      (check(p, TK_GT))     { redirect_op = 1; advance(p); redirect = parse_expr(p); }
+    else if (check(p, TK_GT_GT))  { redirect_op = 2; advance(p); redirect = parse_expr(p); }
+    else if (check(p, TK_PIPE))   { redirect_op = 3; advance(p); redirect = parse_expr(p); }
 
     match_tok(p, TK_SEMICOLON);
-    return ast_print(args, count, redirect, loc);
+    return ast_print(args, count, redirect, redirect_op, loc);
 }
 
 /* printf fmt, arg, ... ; */
@@ -744,13 +744,13 @@ Stmt *parse_printf(Parser *p) {
     }
 
     Expr *redirect = NULL;
-    if (check(p, TK_GT) || check(p, TK_GT_GT) || check(p, TK_PIPE)) {
-        advance(p);
-        redirect = parse_expr(p);
-    }
+    uint8_t redirect_op = 0;
+    if      (check(p, TK_GT))     { redirect_op = 1; advance(p); redirect = parse_expr(p); }
+    else if (check(p, TK_GT_GT))  { redirect_op = 2; advance(p); redirect = parse_expr(p); }
+    else if (check(p, TK_PIPE))   { redirect_op = 3; advance(p); redirect = parse_expr(p); }
 
     match_tok(p, TK_SEMICOLON);
-    return ast_printf_stmt(args, count, redirect, loc);
+    return ast_printf_stmt(args, count, redirect, redirect_op, loc);
 }
 
 /* outfmt "csv"|"tsv"|"json"|"text" ; */
@@ -888,6 +888,7 @@ Stmt *parse_stmt(Parser *p) {
                            peek_at(p, 1)->kind == TK_VAR_RS  ||
                            peek_at(p, 1)->kind == TK_VAR_OFS ||
                            peek_at(p, 1)->kind == TK_VAR_ORS ||
+                           peek_at(p, 1)->kind == TK_VAR_OFMT ||
                            peek_at(p, 1)->kind == TK_VAR_NR  ||
                            peek_at(p, 1)->kind == TK_VAR_NF  ||
                            peek_at(p, 1)->kind == TK_VAR_FNR)) {
@@ -916,6 +917,10 @@ Stmt *parse_stmt(Parser *p) {
     if (check(p, TK_KW_EXIT)) {
         advance(p); match_tok(p, TK_SEMICOLON);
         return ast_exit(loc);
+    }
+    if (check(p, TK_KW_BREAK)) {
+        advance(p); match_tok(p, TK_SEMICOLON);
+        return ast_break(loc);
     }
     if (check(p, TK_KW_DELETE)) {
         advance(p);
@@ -1056,6 +1061,7 @@ TopLevel *parse_rule(Parser *p) {
         check(p, TK_KW_JOIN)      ||
         check(p, TK_KW_NEXT)      ||
         check(p, TK_KW_EXIT)      ||
+        check(p, TK_KW_BREAK)     ||
         check(p, TK_KW_DELETE)    ||
         check(p, TK_SUBST)        ||
         check(p, TK_TRANS))
