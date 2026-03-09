@@ -55,16 +55,42 @@ static bool arg_num(xf_Value *args, size_t argc, size_t i, double *out) {
 
 static bool arg_str(xf_Value *args, size_t argc, size_t i,
                     const char **out, size_t *outlen) {
+    enum { ARG_STR_SLOTS = 16 };
+
+    static _Thread_local xf_Value slots[ARG_STR_SLOTS];
+    static _Thread_local bool inited = false;
+    static _Thread_local size_t next_slot = 0;
+
+    if (!inited) {
+        for (size_t k = 0; k < ARG_STR_SLOTS; k++)
+            slots[k] = xf_val_null();
+        inited = true;
+    }
+
+    if (out)    *out = "";
+    if (outlen) *outlen = 0;
+
     if (i >= argc) return false;
+
     xf_Value v = args[i];
     if (v.state != XF_STATE_OK) return false;
+
     xf_Value c = xf_coerce_str(v);
     if (c.state != XF_STATE_OK) return false;
-    if (c.data.str) { *out = c.data.str->data; *outlen = c.data.str->len; }
-    else            { *out = "";               *outlen = 0; }
+
+    size_t slot = next_slot;
+    next_slot = (next_slot + 1u) % ARG_STR_SLOTS;
+
+    xf_value_release(slots[slot]);
+    slots[slot] = c;
+
+    if (slots[slot].data.str) {
+        if (out)    *out    = slots[slot].data.str->data;
+        if (outlen) *outlen = slots[slot].data.str->len;
+    }
+
     return true;
 }
-
 static xf_Value make_str_val(const char *data, size_t len);
 
 /* propagate first non-OK arg state */
@@ -814,7 +840,10 @@ static xf_Value cg_split(xf_Value *args, size_t argc) {
                 xf_Value val = xf_map_get(in, key);
                 xf_map_set(chunk, key, val);
             }
-            xf_Value cv = xf_val_ok_map(chunk); xf_map_release(chunk);
+
+xf_Value cv = xf_val_ok_map(chunk);
+xf_map_release(chunk);
+
             xf_arr_push(out, cv);
             if (to >= sz) break;
         }
@@ -934,7 +963,10 @@ static xf_Value cg_strip(xf_Value *args, size_t argc) {
                 xf_map_set(out, key, val);
             }
         }
-        xf_Value rv = xf_val_ok_map(out); return rv;
+
+xf_Value rv = xf_val_ok_map(out);
+xf_map_release(out);
+ return rv;
     }
 
     if (v.type == XF_TYPE_SET && v.data.map) {
@@ -949,7 +981,10 @@ static xf_Value cg_strip(xf_Value *args, size_t argc) {
             xf_map_set(out, nk, xf_val_ok_num(1.0));
             xf_str_release(nk);
         }
-        xf_Value rv = xf_val_ok_map(out);
+
+xf_Value rv = xf_val_ok_map(out);
+xf_map_release(out);
+
         rv.type = XF_TYPE_SET;
         return rv;
     }
@@ -1010,6 +1045,8 @@ static xf_Value cg_length(xf_Value *args, size_t argc) {
     switch (v.type) {
         case XF_TYPE_STR: return xf_val_ok_num(v.data.str  ? (double)v.data.str->len        : 0.0);
         case XF_TYPE_ARR: return xf_val_ok_num(v.data.arr  ? (double)v.data.arr->len        : 0.0);
+        case XF_TYPE_TUPLE:
+    return xf_val_ok_num(v.data.tuple ? (double)xf_tuple_len(v.data.tuple) : 0.0);
         case XF_TYPE_MAP:
         case XF_TYPE_SET: return xf_val_ok_num(v.data.map  ? (double)v.data.map->order_len  : 0.0);
         case XF_TYPE_NUM: return xf_val_ok_num((double)sizeof(double));
@@ -1335,7 +1372,13 @@ static xf_Value cr_build_match_map(const char *subject, regmatch_t *pm,
     xf_str_release(gkey);
     xf_arr_release(grp_arr);
 
-    return xf_val_ok_map(m);
+
+
+xf_Value __tmp = xf_val_ok_map(m);
+xf_map_release(m);
+
+return __tmp;
+
 }
 
 /* apply a replacement string with \1..\9 back-references */
@@ -2341,7 +2384,13 @@ static xf_Value jp_parse(JsonParser *jp, int depth) {
             if (*jp->p == ',') jp->p++;
         }
         map_done:;
-        return xf_val_ok_map(m);
+
+
+xf_Value __tmp = xf_val_ok_map(m);
+xf_map_release(m);
+
+return __tmp;
+
     }
     return xf_val_nav(XF_TYPE_VOID);
 }
@@ -2670,8 +2719,10 @@ static xf_Value cp_worker(xf_Value *args, size_t argc) {
     xf_map_set(m, k_data, args[1]);
     xf_str_release(k_fn);
     xf_str_release(k_data);
-    xf_Value v = xf_val_ok_map(m);
-    xf_map_release(m);
+
+xf_Value v = xf_val_ok_map(m);
+xf_map_release(m);
+
     return v;
 }
 
@@ -2774,7 +2825,10 @@ static xf_Value cp_assign(xf_Value *args, size_t argc) {
             xf_str_release(k_res);
         }
 
-        xf_Value out_val = xf_val_ok_map(out_row);
+
+xf_Value out_val = xf_val_ok_map(out_row);
+xf_map_release(out_row);
+
         xf_arr_push(out, out_val);
         xf_map_release(out_row);
     }
@@ -3100,7 +3154,10 @@ xf_Value push_val = has_akey ? ds_cell(row, akey) : ds->items[i];
 xf_arr_push(ba, xf_value_retain(push_val));
     }
 
-    xf_Value rv = xf_val_ok_map(out);
+
+xf_Value rv = xf_val_ok_map(out);
+xf_map_release(out);
+
     return rv;
 }
 
@@ -3157,7 +3214,10 @@ static xf_Value cd_merge(xf_Value *args, size_t argc) {
                     xf_map_set(merged, r1->order[k], xf_value_retain(xf_map_get(r1, r1->order[k])));
                 for (size_t k = 0; k < matched->order_len; k++)
                     xf_map_set(merged, matched->order[k], xf_value_retain(xf_map_get(matched, matched->order[k])));
-                xf_Value mv = xf_val_ok_map(merged);
+
+xf_Value mv = xf_val_ok_map(merged);
+xf_map_release(merged);
+
                 xf_arr_push(out, mv);
                 (void)merged; /* map not retained by val_ok_map; do not release */
             }
@@ -3191,7 +3251,10 @@ static xf_Value cd_index(xf_Value *args, size_t argc) {
         if (existing.state != XF_STATE_OK)
 xf_map_set(out, ks.data.str, xf_value_retain(ds->items[i]));
         }
-    xf_Value v = xf_val_ok_map(out);
+
+xf_Value v = xf_val_ok_map(out);
+xf_map_release(out);
+
     return v;
 }
 
@@ -3331,7 +3394,10 @@ xf_arr_push(col_arr, xf_value_retain(cell));
     }
     xf_arr_release(cols);
 
-    xf_Value v = xf_val_ok_map(out);
+
+xf_Value v = xf_val_ok_map(out);
+xf_map_release(out);
+
     return v;
 }
 
@@ -3479,7 +3545,10 @@ static xf_Value cd_flatten(xf_Value *args, size_t argc) {
                                    xf_value_retain(xf_map_get(sm, sm->order[j])));
                 }
             }
-            xf_Value r = xf_val_ok_map(out); xf_map_release(out); return r;
+
+xf_Value r = xf_val_ok_map(out);
+xf_map_release(out);
+ return r;
         }
 
         /* mixed/scalar values: return arr of all map values */
@@ -3670,7 +3739,13 @@ static xf_Value cd_agg_parallel(xf_Value *args, size_t argc) {
         xf_arr_release(chunks[i]);
     }
 
-    return xf_val_ok_map(merged);
+
+
+xf_Value __tmp = xf_val_ok_map(merged);
+xf_map_release(merged);
+
+return __tmp;
+
 }
 
 /* ── stream(sources, fn [, n]) → arr ─────────────────────────
@@ -4672,7 +4747,12 @@ static xf_Value ce_grep_files(xf_Value *args, size_t argc) {
     glob_t gresult;
     if (glob(glob_pat, GLOB_TILDE, NULL, &gresult) != 0) {
         globfree(&gresult);
-        return xf_val_ok_map(xf_map_new());  /* empty result for no matches */
+
+xf_map_t *m = xf_map_new();
+xf_Value v = xf_val_ok_map(m);
+xf_map_release(m);
+return v;
+  /* empty result for no matches */
     }
 
     regex_t re;
@@ -4712,7 +4792,13 @@ static xf_Value ce_grep_files(xf_Value *args, size_t argc) {
     regfree(&re);
     globfree(&gresult);
 
-    return xf_val_ok_map(result);
+
+
+xf_Value __tmp = xf_val_ok_map(result);
+xf_map_release(result);
+
+return __tmp;
+
 }
 
 /* batch_files(paths_arr, ops_arr) → map {path → 1/0}
@@ -4754,7 +4840,13 @@ static xf_Value ce_batch_files(xf_Value *args, size_t argc) {
         xf_str_release(pk);
     }
 
-    return xf_val_ok_map(result);
+
+
+xf_Value __tmp = xf_val_ok_map(result);
+xf_map_release(result);
+
+return __tmp;
+
 }
 
 /* ── build_edit ─────────────────────────────────────────────── */

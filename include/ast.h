@@ -45,6 +45,7 @@ typedef enum {
     EXPR_ARR_LIT,
     EXPR_MAP_LIT,
     EXPR_SET_LIT,
+    EXPR_TUPLE_LIT,
 /* ── variables ────────────────────────────────────────── */
     EXPR_IDENT,       /* foo                                    */
     EXPR_FIELD,       /* $0  $1  $n                             */
@@ -157,7 +158,10 @@ struct Expr {
             Expr   **items;
             size_t   count;
         } arr_lit;
-
+struct {
+    Expr **items;
+    size_t count;
+} tuple_lit;
         struct { Expr **keys; Expr **vals; size_t count; } map_lit;
         struct { Expr **items; size_t count; } set_lit;
         /* EXPR_IDENT */
@@ -498,8 +502,12 @@ typedef struct {
  * ============================================================ */
 
 /* expression constructors */
-Expr *ast_num(double val, Loc loc);
-Expr *ast_str(xf_Str *val, Loc loc);
+Expr *ast_arr_lit(Expr **items, size_t count, Loc loc);
+Expr *ast_map_lit(Expr **keys, Expr **vals, size_t count, Loc loc);
+Expr *ast_set_lit(Expr **items, size_t count, Loc loc);
+Expr *ast_tuple_lit(Expr **items, size_t count, Loc loc);
+Expr *ast_num(double value, Loc loc);
+Expr *ast_str(xf_Str *value, Loc loc);
 Expr *ast_regex(xf_Str *pattern, uint32_t flags, Loc loc);
 Expr *ast_arr_lit(Expr **items, size_t count, Loc loc);
 Expr *ast_map_lit(Expr **keys, Expr **vals, size_t count, Loc loc);

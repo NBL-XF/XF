@@ -38,6 +38,12 @@ Expr *ast_num(double val, Loc loc) {
     e->as.num = val;
     return e;
 }
+Expr *ast_tuple_lit(Expr **items, size_t count, Loc loc) {
+    Expr *e = expr_alloc(EXPR_TUPLE_LIT, loc);
+    e->as.tuple_lit.items = items;
+    e->as.tuple_lit.count = count;
+    return e;
+}
 Expr *ast_arr_lit(Expr **items, size_t count, Loc loc) {
     Expr *e = expr_alloc(EXPR_ARR_LIT, loc);   /* use your existing allocator */
     e->as.arr_lit.items = items;
@@ -477,9 +483,15 @@ void ast_expr_free(Expr *e) {
         case EXPR_TYPE:
             ast_expr_free(e->as.introspect.operand);
             break;
+         case EXPR_TUPLE_LIT:
+    for (size_t i = 0; i < e->as.tuple_lit.count; i++)
+        ast_expr_free(e->as.tuple_lit.items[i]);
+    free(e->as.tuple_lit.items);
+    break;
         case EXPR_ARR_LIT: for(size_t i=0;i<e->as.arr_lit.count;i++) ast_expr_free(e->as.arr_lit.items[i]); free(e->as.arr_lit.items); break;
         case EXPR_MAP_LIT: for(size_t i=0;i<e->as.map_lit.count;i++){ast_expr_free(e->as.map_lit.keys[i]);ast_expr_free(e->as.map_lit.vals[i]);} free(e->as.map_lit.keys); free(e->as.map_lit.vals); break;
-        case EXPR_SET_LIT: for(size_t i=0;i<e->as.set_lit.count;i++) ast_expr_free(e->as.set_lit.items[i]); free(e->as.set_lit.items); break;
+
+                case EXPR_SET_LIT: for(size_t i=0;i<e->as.set_lit.count;i++) ast_expr_free(e->as.set_lit.items[i]); free(e->as.set_lit.items); break;
         case EXPR_PIPE_FN:
             ast_expr_free(e->as.pipe_fn.left);
             ast_expr_free(e->as.pipe_fn.right);

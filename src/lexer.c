@@ -16,6 +16,7 @@ static const Keyword keywords[] = {
     { "map",           TK_KW_MAP    },
     { "set",           TK_KW_SET    },
     { "arr",           TK_KW_ARR    },
+    { "tuple",         TK_KW_TUPLE  },
     { "fn",            TK_KW_FN     },
     { "void",          TK_KW_VOID   },
     { "OK",            TK_KW_OK     },

@@ -15,7 +15,7 @@
 #include <regex.h>
 #include <strings.h>
 #include <pthread.h>
-
+#include <stdarg.h>
 /* ============================================================
  * Spawn thread infrastructure
  *
@@ -229,19 +229,25 @@ static xf_Value interp_call_core(Interp *it,
 }
 void interp_error(Interp *it, Loc loc, const char *fmt, ...) {
     it->had_error = true;
-    va_list ap; va_start(ap, fmt);
+
+    va_list ap;
+    va_start(ap, fmt);
+
     char msg[512];
     vsnprintf(msg, sizeof(msg), fmt, ap);
+
     va_end(ap);
+
     snprintf(it->err_msg, sizeof(it->err_msg), "%s", msg);
-    fprintf(stdout, "ERR ──────────────────────────────────────\r\n");
-    fprintf(stdout, "  %s\r\n", msg);
-    fprintf(stdout, "  at %s:%u:%u\r\n", loc.source, loc.line, loc.col);
-    fprintf(stdout, "──────────────────────────────────────────\r\n");
-    xf_Str *_es = xf_str_from_cstr(msg);
-    xf_value_release(it->last_err);
-    it->last_err = xf_val_ok_str(_es);
-    xf_str_release(_es);
+
+    fprintf(stdout, "ERR ──────────────────────────────────────\n");
+    fprintf(stdout, "  %s\n", msg);
+
+    if (loc.source) {
+        fprintf(stdout, "  at %s:%d:%d\n", loc.source, loc.line, loc.col);
+    }
+
+    fprintf(stdout, "──────────────────────────────────────────\n");
 }
 static void xf_print_value(FILE *out, xf_Value v) {
     switch (v.state) {
@@ -272,8 +278,20 @@ static void xf_print_value(FILE *out, xf_Value v) {
             fputc(']', out);
             return;
         }
-
-        case XF_TYPE_MAP: {
+case XF_TYPE_TUPLE: {
+    fputc('(', out);
+    if (v.data.tuple) {
+        size_t n = xf_tuple_len(v.data.tuple);
+        for (size_t i = 0; i < n; i++) {
+            if (i > 0) fputs(", ", out);
+            xf_print_value(out, xf_tuple_get(v.data.tuple, i));
+        }
+        if (n == 1) fputc(',', out);
+    }
+    fputc(')', out);
+    return;
+}
+                case XF_TYPE_MAP: {
             fputc('{', out);
             if (v.data.map) {
                 for (size_t i = 0; i < v.data.map->order_len; i++) {
@@ -479,6 +497,10 @@ static bool lvalue_store(Interp *it, Expr *target, xf_Value val) {
             return false;
         }
         xf_Value container = lvalue_load(it, obj_expr);
+        if (container.state == XF_STATE_OK && container.type == XF_TYPE_TUPLE) {
+    interp_error(it, target->loc, "cannot assign to tuple element");
+    return false;
+}
         if (container.state != XF_STATE_OK ||
             (container.type != XF_TYPE_ARR && container.type != XF_TYPE_MAP)) {
             xf_Value num_key = xf_coerce_num(key);
@@ -528,7 +550,7 @@ static xf_Value lvalue_load(Interp *it, Expr *target) {
                          target->as.ident.name->data);
             return xf_val_nav(XF_TYPE_VOID);
         }
-        return s->value;
+        return xf_value_retain(s->value);
     }
     return interp_eval_expr(it, target);
 }
@@ -536,7 +558,7 @@ static size_t xf_sprintf_impl(char *out, size_t cap,
                                const char *fmt,
                                xf_Value *args, size_t argc) {
     size_t wi = 0;
-    size_t ai = 1;
+    size_t ai = 0;
 #define PUTC(c) do { if (wi < cap-1) out[wi++] = (c); } while(0)
 #define PUTS(s) do { const char *_s=(s); while(*_s && wi<cap-1) out[wi++]=*_s++; } while(0)
     for (const char *p = fmt; *p; p++) {
@@ -921,7 +943,25 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
         re->compiled = NULL;                /* lazy compile on first use */
         return xf_val_ok_re(re);
     }
-    case EXPR_ARR_LIT: {
+case EXPR_TUPLE_LIT: {
+    size_t n = e->as.tuple_lit.count;
+    xf_Value *items = n ? malloc(sizeof(xf_Value) * n) : NULL;
+    for (size_t i = 0; i < n; i++) {
+        xf_Value v = interp_eval_expr(it, e->as.tuple_lit.items[i]);
+        if (v.state != XF_STATE_OK) {
+            for (size_t j = 0; j < i; j++) xf_value_release(items[j]);
+            free(items);
+            return v;
+        }
+        items[i] = v;
+    }
+    xf_tuple_t *t = xf_tuple_new(items, n);
+    free(items);
+    xf_Value out = xf_val_ok_tuple(t);
+    xf_tuple_release(t);
+    return out;
+}
+        case EXPR_ARR_LIT: {
         xf_arr_t *a = xf_arr_new();
         for (size_t i = 0; i < e->as.arr_lit.count; i++) {
             xf_Value v = interp_eval_expr(it, e->as.arr_lit.items[i]);
@@ -943,8 +983,10 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
             xf_Value ks=xf_coerce_str(kv); if(ks.state!=XF_STATE_OK){xf_map_release(m);return ks;}
             xf_map_set(m,ks.data.str,vv); xf_str_release(ks.data.str);
         }
-        return xf_val_ok_map(m);
-    }
+xf_Value out = xf_val_ok_map(m);
+xf_map_release(m);
+return out;
+        }
     case EXPR_SET_LIT: {
         xf_map_t *m=xf_map_new();
         for(size_t i=0;i<e->as.set_lit.count;i++){
@@ -957,8 +999,11 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
                 xf_map_set(m,ks.data.str,xf_val_ok_num(1.0)); xf_str_release(ks.data.str);
             }
         }
-        xf_Value out=xf_val_ok_map(m); out.type=XF_TYPE_SET; return out;
-    }
+xf_Value out = xf_val_ok_map(m);
+xf_map_release(m);
+out.type = XF_TYPE_SET;
+return out;
+        }
     case EXPR_IDENT: {
         Symbol *s = sym_lookup_str(it->syms, e->as.ident.name);
         if (!s) {
@@ -1002,15 +1047,22 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
         if (key.state != XF_STATE_OK) { xf_value_release(obj); return key; }
         xf_Value _sub_result = xf_val_nav(XF_TYPE_VOID);
         if (obj.type == XF_TYPE_ARR) {
-            xf_Value ni = xf_coerce_num(key);
-            if (ni.state == XF_STATE_OK && obj.data.arr)
-                _sub_result = xf_value_retain(xf_arr_get(obj.data.arr, (size_t)ni.data.num));
-        } else if (obj.type == XF_TYPE_MAP) {
-            xf_Value sk = xf_coerce_str(key);
-            if (sk.state == XF_STATE_OK && sk.data.str && obj.data.map)
-                _sub_result = xf_value_retain(xf_map_get(obj.data.map, sk.data.str));
-            xf_value_release(sk);
-        } else if (obj.type == XF_TYPE_STR && obj.data.str) {
+    xf_Value ni = xf_coerce_num(key);
+    if (ni.state == XF_STATE_OK && obj.data.arr)
+        _sub_result = xf_value_retain(xf_arr_get(obj.data.arr, (size_t)ni.data.num));
+
+} else if (obj.type == XF_TYPE_TUPLE) {
+    xf_Value ni = xf_coerce_num(key);
+    if (ni.state == XF_STATE_OK && obj.data.tuple)
+        _sub_result = xf_value_retain(xf_tuple_get(obj.data.tuple, (size_t)ni.data.num));
+
+} else if (obj.type == XF_TYPE_MAP) {
+    xf_Value sk = xf_coerce_str(key);
+    if (sk.state == XF_STATE_OK && sk.data.str && obj.data.map)
+        _sub_result = xf_value_retain(xf_map_get(obj.data.map, sk.data.str));
+    xf_value_release(sk);
+
+    }      else if (obj.type == XF_TYPE_STR && obj.data.str) {
             xf_Value ni = xf_coerce_num(key);
             if (ni.state == XF_STATE_OK) {
                 size_t idx = (size_t)ni.data.num;
@@ -1243,7 +1295,7 @@ case BINOP_PIPE_CMD: {
     if (sb_allocated) xf_value_release(sb_coerced);
     return make_bool(_is_nmatch ? !matched : matched);
 }
-                      
+
             default: return xf_val_nav(XF_TYPE_VOID);
         }
     }
@@ -1402,6 +1454,8 @@ case BINOP_PIPE_CMD: {
                 return xf_val_ok_num(v.data.str ? (double)v.data.str->len : 0.0);
             case XF_TYPE_ARR:
                 return xf_val_ok_num(v.data.arr ? (double)v.data.arr->len : 0.0);
+            case XF_TYPE_TUPLE:
+    return xf_val_ok_num(v.data.tuple ? (double)xf_tuple_len(v.data.tuple) : 0.0);
             case XF_TYPE_MAP:
             case XF_TYPE_SET:
                 return xf_val_ok_num(v.data.map ? (double)v.data.map->order_len : 0.0);

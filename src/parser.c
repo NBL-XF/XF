@@ -76,10 +76,10 @@ static void synchronize(Parser *p) {
         switch (cur_kind(p)) {
             case TK_KW_FN:
             case TK_KW_NUM: case TK_KW_STR: case TK_KW_MAP:
-            case TK_KW_SET: case TK_KW_ARR: case TK_KW_VOID:
-            case TK_KW_IF:    case TK_KW_WHILE: case TK_KW_FOR:
-            case TK_KW_BEGIN: case TK_KW_END:   case TK_KW_RETURN:
-            case TK_KW_PRINT: case TK_LBRACE:
+            case TK_KW_SET: case TK_KW_ARR: case TK_KW_TUPLE: 
+            case TK_KW_VOID: case TK_KW_IF:    case TK_KW_WHILE: 
+            case TK_KW_FOR: case TK_KW_BEGIN: case TK_KW_END:   
+            case TK_KW_RETURN: case TK_KW_PRINT: case TK_LBRACE:
                 return;
             default: advance(p); break;
         }
@@ -96,8 +96,8 @@ static xf_Str *tok_to_str(Token *t) {
 static bool is_type_kw(Parser *p) {
     switch (cur_kind(p)) {
         case TK_KW_NUM: case TK_KW_STR: case TK_KW_MAP:
-        case TK_KW_SET: case TK_KW_ARR: case TK_KW_FN:
-        case TK_KW_VOID: return true;
+        case TK_KW_SET: case TK_KW_ARR: case TK_KW_TUPLE:
+        case TK_KW_FN: case TK_KW_VOID: return true;
         default: return false;
     }
 }
@@ -114,6 +114,7 @@ uint8_t parse_type(Parser *p) {
         case TK_KW_MAP:  advance(p); return XF_TYPE_MAP;
         case TK_KW_SET:  advance(p); return XF_TYPE_SET;
         case TK_KW_ARR:  advance(p); return XF_TYPE_ARR;
+        case TK_KW_TUPLE: advance(p); return XF_TYPE_TUPLE;
         case TK_KW_FN:   advance(p); return XF_TYPE_FN;
         case TK_KW_VOID: advance(p); return XF_TYPE_VOID;
         default:
@@ -290,13 +291,39 @@ if (t->kind == TK_LBRACKET) {
     }
 
     /* grouped expression */
-    if (t->kind == TK_LPAREN) {
+if (t->kind == TK_LPAREN) {
+    advance(p);
+
+    if (check(p, TK_RPAREN)) {
+        parser_error(p, "empty tuple/group not allowed");
         advance(p);
-        Expr *e = parse_expr(p);
-        expect(p, TK_RPAREN, "expected ')' after expression");
-        return e;
+        return ast_num(0, loc);
     }
 
+    Expr *first = parse_expr(p);
+
+    if (match_tok(p, TK_COMMA)) {
+        size_t cap = 4, count = 0;
+        Expr **items = malloc(sizeof(*items) * cap);
+        items[count++] = first;
+
+        if (!check(p, TK_RPAREN)) {
+            do {
+                if (count == cap) {
+                    cap *= 2;
+                    items = realloc(items, sizeof(*items) * cap);
+                }
+                items[count++] = parse_expr(p);
+            } while (match_tok(p, TK_COMMA));
+        }
+
+        expect(p, TK_RPAREN, "expected ')' after tuple literal");
+        return ast_tuple_lit(items, count, loc);
+    }
+
+    expect(p, TK_RPAREN, "expected ')' after expression");
+    return first;
+}
     /* spread: ...x */
     if (t->kind == TK_DOTDOTDOT) {
         advance(p);

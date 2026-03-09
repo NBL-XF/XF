@@ -40,6 +40,7 @@ typedef enum {
     TK_KW_MAP,        /* map                                    */
     TK_KW_SET,        /* set                                    */
     TK_KW_ARR,        /* arr                                    */
+    TK_KW_TUPLE,
     TK_KW_FN,         /* fn                                     */
     TK_KW_VOID,       /* void  (type)                           */
 

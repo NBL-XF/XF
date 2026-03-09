@@ -61,21 +61,19 @@ static const char *const XF_STATE_NAMES[XF_STATE_COUNT] = {
 /* ------------------------------------------------------------
  * Types
  * ------------------------------------------------------------ */
-
-#define XF_TYPE_VOID   0   /* no type — used for void fn returns          */
-#define XF_TYPE_NUM    1   /* double precision float                       */
-#define XF_TYPE_STR    2   /* interned/ref-counted string                  */
-#define XF_TYPE_MAP    3   /* associative array (hash map)                 */
-#define XF_TYPE_SET    4   /* unique value collection                      */
-#define XF_TYPE_ARR    5   /* ordered array                                */
-#define XF_TYPE_FN     6   /* callable — first class                       */
-#define XF_TYPE_REGEX  7   /* compiled regex — second class                */
-#define XF_TYPE_MODULE 8   /* namespace module (core.math etc.)            */
-
-#define XF_TYPE_COUNT  9
-
+#define XF_TYPE_VOID   0
+#define XF_TYPE_NUM    1
+#define XF_TYPE_STR    2
+#define XF_TYPE_MAP    3
+#define XF_TYPE_SET    4
+#define XF_TYPE_ARR    5
+#define XF_TYPE_FN     6
+#define XF_TYPE_REGEX  7
+#define XF_TYPE_MODULE 8
+#define XF_TYPE_TUPLE  9
+#define XF_TYPE_COUNT  10
 static const char *const XF_TYPE_NAMES[XF_TYPE_COUNT] = {
-    "void", "num", "str", "map", "set", "arr", "fn", "regex", "module"
+    "void", "num", "str", "map", "set", "arr", "fn", "regex", "module","tuple"
 };
 
 
@@ -95,7 +93,7 @@ typedef struct xf_param       xf_param_t;
 typedef struct xf_env         xf_env_t;
 typedef struct xf_atomic_value xf_atomic_value_t;
 typedef struct xf_module      xf_module_t;
-
+typedef struct xf_tuple xf_tuple_t;
 /* short aliases — use these in new code */
 typedef xf_value_t         xf_Value;
 typedef xf_str_t           xf_Str;
@@ -231,9 +229,11 @@ struct xf_value {
         xf_map_t    *map;
         xf_set_t    *set;
         xf_arr_t    *arr;
+        xf_tuple_t  *tuple;
         xf_fn_t     *fn;
         xf_regex_t  *re;
         xf_module_t *mod;
+        
     } data;
 
     xf_err_t *err;    /* non-NULL only when state == XF_STATE_ERR */
@@ -359,6 +359,7 @@ typedef struct xf_atomic_value {
         xf_arr_t   *arr;
         xf_fn_t    *fn;
         xf_regex_t *re;
+        xf_tuple_t *tuple;
     } data;
     xf_err_t *err;
 } xf_atomic_value_t;
@@ -422,5 +423,10 @@ void xf_value_repl_print(xf_value_t v);
 /* format err context block for REPL collapse */
 void xf_err_print(xf_err_t *e);
 
-
+xf_tuple_t *xf_tuple_new(xf_value_t *items, size_t len);
+xf_tuple_t *xf_tuple_retain(xf_tuple_t *t);
+void xf_tuple_release(xf_tuple_t *t);
+xf_value_t xf_tuple_get(const xf_tuple_t *t, size_t idx);
+xf_value_t xf_val_ok_tuple(xf_tuple_t *t);
+size_t xf_tuple_len(const xf_tuple_t *t);
 #endif /* XF_VALUE_H */

@@ -5,7 +5,11 @@
 #include <string.h>
 #include <assert.h>
 #include <regex.h>
-
+struct xf_tuple {
+    _Atomic uint32_t refcount;
+    size_t len;
+    xf_Value *items;
+};
 /* ============================================================
  * String implementation
  * ============================================================ */
@@ -125,7 +129,7 @@ xf_value_t xf_val_ok_map(xf_map_t *m) {
     return (xf_value_t){
         .state = XF_STATE_OK,
         .type  = XF_TYPE_MAP,
-        .data  = { .map = m }
+        .data  = { .map = xf_map_retain(m) }
     };
 }
 
@@ -133,10 +137,58 @@ xf_value_t xf_val_ok_set(xf_set_t *s) {
     return (xf_value_t){
         .state = XF_STATE_OK,
         .type  = XF_TYPE_SET,
-        .data  = { .set = s }
+        .data  = { .set = (xf_set_t *)xf_map_retain((xf_map_t *)s) }
     };
 }
+size_t xf_tuple_len(const xf_tuple_t *t) {
+    return t ? t->len : 0;
+}
+xf_tuple_t *xf_tuple_new(xf_Value *items, size_t len) {
+    xf_tuple_t *t = calloc(1, sizeof(xf_tuple_t));
+    if (!t) return NULL;
 
+    atomic_store(&t->refcount, 1);
+    t->len = len;
+    t->items = len ? calloc(len, sizeof(xf_Value)) : NULL;
+
+    if (len && !t->items) {
+        free(t);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        t->items[i] = items[i]; /* steals ownership from caller */
+    }
+
+    return t;
+}
+xf_tuple_t *xf_tuple_retain(xf_tuple_t *t) {
+    if (t) atomic_fetch_add(&t->refcount, 1);
+    return t;
+}
+
+void xf_tuple_release(xf_tuple_t *t) {
+    if (!t) return;
+    if (atomic_fetch_sub(&t->refcount, 1) != 1) return;
+
+    for (size_t i = 0; i < t->len; i++) {
+        xf_value_release(t->items[i]);
+    }
+    free(t->items);
+    free(t);
+}
+
+xf_Value xf_tuple_get(const xf_tuple_t *t, size_t idx) {
+    if (!t || idx >= t->len) return xf_val_nav(XF_TYPE_VOID);
+    return t->items[idx];
+}
+xf_Value xf_val_ok_tuple(xf_tuple_t *t) {
+    return (xf_Value){
+        .state = XF_STATE_OK,
+        .type  = XF_TYPE_TUPLE,
+        .data  = { .tuple = xf_tuple_retain(t) }
+    };
+}
 xf_value_t xf_val_ok_arr(xf_arr_t *a) {
     return (xf_value_t){
         .state = XF_STATE_OK,
@@ -153,9 +205,11 @@ xf_value_t xf_val_ok_module(xf_module_t *m) {
     };
 }
 xf_value_t xf_val_ok_fn(xf_fn_t *f) {
-    return (xf_value_t){ .state = XF_STATE_OK,
-                         .type  = XF_TYPE_FN,
-                         .data  = { .fn = f } };
+    return (xf_value_t){
+        .state = XF_STATE_OK,
+        .type  = XF_TYPE_FN,
+        .data  = { .fn = xf_fn_retain(f) }
+    };
 }
 xf_value_t xf_val_native_fn(const char *name, uint8_t ret_type,
                              xf_value_t (*fn)(xf_value_t *args, size_t argc)) {
@@ -684,6 +738,20 @@ static void print_value_data(xf_value_t v) {
             printf("}");
             break;
         }
+        case XF_TYPE_TUPLE: {
+    xf_tuple_t *t = v.data.tuple;
+    printf("(");
+    if (t) {
+        size_t n = xf_tuple_len(t);
+        for (size_t i = 0; i < n; i++) {
+            if (i > 0) printf(", ");
+            print_value_data(xf_tuple_get(t, i));
+        }
+        if (n == 1) printf(",");
+    }
+    printf(")");
+    break;
+}
         case XF_TYPE_MODULE:
             if (v.data.mod && v.data.mod->name)
                 printf("<module %s>", v.data.mod->name);
