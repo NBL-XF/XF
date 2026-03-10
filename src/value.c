@@ -249,13 +249,12 @@ void xf_regex_release(xf_regex_t *r) {
     }
     free(r);
 }
-
-/* ── value_retain / value_release ───────────────────────────── */
 xf_Value xf_value_retain(xf_Value v) {
     if (v.state != XF_STATE_OK) return v;
     switch (v.type) {
         case XF_TYPE_STR:    xf_str_retain(v.data.str);       break;
         case XF_TYPE_ARR:    xf_arr_retain(v.data.arr);       break;
+        case XF_TYPE_TUPLE:  xf_tuple_retain(v.data.tuple);   break;
         case XF_TYPE_MAP:
         case XF_TYPE_SET:    xf_map_retain(v.data.map);       break;
         case XF_TYPE_FN:     xf_fn_retain(v.data.fn);         break;
@@ -270,6 +269,7 @@ void xf_value_release(xf_Value v) {
     switch (v.type) {
         case XF_TYPE_STR:    xf_str_release(v.data.str);      break;
         case XF_TYPE_ARR:    xf_arr_release(v.data.arr);      break;
+        case XF_TYPE_TUPLE:  xf_tuple_release(v.data.tuple);  break;
         case XF_TYPE_MAP:
         case XF_TYPE_SET:    xf_map_release(v.data.map);      break;
         case XF_TYPE_FN:     xf_fn_release(v.data.fn);        break;
@@ -278,7 +278,6 @@ void xf_value_release(xf_Value v) {
         default: break;
     }
 }
-
 
 xf_value_t xf_val_ok_re(xf_regex_t *r) {
     return (xf_value_t){ .state = XF_STATE_OK,
@@ -578,7 +577,6 @@ xf_value_t xf_coerce_num(xf_value_t v) {
     }
     return xf_val_nav(XF_TYPE_NUM);
 }
-
 xf_value_t xf_coerce_str(xf_value_t v) {
     if (v.state != XF_STATE_OK) return v;
 
@@ -593,6 +591,82 @@ xf_value_t xf_coerce_str(xf_value_t v) {
             snprintf(buf, sizeof(buf), "%.14g", v.data.num);
 
         xf_str_t *s = xf_str_from_cstr(buf);
+        xf_value_t out = xf_val_ok_str(s);
+        xf_str_release(s);
+        return out;
+    }
+
+    if (v.type == XF_TYPE_TUPLE) {
+        xf_tuple_t *t = v.data.tuple;
+        size_t cap = 64;
+        size_t len = 0;
+        char *outbuf = malloc(cap);
+        if (!outbuf) return xf_val_nav(XF_TYPE_STR);
+
+        outbuf[len++] = '(';
+
+        if (t) {
+            for (size_t i = 0; i < t->len; i++) {
+                if (i > 0) {
+                    const char *sep = ", ";
+                    size_t slen = 2;
+                    while (len + slen + 1 > cap) {
+                        cap *= 2;
+                        char *tmp = realloc(outbuf, cap);
+                        if (!tmp) {
+                            free(outbuf);
+                            return xf_val_nav(XF_TYPE_STR);
+                        }
+                        outbuf = tmp;
+                    }
+                    memcpy(outbuf + len, sep, slen);
+                    len += slen;
+                }
+
+                xf_value_t elem = xf_tuple_get(t, i);
+                xf_value_t sv = xf_coerce_str(elem);
+                const char *s = (sv.state == XF_STATE_OK && sv.data.str)
+                              ? sv.data.str->data
+                              : XF_TYPE_NAMES[elem.type];
+                size_t slen = strlen(s);
+
+                while (len + slen + 2 > cap) {
+                    cap *= 2;
+                    char *tmp = realloc(outbuf, cap);
+                    if (!tmp) {
+                        xf_value_release(sv);
+                        free(outbuf);
+                        return xf_val_nav(XF_TYPE_STR);
+                    }
+                    outbuf = tmp;
+                }
+
+                memcpy(outbuf + len, s, slen);
+                len += slen;
+                xf_value_release(sv);
+            }
+
+            if (t->len == 1) {
+                while (len + 2 > cap) {
+                    cap *= 2;
+                    char *tmp = realloc(outbuf, cap);
+                    if (!tmp) {
+                        free(outbuf);
+                        return xf_val_nav(XF_TYPE_STR);
+                    }
+                    outbuf = tmp;
+                }
+                outbuf[len++] = ',';
+            }
+        }
+
+        outbuf[len++] = ')';
+        outbuf[len] = '\0';
+
+        xf_str_t *s = xf_str_new(outbuf, len);
+        free(outbuf);
+        if (!s) return xf_val_nav(XF_TYPE_STR);
+
         xf_value_t out = xf_val_ok_str(s);
         xf_str_release(s);
         return out;

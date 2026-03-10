@@ -27,7 +27,12 @@ static TopLevel *top_alloc(TopKind kind, Loc loc) {
     t->loc  = loc;
     return t;
 }
-
+static LoopBind *loop_bind_alloc(LoopBindKind kind, Loc loc) {
+    LoopBind *b = calloc(1, sizeof(LoopBind));
+    b->kind = kind;
+    b->loc  = loc;
+    return b;
+}
 
 /* ============================================================
  * Expr constructors
@@ -212,7 +217,22 @@ Expr *ast_fn(uint8_t ret, Param *params, size_t pc, Stmt *body, Loc loc) {
     return e;
 }
 
+/* ============================================================
+ * LoopBind constructors
+ * ============================================================ */
 
+LoopBind *ast_loop_bind_name(xf_Str *name, Loc loc) {
+    LoopBind *b = loop_bind_alloc(LOOP_BIND_NAME, loc);
+    b->as.name = xf_str_retain(name);
+    return b;
+}
+
+LoopBind *ast_loop_bind_tuple(LoopBind **items, size_t count, Loc loc) {
+    LoopBind *b = loop_bind_alloc(LOOP_BIND_TUPLE, loc);
+    b->as.tuple.items = items;
+    b->as.tuple.count = count;
+    return b;
+}
 /* ============================================================
  * Stmt constructors
  * ============================================================ */
@@ -264,26 +284,30 @@ Stmt *ast_while(Expr *cond, Stmt *body, Loc loc) {
     return s;
 }
 
-Stmt *ast_for(xf_Str *iter, Expr *collection, Stmt *body, Loc loc) {
+Stmt *ast_for(LoopBind *iter_key, LoopBind *iter_val,
+              Expr *collection, Stmt *body, Loc loc) {
     Stmt *s = stmt_alloc(STMT_FOR, loc);
-    s->as.for_stmt.iter       = xf_str_retain(iter);
+    s->as.for_stmt.iter_key   = iter_key;
+    s->as.for_stmt.iter_val   = iter_val;
     s->as.for_stmt.collection = collection;
     s->as.for_stmt.body       = body;
     return s;
 }
 
+Stmt *ast_for_short(Expr *collection,
+                    LoopBind *iter_key, LoopBind *iter_val,
+                    Stmt *body, Loc loc) {
+    Stmt *s = stmt_alloc(STMT_FOR_SHORT, loc);
+    s->as.for_short.collection = collection;
+    s->as.for_short.iter_key   = iter_key;
+    s->as.for_short.iter_val   = iter_val;
+    s->as.for_short.body       = body;
+    return s;
+}
 Stmt *ast_while_short(Expr *cond, Stmt *body, Loc loc) {
     Stmt *s = stmt_alloc(STMT_WHILE_SHORT, loc);
     s->as.while_short.cond = cond;
     s->as.while_short.body = body;
-    return s;
-}
-
-Stmt *ast_for_short(Expr *collection, xf_Str *iter, Stmt *body, Loc loc) {
-    Stmt *s = stmt_alloc(STMT_FOR_SHORT, loc);
-    s->as.for_short.collection = collection;
-    s->as.for_short.iter       = xf_str_retain(iter);
-    s->as.for_short.body       = body;
     return s;
 }
 
@@ -511,7 +535,26 @@ void ast_expr_free(Expr *e) {
     }
     free(e);
 }
+void ast_loop_bind_free(LoopBind *b) {
+    if (!b) return;
 
+    switch (b->kind) {
+        case LOOP_BIND_NAME:
+            xf_str_release(b->as.name);
+            break;
+
+        case LOOP_BIND_TUPLE:
+            for (size_t i = 0; i < b->as.tuple.count; i++)
+                ast_loop_bind_free(b->as.tuple.items[i]);
+            free(b->as.tuple.items);
+            break;
+
+        default:
+            break;
+    }
+
+    free(b);
+}
 void ast_stmt_free(Stmt *s) {
     if (!s) return;
     switch (s->kind) {
@@ -547,7 +590,8 @@ void ast_stmt_free(Stmt *s) {
             ast_stmt_free(s->as.while_stmt.body);
             break;
         case STMT_FOR:
-            xf_str_release(s->as.for_stmt.iter);
+            ast_loop_bind_free(s->as.for_stmt.iter_key);
+            ast_loop_bind_free(s->as.for_stmt.iter_val);
             ast_expr_free(s->as.for_stmt.collection);
             ast_stmt_free(s->as.for_stmt.body);
             break;
@@ -557,7 +601,8 @@ void ast_stmt_free(Stmt *s) {
             break;
         case STMT_FOR_SHORT:
             ast_expr_free(s->as.for_short.collection);
-            xf_str_release(s->as.for_short.iter);
+            ast_loop_bind_free(s->as.for_short.iter_key);
+            ast_loop_bind_free(s->as.for_short.iter_val);
             ast_stmt_free(s->as.for_short.body);
             break;
         case STMT_RETURN: ast_expr_free(s->as.ret.value);      break;
@@ -726,7 +771,30 @@ void ast_expr_print(const Expr *e, int d) {
             printf("EXPR(%d)\n", e->kind);
     }
 }
+void ast_loop_bind_print(const LoopBind *b, int d) {
+    if (!b) {
+        indent(d);
+        printf("(null-bind)\n");
+        return;
+    }
 
+    indent(d);
+    switch (b->kind) {
+        case LOOP_BIND_NAME:
+            printf("BIND_NAME %s\n", b->as.name->data);
+            break;
+
+        case LOOP_BIND_TUPLE:
+            printf("BIND_TUPLE (%zu)\n", b->as.tuple.count);
+            for (size_t i = 0; i < b->as.tuple.count; i++)
+                ast_loop_bind_print(b->as.tuple.items[i], d + 1);
+            break;
+
+        default:
+            printf("BIND(?)\n");
+            break;
+    }
+}
 void ast_stmt_print(const Stmt *s, int d) {
     if (!s) return;
     indent(d);
@@ -770,21 +838,39 @@ void ast_stmt_print(const Stmt *s, int d) {
             ast_stmt_print(s->as.while_stmt.body, d+1);
             break;
         case STMT_FOR:
-            printf("FOR %s in\n", s->as.for_stmt.iter->data);
-            ast_expr_print(s->as.for_stmt.collection, d+1);
+            printf("FOR\n");
+            if (s->as.for_stmt.iter_key) {
+                indent(d+1); printf("KEY\n");
+                ast_loop_bind_print(s->as.for_stmt.iter_key, d+2);
+            }
+            if (s->as.for_stmt.iter_val) {
+                indent(d+1); printf("VAL\n");
+                ast_loop_bind_print(s->as.for_stmt.iter_val, d+2);
+            }
+            indent(d+1); printf("IN\n");
+            ast_expr_print(s->as.for_stmt.collection, d+2);
             ast_stmt_print(s->as.for_stmt.body, d+1);
             break;
-        case STMT_WHILE_SHORT:
+                case STMT_WHILE_SHORT:
             printf("WHILE_SHORT <>\n");
             ast_expr_print(s->as.while_short.cond, d+1);
             ast_stmt_print(s->as.while_short.body, d+1);
             break;
         case STMT_FOR_SHORT:
-            printf("FOR_SHORT [%s] >\n", s->as.for_short.iter->data);
-            ast_expr_print(s->as.for_short.collection, d+1);
+            printf("FOR_SHORT\n");
+            indent(d+1); printf("COLLECTION\n");
+            ast_expr_print(s->as.for_short.collection, d+2);
+            if (s->as.for_short.iter_key) {
+                indent(d+1); printf("KEY\n");
+                ast_loop_bind_print(s->as.for_short.iter_key, d+2);
+            }
+            if (s->as.for_short.iter_val) {
+                indent(d+1); printf("VAL\n");
+                ast_loop_bind_print(s->as.for_short.iter_val, d+2);
+            }
             ast_stmt_print(s->as.for_short.body, d+1);
             break;
-        case STMT_RETURN:
+                        case STMT_RETURN:
             printf("RETURN\n");
             if (s->as.ret.value) ast_expr_print(s->as.ret.value, d+1);
             break;

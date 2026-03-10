@@ -27,10 +27,11 @@
  * Forward declarations
  * ------------------------------------------------------------ */
 
-typedef struct Expr    Expr;
-typedef struct Stmt    Stmt;
-typedef struct Param   Param;
-typedef struct Branch  Branch;
+typedef struct Expr      Expr;
+typedef struct Stmt      Stmt;
+typedef struct Param     Param;
+typedef struct Branch    Branch;
+typedef struct LoopBind  LoopBind;
 
 
 /* ============================================================
@@ -46,20 +47,21 @@ typedef enum {
     EXPR_MAP_LIT,
     EXPR_SET_LIT,
     EXPR_TUPLE_LIT,
-/* ── variables ────────────────────────────────────────── */
+
+    /* ── variables ────────────────────────────────────────── */
     EXPR_IDENT,       /* foo                                    */
     EXPR_FIELD,       /* $0  $1  $n                             */
     EXPR_IVAR,        /* NR NF FNR FS RS OFS ORS                */
     EXPR_SVAR,        /* $file $match $captures $err            */
 
     /* ── operations ───────────────────────────────────────── */
-    EXPR_UNARY,       /* -x  !x  ++x  x++                      */
-    EXPR_BINARY,      /* x + y  x == y  x ~ /re/  etc.         */
+    EXPR_UNARY,       /* -x  !x  ++x  x++                       */
+    EXPR_BINARY,      /* x + y  x == y  x ~ /re/  etc.          */
     EXPR_TERNARY,     /* cond ? then : else                     */
     EXPR_COALESCE,    /* x ?? y  (null/NAV coalescing)          */
 
     /* ── assignment ───────────────────────────────────────── */
-    EXPR_ASSIGN,      /* x = y   x += y  x ..= y  etc.         */
+    EXPR_ASSIGN,      /* x = y   x += y  x ..= y  etc.          */
     EXPR_WALRUS,      /* x := y  (declare + assign)             */
 
     /* ── call / access ────────────────────────────────────── */
@@ -67,12 +69,12 @@ typedef enum {
     EXPR_SUBSCRIPT,   /* a[k]                                   */
     EXPR_MEMBER,      /* obj.field                              */
 
-    /* ── state / type introspection ────────────────────────── */
+    /* ── state / type introspection ───────────────────────── */
     EXPR_STATE,       /* x.state                                */
     EXPR_TYPE,        /* x.type                                 */
-    EXPR_LEN,         /* x.len / x.length  (str/arr/map/set)   */
+    EXPR_LEN,         /* x.len / x.length  (str/arr/map/set)    */
 
-    /* ── type cast ─────────────────────────────────────────── */
+    /* ── type cast ────────────────────────────────────────── */
     EXPR_CAST,        /* num(x)  str(x)  arr(x)  map(x)  set(x) */
 
     /* ── pipeline ─────────────────────────────────────────── */
@@ -116,21 +118,41 @@ typedef enum {
 /* ── assignment operator ────────────────────────────────── */
 typedef enum {
     ASSIGNOP_EQ,       /* =                                     */
-    ASSIGNOP_ADD,      /* +=                                     */
-    ASSIGNOP_SUB,      /* -=                                     */
-    ASSIGNOP_MUL,      /* *=                                     */
-    ASSIGNOP_DIV,      /* /=                                     */
-    ASSIGNOP_MOD,      /* %=                                     */
-    ASSIGNOP_CONCAT,   /* ..=                                    */
+    ASSIGNOP_ADD,      /* +=                                    */
+    ASSIGNOP_SUB,      /* -=                                    */
+    ASSIGNOP_MUL,      /* *=                                    */
+    ASSIGNOP_DIV,      /* /=                                    */
+    ASSIGNOP_MOD,      /* %=                                    */
+    ASSIGNOP_CONCAT,   /* ..=                                   */
 } AssignOp;
 
 
 /* ── parameter (for fn literals) ────────────────────────── */
 struct Param {
     xf_Str *name;
-    uint8_t  type;        /* XF_TYPE_*                          */
-    Expr    *default_val; /* NULL if no default                 */
-    Loc      loc;
+    uint8_t type;        /* XF_TYPE_*                          */
+    Expr   *default_val; /* NULL if no default                 */
+    Loc     loc;
+};
+
+
+/* ── loop binding (for destructuring in for-loops) ──────── */
+typedef enum {
+    LOOP_BIND_NAME,
+    LOOP_BIND_TUPLE
+} LoopBindKind;
+
+struct LoopBind {
+    LoopBindKind kind;
+    Loc          loc;
+
+    union {
+        xf_Str *name;
+        struct {
+            LoopBind **items;
+            size_t     count;
+        } tuple;
+    } as;
 };
 
 
@@ -152,18 +174,31 @@ struct Expr {
             uint32_t flags;    /* XF_RE_*                       */
         } regex;
 
-
         /* EXPR_ARR_LIT */
         struct {
             Expr   **items;
             size_t   count;
         } arr_lit;
-struct {
-    Expr **items;
-    size_t count;
-} tuple_lit;
-        struct { Expr **keys; Expr **vals; size_t count; } map_lit;
-        struct { Expr **items; size_t count; } set_lit;
+
+        /* EXPR_TUPLE_LIT */
+        struct {
+            Expr   **items;
+            size_t   count;
+        } tuple_lit;
+
+        /* EXPR_MAP_LIT */
+        struct {
+            Expr   **keys;
+            Expr   **vals;
+            size_t   count;
+        } map_lit;
+
+        /* EXPR_SET_LIT */
+        struct {
+            Expr   **items;
+            size_t   count;
+        } set_lit;
+
         /* EXPR_IDENT */
         struct { xf_Str *name; } ident;
 
@@ -231,8 +266,8 @@ struct {
 
         /* EXPR_MEMBER */
         struct {
-            Expr    *obj;
-            xf_Str  *field;
+            Expr   *obj;
+            xf_Str *field;
         } member;
 
         /* EXPR_STATE / EXPR_TYPE / EXPR_LEN — operand only */
@@ -240,8 +275,8 @@ struct {
 
         /* EXPR_CAST — type(expr) */
         struct {
-            uint8_t  to_type;   /* XF_TYPE_* target             */
-            Expr    *operand;
+            uint8_t to_type;   /* XF_TYPE_* target              */
+            Expr   *operand;
         } cast;
 
         /* EXPR_PIPE_FN */
@@ -298,7 +333,7 @@ typedef enum {
     /* ── I/O ──────────────────────────────────────────────── */
     STMT_PRINT,       /* print expr, expr, ... ;                */
     STMT_PRINTF,      /* printf fmt, arg, ... ;                 */
-    STMT_OUTFMT,      /* outfmt "csv"|"tsv"|"json"|"text" ;    */
+    STMT_OUTFMT,      /* outfmt "csv"|"tsv"|"json"|"text" ;     */
     STMT_IMPORT,      /* import "file.xf" ;                     */
     STMT_DELETE,      /* delete map[key] ;                      */
 
@@ -315,9 +350,9 @@ typedef enum {
 
 /* ── if/elif/else branch ────────────────────────────────── */
 struct Branch {
-    Expr   *cond;     /* NULL for final else                    */
-    Stmt   *body;
-    Loc     loc;
+    Expr *cond;     /* NULL for final else                     */
+    Stmt *body;
+    Loc   loc;
 };
 
 
@@ -337,25 +372,25 @@ struct Stmt {
 
         /* STMT_VAR_DECL */
         struct {
-            uint8_t  type;     /* XF_TYPE_*                    */
-            xf_Str  *name;
-            Expr    *init;     /* NULL = UNDETERMINED           */
+            uint8_t type;     /* XF_TYPE_*                       */
+            xf_Str *name;
+            Expr   *init;     /* NULL = UNDETERMINED             */
         } var_decl;
 
         /* STMT_FN_DECL */
         struct {
-            uint8_t  return_type;
-            xf_Str  *name;
-            Param   *params;
-            size_t   param_count;
-            Stmt    *body;
+            uint8_t return_type;
+            xf_Str *name;
+            Param  *params;
+            size_t  param_count;
+            Stmt   *body;
         } fn_decl;
 
         /* STMT_IF */
         struct {
-            Branch *branches;  /* if + elif*                    */
+            Branch *branches;  /* if + elif*                     */
             size_t  count;
-            Stmt   *els;       /* else block, or NULL           */
+            Stmt   *els;       /* else block, or NULL            */
         } if_stmt;
 
         /* STMT_WHILE */
@@ -366,48 +401,48 @@ struct Stmt {
 
         /* STMT_FOR */
         struct {
-            xf_Str *iter;     /* loop variable name             */
-            Expr   *collection;
-            Stmt   *body;
+            LoopBind *iter_key;   /* optional */
+            LoopBind *iter_val;   /* required */
+            Expr     *collection;
+            Stmt     *body;
         } for_stmt;
 
-        /* STMT_WHILE_SHORT:  cond <> body */
+        /* STMT_WHILE_SHORT: cond <> body */
         struct {
             Expr *cond;
             Stmt *body;
         } while_short;
 
-        /* STMT_FOR_SHORT:  collection[iter] > body */
+        /* STMT_FOR_SHORT: collection[iter] > body */
         struct {
-            Expr   *collection;
-            xf_Str *iter;
-            Stmt   *body;
+            Expr     *collection;
+            LoopBind *iter_key;   /* optional */
+            LoopBind *iter_val;   /* required */
+            Stmt     *body;
         } for_short;
 
         /* STMT_RETURN */
-        struct { Expr *value; } ret;  /* NULL = void return     */
-
-        /* STMT_NEXT / STMT_EXIT — no extra fields              */
+        struct { Expr *value; } ret;  /* NULL = void return      */
 
         /* STMT_PRINT */
         struct {
-            Expr  **args;
-            size_t  count;
-            Expr   *redirect;    /* target — NULL = stdout                */
-            uint8_t redirect_op; /* 0=none 1=>file 2=>>append 3=|pipe    */
+            Expr   **args;
+            size_t   count;
+            Expr    *redirect;    /* target — NULL = stdout               */
+            uint8_t  redirect_op; /* 0=none 1=>file 2=>>append 3=|pipe    */
         } print;
 
-        /* STMT_PRINTF — same shape; first arg is the format string */
+        /* STMT_PRINTF */
         struct {
-            Expr  **args;
-            size_t  count;
-            Expr   *redirect;
-            uint8_t redirect_op;
+            Expr   **args;
+            size_t   count;
+            Expr    *redirect;
+            uint8_t  redirect_op;
         } printf_stmt;
 
         /* STMT_OUTFMT */
         struct {
-            uint8_t mode;   /* XF_OUTFMT_* constant             */
+            uint8_t mode;   /* XF_OUTFMT_* constant              */
         } outfmt;
 
         /* STMT_IMPORT */
@@ -427,14 +462,14 @@ struct Stmt {
             xf_Str  *pattern;
             xf_Str  *replacement;
             uint32_t flags;
-            Expr    *target;   /* NULL = $0                     */
+            Expr    *target;   /* NULL = $0                      */
         } subst;
 
         /* STMT_TRANS */
         struct {
             xf_Str *from;
             xf_Str *to;
-            Expr   *target;    /* NULL = $0                     */
+            Expr   *target;    /* NULL = $0                      */
         } trans;
 
     } as;
@@ -464,17 +499,17 @@ typedef struct {
 
         /* TOP_RULE */
         struct {
-            Expr *pattern;    /* NULL = match every record      */
+            Expr *pattern;    /* NULL = match every record       */
             Stmt *body;
         } rule;
 
-        /* TOP_FN — mirrors STMT_FN_DECL at top level */
+        /* TOP_FN */
         struct {
-            uint8_t  return_type;
-            xf_Str  *name;
-            Param   *params;
-            size_t   param_count;
-            Stmt    *body;
+            uint8_t return_type;
+            xf_Str *name;
+            Param  *params;
+            size_t  param_count;
+            Stmt   *body;
         } fn;
 
         /* TOP_STMT */
@@ -490,10 +525,10 @@ typedef struct {
  * ============================================================ */
 
 typedef struct {
-    TopLevel **items;
-    size_t     count;
-    size_t     capacity;
-    const char *source;   /* filename or "<inline>" or "<repl>" */
+    TopLevel   **items;
+    size_t       count;
+    size_t       capacity;
+    const char  *source;   /* filename or "<inline>" or "<repl>" */
 } Program;
 
 
@@ -509,9 +544,6 @@ Expr *ast_tuple_lit(Expr **items, size_t count, Loc loc);
 Expr *ast_num(double value, Loc loc);
 Expr *ast_str(xf_Str *value, Loc loc);
 Expr *ast_regex(xf_Str *pattern, uint32_t flags, Loc loc);
-Expr *ast_arr_lit(Expr **items, size_t count, Loc loc);
-Expr *ast_map_lit(Expr **keys, Expr **vals, size_t count, Loc loc);
-Expr *ast_set_lit(Expr **items, size_t count, Loc loc);
 Expr *ast_ident(xf_Str *name, Loc loc);
 Expr *ast_field(int index, Loc loc);
 Expr *ast_ivar(TokenKind var, Loc loc);
@@ -524,6 +556,7 @@ Expr *ast_assign(AssignOp op, Expr *target, Expr *value, Loc loc);
 Expr *ast_walrus(xf_Str *name, uint8_t type, Expr *value, Loc loc);
 Expr *ast_call(Expr *callee, Expr **args, size_t argc, Loc loc);
 Expr *ast_subscript(Expr *obj, Expr *key, Loc loc);
+
 /* output format modes for STMT_OUTFMT / RecordCtx.out_mode */
 #define XF_OUTFMT_TEXT  0
 #define XF_OUTFMT_CSV   1
@@ -539,6 +572,12 @@ Expr *ast_pipe_fn(Expr *left, Expr *right, Loc loc);
 Expr *ast_spread(Expr *operand, Loc loc);
 Expr *ast_fn(uint8_t ret, Param *params, size_t pc, Stmt *body, Loc loc);
 
+/* loop binding constructors */
+LoopBind *ast_loop_bind_name(xf_Str *name, Loc loc);
+LoopBind *ast_loop_bind_tuple(LoopBind **items, size_t count, Loc loc);
+void      ast_loop_bind_free(LoopBind *b);
+void      ast_loop_bind_print(const LoopBind *b, int indent);
+
 /* statement constructors */
 Stmt *ast_block(Stmt **stmts, size_t count, Loc loc);
 Stmt *ast_expr_stmt(Expr *expr, Loc loc);
@@ -547,9 +586,12 @@ Stmt *ast_fn_decl(uint8_t ret, xf_Str *name,
                   Param *params, size_t pc, Stmt *body, Loc loc);
 Stmt *ast_if(Branch *branches, size_t count, Stmt *els, Loc loc);
 Stmt *ast_while(Expr *cond, Stmt *body, Loc loc);
-Stmt *ast_for(xf_Str *iter, Expr *collection, Stmt *body, Loc loc);
+Stmt *ast_for(LoopBind *iter_key, LoopBind *iter_val,
+              Expr *collection, Stmt *body, Loc loc);
 Stmt *ast_while_short(Expr *cond, Stmt *body, Loc loc);
-Stmt *ast_for_short(Expr *collection, xf_Str *iter, Stmt *body, Loc loc);
+Stmt *ast_for_short(Expr *collection,
+                    LoopBind *iter_key, LoopBind *iter_val,
+                    Stmt *body, Loc loc);
 Stmt *ast_return(Expr *value, Loc loc);
 Stmt *ast_next(Loc loc);
 Stmt *ast_exit(Loc loc);
@@ -573,18 +615,18 @@ TopLevel *ast_top_fn(uint8_t ret, xf_Str *name,
 TopLevel *ast_top_stmt(Stmt *stmt, Loc loc);
 
 /* program */
-Program  *ast_program_new(const char *source);
-void      ast_program_push(Program *p, TopLevel *item);
-void      ast_program_free(Program *p);
+Program *ast_program_new(const char *source);
+void     ast_program_push(Program *p, TopLevel *item);
+void     ast_program_free(Program *p);
 
 /* recursive free */
-void      ast_expr_free(Expr *e);
-void      ast_stmt_free(Stmt *s);
-void      ast_top_free(TopLevel *t);
+void     ast_expr_free(Expr *e);
+void     ast_stmt_free(Stmt *s);
+void     ast_top_free(TopLevel *t);
 
 /* debug print (indented) */
-void      ast_expr_print(const Expr *e, int indent);
-void      ast_stmt_print(const Stmt *s, int indent);
-void      ast_program_print(const Program *p);
+void     ast_expr_print(const Expr *e, int indent);
+void     ast_stmt_print(const Stmt *s, int indent);
+void     ast_program_print(const Program *p);
 
 #endif /* XF_AST_H */

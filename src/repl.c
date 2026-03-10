@@ -35,7 +35,6 @@ static bool enter_raw_mode(void) {
 
     struct termios raw = orig_termios;
     raw.c_iflag &= (unsigned)~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-    raw.c_oflag &= (unsigned)~(OPOST);
     raw.c_cflag |= (CS8);
     raw.c_lflag &= (unsigned)~(ECHO | ICANON | IEXTEN | ISIG);
     raw.c_cc[VMIN]  = 1;

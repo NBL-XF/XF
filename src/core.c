@@ -2700,6 +2700,11 @@ static void *cp_thread_fn(void *arg) {
         /* callback not registered yet — fall back to NAV */
         ctx->result = xf_val_nav(XF_TYPE_FN);
     }
+
+    /* xf_val_ok_arr retained chunk_val — release our local ref now that
+     * the fn call is done.  cp_run will release ctx->chunk separately. */
+    xf_value_release(chunk_val);
+
     ctx->done = true;
     return NULL;
 }
@@ -2826,11 +2831,11 @@ static xf_Value cp_assign(xf_Value *args, size_t argc) {
         }
 
 
-xf_Value out_val = xf_val_ok_map(out_row);
-xf_map_release(out_row);
+        xf_Value out_val = xf_val_ok_map(out_row);
+        xf_map_release(out_row);  /* drop local ref; xf_val_ok_map already retained */
 
         xf_arr_push(out, out_val);
-        xf_map_release(out_row);
+        /* do NOT release out_row a second time — already dropped above */
     }
 
     xf_Value v = xf_val_ok_arr(out);

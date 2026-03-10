@@ -19,14 +19,26 @@ static Token *peek_at(Parser *p, size_t offset) {
     return &p->lex->tokens[idx];
 }
 static bool looks_like_shorthand_for(Parser *p) {
-    return check(p, TK_IDENT) &&
-           peek_at(p, 1)->kind == TK_LBRACKET &&
-           peek_at(p, 2)->kind == TK_IDENT &&
-           peek_at(p, 3)->kind == TK_RBRACKET &&
-           peek_at(p, 4)->kind == TK_GT;
+    if (!check(p, TK_IDENT)) return false;
+    if (peek_at(p, 1)->kind != TK_LBRACKET) return false;
+
+    int depth = 0;
+    size_t i = 1;
+
+    for (;;) {
+        TokenKind k = peek_at(p, i)->kind;
+        if (k == TK_EOF) return false;
+
+        if (k == TK_LBRACKET || k == TK_LPAREN) depth++;
+        else if (k == TK_RBRACKET || k == TK_RPAREN) depth--;
+
+        if (k == TK_RBRACKET && depth == 0) {
+            return peek_at(p, i + 1)->kind == TK_GT;
+        }
+
+        i++;
+    }
 }
-
-
 static Token *advance(Parser *p) {
     Token *t = cur(p);
     if (t->kind != TK_EOF) p->pos++;
@@ -91,7 +103,56 @@ static xf_Str *tok_to_str(Token *t) {
         return xf_str_new(t->val.str.data, t->val.str.len);
     return xf_str_new(t->lexeme, t->lexeme_len);
 }
+static bool loop_bind_starts(Parser *p) {
+    return check(p, TK_IDENT) || check(p, TK_LPAREN);
+}
 
+static LoopBind *parse_loop_bind(Parser *p) {
+    Loc loc = cur(p)->loc;
+
+    if (check(p, TK_IDENT)) {
+        Token *t = advance(p);
+        xf_Str *name = tok_to_str(t);
+        LoopBind *b = ast_loop_bind_name(name, loc);
+        xf_str_release(name);
+        return b;
+    }
+
+    if (match_tok(p, TK_LPAREN)) {
+        size_t cap = 4, count = 0;
+        LoopBind **items = malloc(sizeof(*items) * cap);
+
+        if (!loop_bind_starts(p)) {
+            parser_error(p, "expected loop binding");
+            free(items);
+            return NULL;
+        }
+
+        for (;;) {
+            if (count == cap) {
+                cap *= 2;
+                items = realloc(items, sizeof(*items) * cap);
+            }
+
+            LoopBind *item = parse_loop_bind(p);
+            if (!item) {
+                for (size_t i = 0; i < count; i++) ast_loop_bind_free(items[i]);
+                free(items);
+                return NULL;
+            }
+            items[count++] = item;
+
+            if (match_tok(p, TK_COMMA)) continue;
+            break;
+        }
+
+        expect(p, TK_RPAREN, "expected ')' after loop binding");
+        return ast_loop_bind_tuple(items, count, loc);
+    }
+
+    parser_error(p, "expected loop binding");
+    return NULL;
+}
 /* true if current token is a type keyword */
 static bool is_type_kw(Parser *p) {
     switch (cur_kind(p)) {
@@ -701,20 +762,37 @@ Stmt *parse_for(Parser *p) {
     Loc loc = cur(p)->loc;
     advance(p);
     expect(p, TK_LPAREN, "expected '(' after 'for'");
-    Token *iter_tok = expect(p, TK_IDENT, "expected iterator name");
-    xf_Str *iter = tok_to_str(iter_tok);
+
+    LoopBind *iter_key = NULL;
+    LoopBind *iter_val = NULL;
+
+    if (check(p, TK_LPAREN)) {
+        /* either:
+         *   for ((x,y) in xs)
+         *   for ((i,x) in xs)
+         *   for ((i,(x,y)) in xs)
+         */
+        LoopBind *first = parse_loop_bind(p);
+
+        if (match_tok(p, TK_COMMA)) {
+            LoopBind *second = parse_loop_bind(p);
+            iter_key = first;
+            iter_val = second;
+        } else {
+            iter_val = first;
+        }
+    } else {
+        iter_val = parse_loop_bind(p);
+    }
+
     expect(p, TK_KW_IN, "expected 'in' after iterator");
     Expr *collection = parse_expr(p);
     expect(p, TK_RPAREN, "expected ')' after collection");
-    sym_push(p->syms, SCOPE_LOOP);
-    sym_declare(p->syms, iter, SYM_VAR, XF_TYPE_VOID, loc);
-    Stmt *body = parse_block(p);
-    sym_pop(p->syms);
-    Stmt *s = ast_for(iter, collection, body, loc);
-    xf_str_release(iter);
-    return s;
-}
 
+    Stmt *body = parse_block(p);
+
+    return ast_for(iter_key, iter_val, collection, body, loc);
+}
 /* return expr? ; */
 Stmt *parse_return(Parser *p) {
     Loc loc = cur(p)->loc;
@@ -986,37 +1064,36 @@ Stmt *parse_stmt(Parser *p) {
     /* shorthand for: collection[iter] > body
      * Must be detected before parse_expr(), otherwise '>' is parsed
      * as the normal comparison operator. */
-    if (looks_like_shorthand_for(p)) {
-        Expr *obj = parse_postfix(p);
+if (looks_like_shorthand_for(p)) {
+    Token *name_tok = expect(p, TK_IDENT, "expected collection name");
+    xf_Str *name = tok_to_str(name_tok);
+    Expr *collection = ast_ident(name, loc);
+    xf_str_release(name);
 
-        if (obj->kind == EXPR_SUBSCRIPT &&
-            obj->as.subscript.key->kind == EXPR_IDENT &&
-            check(p, TK_GT)) {
+    expect(p, TK_LBRACKET, "expected '[' in shorthand for");
 
-            advance(p);   /* consume > */
+    LoopBind *iter_key = NULL;
+    LoopBind *iter_val = NULL;
 
-            xf_Str *iter = xf_str_retain(obj->as.subscript.key->as.ident.name);
-            Expr *collection = obj->as.subscript.obj;
-            obj->as.subscript.obj = NULL;
-            ast_expr_free(obj);
-
-            sym_push(p->syms, SCOPE_LOOP);
-            sym_declare(p->syms, iter, SYM_VAR, XF_TYPE_VOID, loc);
-            Stmt *body = check(p, TK_LBRACE) ? parse_block(p) : parse_stmt(p);
-            sym_pop(p->syms);
-
-            Stmt *s = ast_for_short(collection, iter, body, loc);
-            xf_str_release(iter);
-            match_tok(p, TK_SEMICOLON);
-            return s;
-        }
-
-        ast_expr_free(obj);
-        parser_error(p, "invalid shorthand for");
-        return NULL;
+    LoopBind *first = parse_loop_bind(p);
+    if (match_tok(p, TK_COMMA)) {
+        LoopBind *second = parse_loop_bind(p);
+        iter_key = first;
+        iter_val = second;
+    } else {
+        iter_val = first;
     }
 
-    /* shorthand while / normal expr stmt */
+    expect(p, TK_RBRACKET, "expected ']' after iterator binding");
+    expect(p, TK_GT, "expected '>' after shorthand iterator");
+
+    Stmt *body = check(p, TK_LBRACE) ? parse_block(p) : parse_stmt(p);
+
+    Stmt *s = ast_for_short(collection, iter_key, iter_val, body, loc);
+    match_tok(p, TK_SEMICOLON);
+    return s;
+}
+        /* shorthand while / normal expr stmt */
     Expr *expr = parse_expr(p);
 
     if (match_tok(p, TK_DIAMOND)) {
@@ -1103,36 +1180,36 @@ TopLevel *parse_rule(Parser *p) {
      *   expr[k] > s   → shorthand for    (TOP_STMT)
      *   expr ;        → bare expression  (TOP_STMT)
      * Parse the expression first, then dispatch on what follows. */
-      if (looks_like_shorthand_for(p)) {
-        Expr *obj = parse_postfix(p);
+if (looks_like_shorthand_for(p)) {
+    Token *name_tok = expect(p, TK_IDENT, "expected collection name");
+    xf_Str *name = tok_to_str(name_tok);
+    Expr *collection = ast_ident(name, loc);
+    xf_str_release(name);
 
-        if (obj->kind == EXPR_SUBSCRIPT &&
-            obj->as.subscript.key->kind == EXPR_IDENT &&
-            check(p, TK_GT)) {
+    expect(p, TK_LBRACKET, "expected '[' in shorthand for");
 
-            advance(p);   /* consume > */
+    LoopBind *iter_key = NULL;
+    LoopBind *iter_val = NULL;
 
-            xf_Str *iter = xf_str_retain(obj->as.subscript.key->as.ident.name);
-            Expr *collection = obj->as.subscript.obj;
-            obj->as.subscript.obj = NULL;
-            ast_expr_free(obj);
-
-            sym_push(p->syms, SCOPE_LOOP);
-            sym_declare(p->syms, iter, SYM_VAR, XF_TYPE_VOID, loc);
-            Stmt *body = check(p, TK_LBRACE) ? parse_block(p) : parse_stmt(p);
-            sym_pop(p->syms);
-
-            Stmt *s = ast_for_short(collection, iter, body, loc);
-            xf_str_release(iter);
-            match_tok(p, TK_SEMICOLON);
-            return ast_top_stmt(s, loc);
-        }
-
-        ast_expr_free(obj);
-        parser_error(p, "invalid shorthand for");
-        return NULL;
+    LoopBind *first = parse_loop_bind(p);
+    if (match_tok(p, TK_COMMA)) {
+        LoopBind *second = parse_loop_bind(p);
+        iter_key = first;
+        iter_val = second;
+    } else {
+        iter_val = first;
     }
-      Expr *pattern = parse_expr(p);
+
+    expect(p, TK_RBRACKET, "expected ']' after iterator binding");
+    expect(p, TK_GT, "expected '>' after shorthand iterator");
+
+    Stmt *body = check(p, TK_LBRACE) ? parse_block(p) : parse_stmt(p);
+
+    Stmt *s = ast_for_short(collection, iter_key, iter_val, body, loc);
+    match_tok(p, TK_SEMICOLON);
+    return ast_top_stmt(s, loc);
+}
+                        Expr *pattern = parse_expr(p);
 
     /* pattern { body } — true pattern-action rule */
     if (check(p, TK_LBRACE)) {
@@ -1149,27 +1226,6 @@ TopLevel *parse_rule(Parser *p) {
         return ast_top_stmt(ast_while_short(pattern, body, loc), loc);
     }
 
-    /* collection[iter] > body — shorthand for */
-    if (pattern->kind == EXPR_SUBSCRIPT && check(p, TK_GT) &&
-        pattern->as.subscript.key->kind == EXPR_IDENT) {
-        advance(p);   /* consume > */
-        xf_Str *iter = xf_str_retain(pattern->as.subscript.key->as.ident.name);
-        Expr *obj = pattern->as.subscript.obj;
-        pattern->as.subscript.obj = NULL;
-        ast_expr_free(pattern);
-
-        sym_push(p->syms, SCOPE_LOOP);
-        sym_declare(p->syms, iter, SYM_VAR, XF_TYPE_VOID, loc);
-        Stmt *body = check(p, TK_LBRACE) ? parse_block(p) : parse_stmt(p);
-        sym_pop(p->syms);
-
-        Stmt *s = ast_for_short(obj, iter, body, loc);
-        xf_str_release(iter);
-        match_tok(p, TK_SEMICOLON);
-        return ast_top_stmt(s, loc);
-    }
-
-    /* bare expression statement */
     match_tok(p, TK_SEMICOLON);
     return ast_top_stmt(ast_expr_stmt(pattern, loc), loc);
 }
