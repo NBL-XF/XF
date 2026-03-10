@@ -604,6 +604,9 @@ printf(
             if (result.state != XF_STATE_NULL && result.state != XF_STATE_VOID) {
                 xf_value_repl_print(result);
             }
+            else{
+                printf("\n\n");
+            }
             fflush(stdout);
 
             /* reset interp transient flags */

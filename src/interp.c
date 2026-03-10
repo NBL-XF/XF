@@ -316,6 +316,64 @@ static xf_Value interp_call_core(Interp *it,
 
     return fn->native_v(args, argc);
 }
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdbool.h>
+
+static char *xf_read_line_from_file(const char *path, int target_line) {
+    if (!path || target_line <= 0) return NULL;
+    if (strcmp(path, "<repl>") == 0) return NULL;
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) return NULL;
+
+    char buf[4096];
+    int line_no = 0;
+    char *out = NULL;
+
+    while (fgets(buf, sizeof(buf), fp)) {
+        line_no++;
+        if (line_no == target_line) {
+            size_t len = strlen(buf);
+
+            while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+                buf[--len] = '\0';
+            }
+
+            out = malloc(len + 1);
+            if (out) memcpy(out, buf, len + 1);
+            break;
+        }
+    }
+
+    fclose(fp);
+    return out;
+}
+
+static void xf_print_caret_line(const char *src_line, int col) {
+    fprintf(stdout, "   | ");
+
+    if (!src_line || col <= 1) {
+        fprintf(stdout, "^\n");
+        return;
+    }
+
+    int visual = 0;
+    for (int i = 0; src_line[i] && i < col - 1; i++) {
+        if (src_line[i] == '\t') {
+            fputc('\t', stdout);
+        } else {
+            fputc(' ', stdout);
+        }
+        visual++;
+    }
+
+    (void)visual;
+    fprintf(stdout, "^\n");
+}
+
 void interp_error(Interp *it, Loc loc, const char *fmt, ...) {
     it->had_error = true;
 
@@ -333,7 +391,15 @@ void interp_error(Interp *it, Loc loc, const char *fmt, ...) {
     fprintf(stdout, "  %s\n", msg);
 
     if (loc.source) {
-        fprintf(stdout, "  at %s:%d:%d\n", loc.source, loc.line, loc.col);
+        fprintf(stdout, "  --> %s:%d:%d\n", loc.source, loc.line, loc.col);
+
+        char *src_line = xf_read_line_from_file(loc.source, loc.line);
+        if (src_line) {
+            fprintf(stdout, "   |\n");
+            fprintf(stdout, "%2d | %s\n", loc.line, src_line);
+            xf_print_caret_line(src_line, loc.col);
+            free(src_line);
+        }
     }
 
     fprintf(stdout, "──────────────────────────────────────────\n");
@@ -426,6 +492,7 @@ case XF_TYPE_TUPLE: {
             xf_value_release(sv);
             return;
         }
+        printf("\n\n\n");
     }
 }
 void interp_type_err(Interp *it, Loc loc,

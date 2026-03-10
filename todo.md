@@ -6,6 +6,267 @@ Goal: **eliminate correctness bugs before v1**
 
 ### Ownership / reference audit
 
+Function call argument handling (EXPR_CALL)
+
+args[] values are not released on many return paths
+
+Interpreted-function parameter binding uses:
+
+ps->value = av
+
+Should be:
+
+ps->value = xf_value_retain(av)
+
+Problems caused:
+
+argument values leak
+
+borrowed values may be stored in scope
+
+Fix
+
+release args[] before returning
+
+retain values when binding parameters
+
+Return value lifetime (STMT_RETURN)
+
+Problem pattern:
+
+it->return_val = interp_eval_expr(...)
+ret = it->return_val
+scope_pop()
+return ret
+
+Risk:
+
+scope_pop() may release the value being returned.
+
+Fix
+
+xf_Value ret = xf_value_retain(it->return_val)
+scope_pop()
+return ret
+Pipe function call (EXPR_PIPE_FN)
+
+Problems:
+
+left argument passed into function without retain
+
+obj, callee, left not released on many exits
+
+Fix
+
+treat left exactly like function call arguments
+
+ensure cleanup releases:
+
+left
+
+obj
+
+callee
+
+Major Memory Leaks
+Binary operations (EXPR_BINARY)
+
+Values created:
+
+xf_Value a = interp_eval_expr(...)
+xf_Value b = interp_eval_expr(...)
+
+Most operator branches:
+
+never release a or b
+
+Fix pattern
+
+result = op(a,b)
+xf_value_release(a)
+xf_value_release(b)
+return result
+Unary operations (EXPR_UNARY)
+
+Temporary values created via:
+
+xf_coerce_num
+
+xf_coerce_str
+
+Often returned without releasing the original value.
+
+Fix
+
+release original temporary values.
+
+Assignment (EXPR_ASSIGN)
+
+Problems:
+
+cur = lvalue_load(...)
+rhs = interp_eval_expr(...)
+rhs = apply_assign_op(cur, rhs)
+
+Leaks:
+
+cur never released
+
+original rhs may be lost when replaced
+
+Fix
+
+release cur
+
+release old rhs when overwritten
+
+Map / Set Literal Construction
+EXPR_MAP_LIT
+
+Current pattern:
+
+ks = xf_coerce_str(...)
+xf_str_release(ks.data.str)
+
+Problems:
+
+inconsistent with rest of interpreter
+
+bypasses xf_value_release
+
+Fix
+
+xf_value_release(ks)
+
+Also ensure release of:
+
+kv
+
+vv
+
+EXPR_SET_LIT
+
+Same issue as map literal.
+
+Ensure release of:
+
+v
+
+coercion temporaries
+
+Smaller Expression Leaks
+
+These nodes evaluate values but never release them:
+
+EXPR_LEN
+
+EXPR_CAST
+
+EXPR_STATE
+
+EXPR_TYPE
+
+EXPR_MEMBER
+
+Typical pattern:
+
+v = interp_eval_expr(...)
+result = something(v)
+return result
+
+Fix
+
+result = something(v)
+xf_value_release(v)
+return result
+Things That Look Correct
+
+These areas appear well-managed:
+
+Loop binding
+
+values retained when stored in loop variables
+
+Worker thread parameter binding
+
+uses xf_value_retain(av)
+
+Tuple construction
+
+partially constructed tuples cleaned up on failure
+
+Iterator cleanup
+
+temporary values released on:
+
+break
+
+continue
+
+return
+
+error
+
+These sections demonstrate the correct ownership model.
+
+Global Rule To Adopt
+
+Treat every result of interp_eval_expr() as owned.
+
+If storing in a symbol or container
+xf_value_retain(v)
+If returning past scope cleanup
+xf_value_retain(v)
+If value is temporary
+xf_value_release(v)
+Structural Refactor Recommendation
+
+Use cleanup blocks for hot paths.
+
+Example pattern:
+
+xf_Value a = interp_eval_expr(...)
+xf_Value b = interp_eval_expr(...)
+xf_Value result = NAV
+
+switch(op) {
+    case ADD:
+        result = val_add(a,b)
+        break
+}
+
+cleanup:
+xf_value_release(a)
+xf_value_release(b)
+return result
+
+This prevents:
+
+forgotten releases
+
+inconsistent return paths
+
+double frees
+
+Fix Priority Order
+
+EXPR_CALL
+
+STMT_RETURN
+
+EXPR_PIPE_FN
+
+EXPR_BINARY
+
+EXPR_ASSIGN
+
+EXPR_MAP_LIT
+
+EXPR_SET_LIT
+
+small expression nodes (LEN, CAST, etc.)
+
+
 Review hot paths:
 
 * `interp_eval_expr`
@@ -265,17 +526,3 @@ Requirements:
 * interpreter robust enough for production use
 
 ---
-
-# Post-v1 roadmap
-
-## v1.1.0
-
-* parallel aggregation in `core.ds`
-* richer dataset utilities
-* improved module ergonomics
-
-## v1.2.0
-
-* interpreter-safe threaded XF execution
-* deeper concurrency support
-* runtime optimization work

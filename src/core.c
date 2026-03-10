@@ -12,14 +12,152 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+#include <pthread.h>
+
+#define NEED(n) \
+    do { if (argc < (n)) return xf_val_nav(XF_TYPE_VOID); } while(0)
 
 /* ============================================================
  * Helpers
  * ============================================================ */
+/* ── file handle table ──────────────────────────────────────── */
+#define COS_MAX_HANDLES 64
+static bool arg_num(xf_Value *args, size_t argc, size_t i, double *out);
+static xf_Value propagate(xf_Value *args, size_t argc);
+static bool arg_str(xf_Value *args, size_t argc, size_t i,
+                    const char **out, size_t *outlen);
+typedef struct {
+    FILE  *fp;
+    bool   open;
+    size_t lines_read;  /* running total — used for offset tracking */
+} CosHandle;
 
+static CosHandle       cos_handles[COS_MAX_HANDLES];
+static pthread_mutex_t cos_handle_mu  = PTHREAD_MUTEX_INITIALIZER;
+static bool            cos_handles_inited = false;
+
+static void cos_init_handles(void) {
+    if (cos_handles_inited) return;
+    memset(cos_handles, 0, sizeof(cos_handles));
+    cos_handles_inited = true;
+}
+
+/* open(path) → num handle, or NAV on error */
+static xf_Value csy_open(xf_Value *args, size_t argc) {
+    NEED(1);
+    const char *path; size_t plen;
+    if (!arg_str(args, argc, 0, &path, &plen)) return propagate(args, argc);
+
+    pthread_mutex_lock(&cos_handle_mu);
+    cos_init_handles();
+    int slot = -1;
+    for (int i = 0; i < COS_MAX_HANDLES; i++) {
+        if (!cos_handles[i].open) { slot = i; break; }
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&cos_handle_mu);
+        return xf_val_nav(XF_TYPE_NUM);  /* too many open handles */
+    }
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        pthread_mutex_unlock(&cos_handle_mu);
+        return xf_val_nav(XF_TYPE_NUM);
+    }
+    cos_handles[slot].fp         = fp;
+    cos_handles[slot].open       = true;
+    cos_handles[slot].lines_read = 0;
+    pthread_mutex_unlock(&cos_handle_mu);
+    return xf_val_ok_num((double)slot);
+}
+
+/* chunk(handle, n) → arr of n str lines; empty arr = EOF */
+static xf_Value csy_chunk(xf_Value *args, size_t argc) {
+    NEED(2);
+    double dh, dn;
+    if (!arg_num(args, argc, 0, &dh)) return propagate(args, argc);
+    if (!arg_num(args, argc, 1, &dn)) return propagate(args, argc);
+
+    int slot = (int)dh;
+    if (slot < 0 || slot >= COS_MAX_HANDLES) return xf_val_nav(XF_TYPE_ARR);
+
+    pthread_mutex_lock(&cos_handle_mu);
+    if (!cos_handles[slot].open || !cos_handles[slot].fp) {
+        pthread_mutex_unlock(&cos_handle_mu);
+        xf_arr_t *empty = xf_arr_new();
+        xf_Value v = xf_val_ok_arr(empty);
+        xf_arr_release(empty);
+        return v;
+    }
+    FILE *fp = cos_handles[slot].fp;
+    pthread_mutex_unlock(&cos_handle_mu);
+
+    size_t n   = (size_t)(dn < 1 ? 1 : dn);
+    size_t cap = 65536;
+    char  *line_buf = malloc(cap);
+    xf_arr_t *out = xf_arr_new();
+    size_t count = 0;
+
+    while (count < n) {
+        /* dynamic line read — handles arbitrarily long lines */
+        size_t pos = 0;
+        int c;
+        bool got = false;
+        while ((c = fgetc(fp)) != EOF) {
+            got = true;
+            if (pos + 2 >= cap) { cap *= 2; line_buf = realloc(line_buf, cap); }
+            if (c == '\n') break;
+            if (c != '\r') line_buf[pos++] = (char)c;
+        }
+        if (!got) break;
+        line_buf[pos] = '\0';
+        xf_Str *ls = xf_str_new(line_buf, pos);
+        xf_arr_push(out, xf_val_ok_str(ls));
+        xf_str_release(ls);
+        count++;
+    }
+
+    free(line_buf);
+
+    /* update running total */
+    pthread_mutex_lock(&cos_handle_mu);
+    cos_handles[slot].lines_read += count;
+    pthread_mutex_unlock(&cos_handle_mu);
+
+    xf_Value v = xf_val_ok_arr(out);
+    xf_arr_release(out);
+    return v;
+}
+
+/* tell(handle) → num lines read so far */
+static xf_Value csy_tell(xf_Value *args, size_t argc) {
+    NEED(1);
+    double dh;
+    if (!arg_num(args, argc, 0, &dh)) return propagate(args, argc);
+    int slot = (int)dh;
+    if (slot < 0 || slot >= COS_MAX_HANDLES) return xf_val_nav(XF_TYPE_NUM);
+    pthread_mutex_lock(&cos_handle_mu);
+    double nr = cos_handles[slot].open ? (double)cos_handles[slot].lines_read : -1.0;
+    pthread_mutex_unlock(&cos_handle_mu);
+    return xf_val_ok_num(nr);
+}
+
+/* close(handle) → void */
+static xf_Value csy_close(xf_Value *args, size_t argc) {
+    NEED(1);
+    double dh;
+    if (!arg_num(args, argc, 0, &dh)) return propagate(args, argc);
+    int slot = (int)dh;
+    if (slot < 0 || slot >= COS_MAX_HANDLES) return xf_val_null();
+    pthread_mutex_lock(&cos_handle_mu);
+    if (cos_handles[slot].open && cos_handles[slot].fp) {
+        fclose(cos_handles[slot].fp);
+        cos_handles[slot].fp   = NULL;
+        cos_handles[slot].open = false;
+    }
+    pthread_mutex_unlock(&cos_handle_mu);
+    return xf_val_null();
+}
 /* require at least n args; return NAV if fewer given */
-#define NEED(n) \
-    do { if (argc < (n)) return xf_val_nav(XF_TYPE_VOID); } while(0)
 static xf_module_t *build_ds(void);
 static xf_module_t *build_edit(void);
 static xf_module_t *build_format(void);
@@ -1260,6 +1398,10 @@ static xf_module_t *build_os(void) {
     FN("env",       XF_TYPE_STR,  csy_env);
     FN("read",      XF_TYPE_STR,  csy_read);
     FN("write",     XF_TYPE_NUM,  csy_write);
+    FN("open",  XF_TYPE_NUM,  csy_open);
+    FN("chunk", XF_TYPE_ARR,  csy_chunk);
+    FN("tell",  XF_TYPE_NUM,  csy_tell);
+    FN("close", XF_TYPE_VOID, csy_close);
     FN("append",    XF_TYPE_NUM,  csy_append);
     FN("lines",     XF_TYPE_ARR,  csy_lines);
     FN("run",       XF_TYPE_STR,  csy_run);
@@ -2673,7 +2815,6 @@ static xf_module_t *build_format(void) {
  *   back to sequential on the calling thread.
  * ============================================================ */
 
-#include <pthread.h>
 
 /* ── process worker thread context ──────────────────────────── */
 
@@ -2757,92 +2898,115 @@ static xf_Value cp_split(xf_Value *args, size_t argc) {
     xf_Value v = xf_val_ok_arr(out); xf_arr_release(out);
     return v;
 }
-
-/* ── cp_assign(chunk, fn) → arr of maps ─────────────────────────
+/* ── cp_assign(chunk, fn, offset) → map { colName: { val: [global_ids] } }
  *
- * Applies fn(row) to every row in chunk and returns a plain
- * arr-of-maps dataset — compatible with ds.flatten, ds.sort, etc.
+ * Builds a semi-relational inverted index from an arr-of-maps chunk.
  *
- * Merge rules per row:
- *   fn returns map  → original row merged with fn output
- *                     (fn keys overwrite original keys)
- *   fn returns arr  → row stored as-is, arr appended under "_result"
- *   fn returns scalar → row stored with scalar under "_result"
- *   fn omitted/null → row stored as-is (identity transform)
+ * For each row at position i:
+ *   1. global_id = offset + i
+ *   2. Apply fn(row) if provided → use transformed row for indexing
+ *   3. For each col/value in the (transformed) row:
+ *        index[col][coerced_val_str] += global_id
  *
- * fn may be native or XF-language (XF fns require core_set_fn_caller
- * to have been called by the interpreter at startup).
+ * Result structure:
+ *   {
+ *     "name": { "alice": [0, 2], "bob": [1] },
+ *     "age":  { "30":   [0],     "25": [1, 2] }
+ *   }
  */
 static xf_Value cp_assign(xf_Value *args, size_t argc) {
     NEED(1);
-    if (!args[0].data.arr || args[0].state != XF_STATE_OK ||
-        args[0].type != XF_TYPE_ARR) return xf_val_nav(XF_TYPE_ARR);
+    if (args[0].state != XF_STATE_OK || args[0].type != XF_TYPE_ARR || !args[0].data.arr)
+        return xf_val_nav(XF_TYPE_MAP);
     xf_arr_t *chunk = args[0].data.arr;
 
-    /* resolve fn — native or XF-language, or NULL */
-    xf_fn_t *fn = NULL;
-    bool fn_is_xf = false;
+    /* resolve fn (optional) */
+    xf_fn_t *fn      = NULL;
+    bool     fn_is_xf = false;
     if (argc >= 2 && args[1].state == XF_STATE_OK &&
         args[1].type == XF_TYPE_FN && args[1].data.fn) {
-        fn = args[1].data.fn;
+        fn       = args[1].data.fn;
         fn_is_xf = !fn->is_native;
     }
 
-    xf_arr_t *out = xf_arr_new();
+    /* global offset for row IDs (optional, default 0) */
+    double doffset = 0.0;
+    if (argc >= 3) arg_num(args, argc, 2, &doffset);
+    size_t base = (size_t)(doffset < 0.0 ? 0.0 : doffset);
+
+    /* top-level index: col_name → col_map */
+    xf_map_t *index = xf_map_new();
 
     for (size_t r = 0; r < chunk->len; r++) {
-        xf_Value row_in = chunk->items[r];
+        xf_Value row_in  = chunk->items[r];
+        double   gid     = (double)(base + r);
 
-        /* apply fn */
-        xf_Value row_out = xf_val_nav(XF_TYPE_VOID);
+        /* apply fn to get the row that will actually be indexed */
+        xf_Value fn_out  = xf_val_nav(XF_TYPE_VOID);
+        xf_Value row_v   = row_in;
         if (fn) {
             if (fn->is_native && fn->native_v) {
-                row_out = fn->native_v(&row_in, 1);
+                fn_out = fn->native_v(&row_in, 1);
             } else if (fn_is_xf && g_fn_caller && g_fn_caller_vm) {
-                row_out = g_fn_caller(g_fn_caller_vm, g_fn_caller_syms, fn, &row_in, 1);
+                fn_out = g_fn_caller(g_fn_caller_vm, g_fn_caller_syms,
+                                     fn, &row_in, 1);
             }
+            if (fn_out.state == XF_STATE_OK && fn_out.type == XF_TYPE_MAP)
+                row_v = fn_out;
         }
 
-        /* build output row map starting from original row */
-        xf_map_t *out_row = xf_map_new();
-
-        /* copy original row fields first */
-        if (row_in.state == XF_STATE_OK && row_in.type == XF_TYPE_MAP && row_in.data.map) {
-            xf_map_t *orig = row_in.data.map;
-            for (size_t k = 0; k < orig->order_len; k++)
-                xf_map_set(out_row, orig->order[k],
-                           xf_value_retain(xf_map_get(orig, orig->order[k])));
+        if (row_v.state != XF_STATE_OK ||
+            row_v.type  != XF_TYPE_MAP || !row_v.data.map) {
+            xf_value_release(fn_out);
+            continue;
         }
 
-        if (!fn || row_out.state != XF_STATE_OK) {
-            /* no fn / fn errored: output is original row */
-        } else if (row_out.type == XF_TYPE_MAP && row_out.data.map) {
-            /* fn returned map: overlay its keys (overwrite originals) */
-            xf_map_t *rm = row_out.data.map;
-            for (size_t k = 0; k < rm->order_len; k++)
-                xf_map_set(out_row, rm->order[k],
-                           xf_value_retain(xf_map_get(rm, rm->order[k])));
-            xf_value_release(row_out);
-        } else {
-            /* scalar or arr: store under "_result" */
-            xf_Str *k_res = xf_str_from_cstr("_result");
-            xf_map_set(out_row, k_res, row_out);
-            xf_str_release(k_res);
+        xf_map_t *row = row_v.data.map;
+
+        for (size_t k = 0; k < row->order_len; k++) {
+            xf_Str  *col_key = row->order[k];
+            xf_Value cell    = xf_map_get(row, col_key);
+            xf_Value cell_s  = xf_coerce_str(cell);
+            if (cell_s.state != XF_STATE_OK || !cell_s.data.str) continue;
+            xf_Str *val_str = cell_s.data.str;
+
+            /* get or create col_map = index[col_key] */
+            xf_Value  col_val = xf_map_get(index, col_key);
+            xf_map_t *col_map;
+            if (col_val.state != XF_STATE_OK ||
+                col_val.type  != XF_TYPE_MAP || !col_val.data.map) {
+                col_map = xf_map_new();
+                xf_map_set(index, col_key, xf_val_ok_map(col_map));
+                xf_map_release(col_map);
+                col_map = xf_map_get(index, col_key).data.map;
+            } else {
+                col_map = col_val.data.map;
+            }
+
+            /* get or create id_arr = col_map[val_str] */
+            xf_Value  id_val = xf_map_get(col_map, val_str);
+            xf_arr_t *id_arr;
+            if (id_val.state != XF_STATE_OK ||
+                id_val.type  != XF_TYPE_ARR || !id_val.data.arr) {
+                id_arr = xf_arr_new();
+                xf_map_set(col_map, val_str, xf_val_ok_arr(id_arr));
+                xf_arr_release(id_arr);
+                id_arr = xf_map_get(col_map, val_str).data.arr;
+            } else {
+                id_arr = id_val.data.arr;
+            }
+
+            xf_arr_push(id_arr, xf_val_ok_num(gid));
+            xf_value_release(cell_s);
         }
 
-
-        xf_Value out_val = xf_val_ok_map(out_row);
-        xf_map_release(out_row);  /* drop local ref; xf_val_ok_map already retained */
-
-        xf_arr_push(out, out_val);
-        /* do NOT release out_row a second time — already dropped above */
+        xf_value_release(fn_out);
     }
 
-    xf_Value v = xf_val_ok_arr(out);
-    xf_arr_release(out);
+    xf_Value v = xf_val_ok_map(index);
+    xf_map_release(index);
     return v;
 }
-
 /* ── cp_run(workers) → arr of results ───────────────────────── */
 /*
  * workers: arr of maps {fn:<fn>, data:<arr>}
@@ -2905,6 +3069,7 @@ static xf_Value cp_run(xf_Value *args, size_t argc) {
     for (size_t i = 0; i < nw; i++) {
         if (tids[i]) pthread_join(tids[i], NULL);
         xf_arr_push(out, ctxs[i].result);
+        xf_value_release(ctxs[i].result); 
         xf_arr_release(ctxs[i].chunk);
     }
 
@@ -2922,7 +3087,7 @@ static xf_module_t *build_process(void) {
     xf_module_t *m = xf_module_new("core.process");
     FN("worker", XF_TYPE_MAP, cp_worker);
     FN("split",  XF_TYPE_ARR, cp_split);
-    FN("assign", XF_TYPE_ARR, cp_assign);
+    FN("assign", XF_TYPE_MAP, cp_assign);
     FN("run",    XF_TYPE_ARR, cp_run);
     return m;
 }
@@ -3460,10 +3625,97 @@ static xf_Value cd_flatten(xf_Value *args, size_t argc) {
 
     /* ── arr input ───────────────────────────────────────────── */
     if (src.type == XF_TYPE_ARR && src.data.arr) {
-        xf_arr_t *in  = src.data.arr;
+        xf_arr_t *in = src.data.arr;
         if (in->len == 0) return xf_val_ok_arr(xf_arr_new());
 
-        /* peek: are the elements maps (dataset rows)? */
+        /* ── inverted index maps → merged inverted index ────────
+         * Detected when: all elements are maps whose values are
+         * themselves maps (the { col: { val: [ids] } } structure
+         * produced by cp_assign).
+         *
+         * flatten([
+         *   { "name": {"alice":[0,2]}, "age": {"30":[0]} },
+         *   { "name": {"alice":[250]}, "age": {"25":[250]} }
+         * ])
+         * → { "name": {"alice":[0,2,250]}, "age": {"30":[0],"25":[250]} }
+         */
+        bool all_index_maps = (in->len > 0);
+        for (size_t i = 0; i < in->len && all_index_maps; i++) {
+            xf_Value v = in->items[i];
+            if (!(v.state == XF_STATE_OK &&
+                  v.type  == XF_TYPE_MAP && v.data.map)) {
+                all_index_maps = false; break;
+            }
+            xf_map_t *m = v.data.map;
+            if (m->order_len == 0) { all_index_maps = false; break; }
+            for (size_t j = 0; j < m->order_len && all_index_maps; j++) {
+                xf_Value inner = xf_map_get(m, m->order[j]);
+                if (!(inner.state == XF_STATE_OK &&
+                      inner.type  == XF_TYPE_MAP))
+                    all_index_maps = false;
+            }
+        }
+
+        if (all_index_maps) {
+            xf_map_t *merged = xf_map_new();
+
+            for (size_t i = 0; i < in->len; i++) {
+                xf_map_t *chunk_idx = in->items[i].data.map;
+
+                for (size_t c = 0; c < chunk_idx->order_len; c++) {
+                    xf_Str  *col_key = chunk_idx->order[c];
+                    xf_Value col_src = xf_map_get(chunk_idx, col_key);
+                    if (col_src.state != XF_STATE_OK ||
+                        col_src.type  != XF_TYPE_MAP || !col_src.data.map) continue;
+                    xf_map_t *src_col = col_src.data.map;
+
+                    /* get or create merged col_map for this column */
+                    xf_Value  dst_col_v = xf_map_get(merged, col_key);
+                    xf_map_t *dst_col;
+                    if (dst_col_v.state != XF_STATE_OK ||
+                        dst_col_v.type  != XF_TYPE_MAP || !dst_col_v.data.map) {
+                        dst_col = xf_map_new();
+                        xf_map_set(merged, col_key, xf_val_ok_map(dst_col));
+                        xf_map_release(dst_col);
+                        dst_col = xf_map_get(merged, col_key).data.map;
+                    } else {
+                        dst_col = dst_col_v.data.map;
+                    }
+
+                    /* for each distinct value, append IDs into dst_col */
+                    for (size_t v2 = 0; v2 < src_col->order_len; v2++) {
+                        xf_Str  *val_key = src_col->order[v2];
+                        xf_Value src_ids = xf_map_get(src_col, val_key);
+                        if (src_ids.state != XF_STATE_OK ||
+                            src_ids.type  != XF_TYPE_ARR || !src_ids.data.arr) continue;
+
+                        /* get or create dst id_arr for this value */
+                        xf_Value  dst_ids_v = xf_map_get(dst_col, val_key);
+                        xf_arr_t *dst_ids;
+                        if (dst_ids_v.state != XF_STATE_OK ||
+                            dst_ids_v.type  != XF_TYPE_ARR || !dst_ids_v.data.arr) {
+                            dst_ids = xf_arr_new();
+                            xf_map_set(dst_col, val_key, xf_val_ok_arr(dst_ids));
+                            xf_arr_release(dst_ids);
+                            dst_ids = xf_map_get(dst_col, val_key).data.arr;
+                        } else {
+                            dst_ids = dst_ids_v.data.arr;
+                        }
+
+                        /* append all IDs from this chunk's arr */
+                        xf_arr_t *sa = src_ids.data.arr;
+                        for (size_t id = 0; id < sa->len; id++)
+                            xf_arr_push(dst_ids, xf_value_retain(sa->items[id]));
+                    }
+                }
+            }
+
+            xf_Value r = xf_val_ok_map(merged);
+            xf_map_release(merged);
+            return r;
+        }
+
+        /* ── arr of maps (flat dataset) → returned as-is ────── */
         bool all_maps = true;
         for (size_t i = 0; i < in->len && all_maps; i++) {
             xf_Value v = in->items[i];
@@ -3471,7 +3723,6 @@ static xf_Value cd_flatten(xf_Value *args, size_t argc) {
         }
 
         if (all_maps) {
-            /* dataset flatten: merge all rows into one arr-of-map, union columns */
             xf_arr_t *out = xf_arr_new();
             for (size_t i = 0; i < in->len; i++)
                 xf_arr_push(out, xf_value_retain(in->items[i]));
@@ -3480,14 +3731,13 @@ static xf_Value cd_flatten(xf_Value *args, size_t argc) {
             return v;
         }
 
-        /* are elements arrays-of-arrays (nested dataset chunks)? */
+        /* ── arr of arr-of-maps (chunked dataset) → merged ──── */
         bool all_arr_of_map = true;
         for (size_t i = 0; i < in->len && all_arr_of_map; i++) {
             xf_Value v = in->items[i];
             if (!(v.state == XF_STATE_OK && v.type == XF_TYPE_ARR && v.data.arr)) {
                 all_arr_of_map = false; break;
             }
-            /* check inner elements are maps */
             for (size_t j = 0; j < v.data.arr->len && all_arr_of_map; j++) {
                 xf_Value inner = v.data.arr->items[j];
                 if (!(inner.state == XF_STATE_OK && inner.type == XF_TYPE_MAP))
@@ -3496,7 +3746,6 @@ static xf_Value cd_flatten(xf_Value *args, size_t argc) {
         }
 
         if (all_arr_of_map) {
-            /* arr of dataset chunks → one merged dataset */
             xf_arr_t *out = xf_arr_new();
             for (size_t i = 0; i < in->len; i++) {
                 xf_arr_t *chunk = in->items[i].data.arr;
@@ -3508,7 +3757,7 @@ static xf_Value cd_flatten(xf_Value *args, size_t argc) {
             return v;
         }
 
-        /* general arr flatten */
+        /* ── general arr flatten ─────────────────────────────── */
         return cd_flatten_arr_deep(in, deep);
     }
 
@@ -3516,7 +3765,7 @@ static xf_Value cd_flatten(xf_Value *args, size_t argc) {
     if (src.type == XF_TYPE_MAP && src.data.map) {
         xf_map_t *in = src.data.map;
 
-        /* are values arrays? → concatenate all sub-arrays */
+        /* values are arrays → concatenate all sub-arrays */
         bool vals_are_arrs = true;
         for (size_t i = 0; i < in->order_len && vals_are_arrs; i++) {
             xf_Value v = xf_map_get(in, in->order[i]);
@@ -3533,7 +3782,7 @@ static xf_Value cd_flatten(xf_Value *args, size_t argc) {
             xf_Value r = xf_val_ok_arr(out); xf_arr_release(out); return r;
         }
 
-        /* are values maps? → merge all sub-maps into one map (later keys win) */
+        /* values are maps → merge all sub-maps into one (later keys win) */
         bool vals_are_maps = true;
         for (size_t i = 0; i < in->order_len && vals_are_maps; i++) {
             xf_Value v = xf_map_get(in, in->order[i]);
@@ -3550,13 +3799,12 @@ static xf_Value cd_flatten(xf_Value *args, size_t argc) {
                                    xf_value_retain(xf_map_get(sm, sm->order[j])));
                 }
             }
-
-xf_Value r = xf_val_ok_map(out);
-xf_map_release(out);
- return r;
+            xf_Value r = xf_val_ok_map(out);
+            xf_map_release(out);
+            return r;
         }
 
-        /* mixed/scalar values: return arr of all map values */
+        /* mixed/scalar values → return arr of all map values */
         xf_arr_t *out = xf_arr_new();
         for (size_t i = 0; i < in->order_len; i++)
             xf_arr_push(out, xf_value_retain(xf_map_get(in, in->order[i])));
