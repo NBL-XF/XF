@@ -3786,6 +3786,7 @@ static void *cd_stream_thread(void *arg) {
     } else {
         ctx->result = xf_val_nav(XF_TYPE_FN);
     }
+xf_value_release(chunk_val); 
     ctx->done = true;
     return NULL;
 }

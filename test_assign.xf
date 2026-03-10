@@ -1,0 +1,115 @@
+BEGIN {
+    str path = "tests/data_1k.csv"
+    print path
+
+    arr lines = core.os.lines(path)
+    print core.format.json(lines)
+
+    num total = core.generics.length(lines)
+    print "Lines read : " .. total
+
+    if (total < 2) {
+        print "ERROR: file has fewer than 2 lines — check path"
+        exit(1)
+    }
+
+    arr headers = core.generics.split(lines[0], ",")
+    num ncols   = core.generics.length(headers)
+    print "Columns    : " .. ncols .. "  →  " .. core.generics.join(headers, ", ")
+
+    arr dataset = []
+
+    num i = 1
+    while (i < total) {
+        arr fields = core.generics.split(lines[i], ",")
+        map row = {}
+        num j = 0
+        while (j < ncols) {
+            row[headers[j]] = fields[j]
+            j = j + 1
+        }
+        push(dataset, row)
+        i = i + 1
+    }
+
+    num nrows = core.generics.length(dataset)
+    print "Dataset    : " .. nrows .. " rows"
+    print "Row[0] raw : " .. core.format.json(core.ds.row(dataset, 0))
+
+    fn mark_row = fn(row) {
+        row["_checked"] = 1
+        return row
+    }
+
+    arr assigned = core.process.assign(dataset, mark_row)
+
+    num assigned_len = core.generics.length(assigned)
+    print "Assigned   : " .. assigned_len .. " rows"
+
+    map peek = core.ds.row(assigned, 0)
+    str peek_json = core.format.json(peek)
+    print "Row[0] assigned : " .. peek_json
+
+    if (core.generics.contains(peek_json, "\"_checked\"")) {
+        print "Shape check : PASS — arr-of-maps (ds.flatten compatible)"
+    } else if (core.generics.contains(peek_json, "\"columns\"")) {
+        print "Shape check : FAIL — got old {columns, rows} structure"
+        exit(1)
+    } else {
+        print "Shape check : WARN — unexpected shape, inspect above"
+    }
+
+    arr flat = core.ds.flatten(assigned)
+    num flat_len = core.generics.length(flat)
+    print "Flattened  : " .. flat_len .. " rows"
+
+    if (flat_len == nrows) {
+        print "Row count   : PASS — " .. flat_len .. " == " .. nrows
+    } else {
+        print "Row count   : FAIL — got " .. flat_len .. ", expected " .. nrows
+        exit(1)
+    }
+
+    print "Row[0] flat : " .. core.format.json(core.ds.row(flat, 0))
+    print "Row[-1] flat: " .. core.format.json(core.ds.row(flat, flat_len - 1))
+
+    arr chunks  = core.process.split(dataset, 4)
+    num nchunks = core.generics.length(chunks)
+    print "Chunks     : " .. nchunks
+
+    fn parallel_mark = fn(row) {
+        row["_parallel"] = 1
+        return row
+    }
+
+    fn process_chunk = fn(chunk) {
+        return core.process.assign(chunk, parallel_mark
+    }
+
+    arr workers = []
+    for (chunk in chunks) {
+        push(workers, core.process.worker(process_chunk, chunk))
+    }
+
+    arr results  = core.process.run(workers)
+    arr combined = core.ds.flatten(results)
+    num combined_len = core.generics.length(combined)
+
+    if (combined_len == nrows) {
+        print "Parallel    : PASS — " .. combined_len .. " rows across " .. nchunks .. " threads"
+    } else {
+        print "Parallel    : FAIL — got " .. combined_len .. ", expected " .. nrows
+        exit(1)
+    }
+
+    map par_row = core.ds.row(combined, 0)
+    if (core.generics.contains(core.format.json(par_row), "\"_parallel\"")) {
+        print "XF fn path  : PASS — g_fn_caller_syms not clobbered"
+    } else {
+        print "XF fn path  : FAIL — _parallel key missing, likely NAV return"
+        exit(1)
+    }
+
+    print "──────────────────────────────────"
+    print "All checks passed"
+}
