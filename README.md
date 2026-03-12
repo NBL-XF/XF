@@ -1,180 +1,218 @@
-# xf
+# XF — The Stream-Processing Scripting Language
 
-**xf** is a systems-oriented data and stream processing scripting language. It combines the record-splitting pipeline model of awk with typed variables, first-class collections, a state/type value system, shell-pipe integration, and a module library — all accessible from an interactive REPL or as a command-line tool for file and stream processing.
+XF is a statically-typed, stream-processing scripting language inspired by AWK, with first-class threading, a rich type system, a quantum-inspired state model, and a comprehensive standard library. It is designed to process structured text and data files — CSV, TSV, JSON — with concise, expressive syntax. XF can be used as a standalone interpreter or embedded into C applications via its public API (`libxf`).
 
 ---
 
 ## Table of Contents
 
-1. [Invocation](#invocation)
-2. [Value System](#value-system)
-3. [Types](#types)
-4. [Variables & Declarations](#variables--declarations)
-5. [Operators](#operators)
-6. [Control Flow](#control-flow)
-7. [Functions](#functions)
-8. [Collections](#collections)
-9. [Pattern-Action Rules](#pattern-action-rules)
-10. [Record Variables](#record-variables)
-11. [Stream & I/O](#stream--io)
-12. [Output Formatting](#output-formatting)
-13. [Substitution & Transliteration](#substitution--transliteration)
-14. [Concurrency](#concurrency)
-15. [Modules](#modules)
+1. [Overview](#overview)
+2. [Quick Start](#quick-start)
+3. [Program Structure](#program-structure)
+4. [Types](#types)
+5. [States](#states)
+6. [Variables and Declarations](#variables-and-declarations)
+7. [Operators](#operators)
+8. [Control Flow](#control-flow)
+9. [Functions](#functions)
+10. [Collections](#collections)
+11. [Iteration and Loops](#iteration-and-loops)
+12. [Pattern-Action Rules](#pattern-action-rules)
+13. [Threading](#threading)
+14. [Import](#import)
+15. [Core Module Reference](#core-module-reference)
 16. [Built-in Functions](#built-in-functions)
-17. [REPL](#repl)
-18. [Examples](#examples)
-19. [Classic Programs](#classic-programs)
+17. [Small Examples (15–20)](#small-examples)
+18. [Algorithms (5–10)](#algorithms)
+19. [Larger Examples (5–10)](#larger-examples)
 
 ---
 
-## Invocation
+## Overview
 
-```
-xf                          # start interactive REPL
-xf -e 'expr'                # execute inline expression
-xf -f script.xf             # execute script file
-xf -e 'expr' input.txt      # inline expression with file input
-xf -f script.xf input.txt   # script with file input
-```
+XF processes input line by line (like AWK) or can run entirely in `BEGIN`/`END` blocks without any input. Key features:
 
-**Flags**
-
-| Flag      | Description                                  |
-|-----------|----------------------------------------------|
-| `-e expr` | inline expression (may be repeated)          |
-| `-f file` | script file (`.xf`)                          |
-| `-n`      | suppress implicit print                      |
-| `-p`      | print every input record                     |
-| `-j N`    | parallel schedulables (default: 1)           |
-| `-s`      | strict mode — NAV is treated as ERR          |
-| `-l`      | lenient mode — NAV does not propagate        |
-| `-h`      | show help                                    |
-| `-v`      | show version                                 |
+- **Static types** — `num`, `str`, `arr`, `map`, `set`, `tuple`, `fn`
+- **State system** — every value carries a lifecycle state (`OK`, `ERR`, `NAV`, `NULL`, `VOID`, `UNDEF`)
+- **Stream processing** — `BEGIN { }`, pattern-action rules, `END { }` over input records
+- **Threading** — `spawn`/`join` for parallel work
+- **Core library** — `core.math`, `core.str`, `core.regex`, `core.format`, `core.os`, `core.ds`
+- **Import** — load other `.xf` files
 
 ---
 
-## Value System
-
-Every value in xf carries two orthogonal axes: **state** and **type**. State is primary — it takes precedence over type in every operation. A value with a non-`OK` state propagates that state through expressions rather than producing a result.
-
-### The 7 States
-
-States form a one-way lifecycle. Once a value reaches a **terminal state** it cannot change. Transitions are atomic — in concurrent code, only one thread wins the collapse race.
-
-```
-UNDETERMINED → UNDEF → { OK, ERR, NAV, NULL, VOID }
-                              ↑ terminal — no further change possible
-```
-
-| State           | Terminal | Meaning                                                               |
-|-----------------|----------|-----------------------------------------------------------------------|
-| `UNDETERMINED`  | no       | Not yet processed. Pre-collapse — the scheduler has not touched it.   |
-| `UNDEF`         | no       | Declared but not yet assigned. Reading such a variable produces NAV.  |
-| `OK`            | yes      | Value is valid and fully usable.                                      |
-| `ERR`           | yes      | Value carries a fault. Propagates through all downstream expressions. |
-| `NAV`           | yes      | Return was expected but nothing came back. Propagates like ERR.       |
-| `NULL`          | yes      | No return was expected and none was given. Silent empty.              |
-| `VOID`          | yes      | No return was expected but a value leaked out anyway.                 |
-
-**Error states** (`ERR`, `NAV`) propagate automatically — any arithmetic, comparison, or function call on an error-state value short-circuits and returns the same error state without executing. This mirrors NaN propagation in IEEE floats but applies to the entire type system.
-
-**Pending states** (`UNDETERMINED`, `UNDEF`) block further collapse. In the scheduler, `UNDETERMINED` means queued for execution and `UNDEF` means currently running.
-
-### State Transitions in Practice
+## Quick Start
 
 ```xf
-num x               # UNDEF  — declared, not yet assigned
-x = 42              # OK     — valid value
-x = num("bad")      # NAV    — coercion failed, state collapses to NAV
-x + 10              # NAV    — propagated, no addition performed
-```
-
-A `void` function that runs to completion sets its return to `NULL`. A typed function that exits without a `return` gives the caller `NAV`.
-
-```xf
-void fn log(str msg) {
-    print msg         # NULL — no return value expected or given
-}
-
-num fn broken(str s) {
-    print s           # no return → caller receives NAV
+# hello.xf
+BEGIN {
+    print "Hello, XF!"
 }
 ```
 
-### Inspecting State
-
 ```xf
-x.state          # returns the state: OK, NAV, ERR, NULL, VOID, UNDEF, UNDETERMINED
-x.type           # returns the type: num, str, arr, map, set, fn, void
-x.len            # element count for str, arr, map, or set
-
-if x.state == OK  { print "valid" }
-if x.state == NAV { print "missing" }
-if x.state == ERR { print "faulted" }
-
-# guard before use
-num result = parse(input)
-if result.state != OK { exit }
-print result * 2
+# sum_csv.xf  — sum the third column of a CSV file
+FS = ","
+num total = 0
+NR > 1 { total += num($3) }
+END { print "Total:", total }
 ```
 
-### Null Coalescing
+Run with:
+
+```bash
+xf -f hello.xf
+xf -f sum_csv.xf data.csv
+```
+
+---
+
+## Program Structure
+
+An XF program consists of:
+
+- **Top-level variable declarations** — outside all blocks
+- **Function declarations** — `type fn name(params) { body }`
+- **`BEGIN { }`** — runs once before any input is processed
+- **Pattern-action rules** — `pattern { body }` — run for each input record
+- **`END { }`** — runs once after all input is processed
 
 ```xf
-num y = x ?? 0          # use 0 if x is NAV or NULL
-str s = name ?? "anon"  # fallback string
+FS = ","            # set field separator (runs before input)
+
+num total = 0       # top-level variable
+
+num fn double(num x) { return x * 2 }
+
+BEGIN {
+    print "Starting"
+}
+
+NR > 1 {            # skip header row
+    total += num($3)
+}
+
+END {
+    print "Total:", total
+}
 ```
 
 ---
 
 ## Types
 
-| Type   | Description                                      |
-|--------|--------------------------------------------------|
-| `num`  | Double-precision float                           |
-| `str`  | Reference-counted UTF-8 string                   |
-| `arr`  | Ordered array (heterogeneous elements)           |
-| `map`  | Associative array, insertion-ordered             |
-| `set`  | Unique-value collection                          |
-| `fn`   | First-class callable                             |
-| `void` | No-value return type for functions               |
+| Type    | Description                              | Example literal          |
+|---------|------------------------------------------|--------------------------|
+| `num`   | 64-bit floating-point number             | `42`, `3.14`, `-7`       |
+| `str`   | Reference-counted UTF-8 string           | `"hello"`, `""`          |
+| `arr`   | Ordered, resizable array                 | `[1, 2, 3]`              |
+| `map`   | Ordered key-value map (string keys)      | `{"a": 1, "b": 2}`       |
+| `set`   | Unique string set                        | `{"red", "green"}`       |
+| `tuple` | Fixed-length heterogeneous sequence      | `("key", 99)`            |
+| `fn`    | Function value                           | `fn(num x) { return x }` |
+| `void`  | No value (return type only)              | —                        |
 
-### Type Casts
+### Type Properties
+
+Every value exposes three read-only properties:
 
 ```xf
-num n = num("3.14")      # string → num
-str s = str(99)          # num → str
-arr a = arr(some_map)    # convert to array
-map m = map(some_arr)    # convert to map
+str s = "hello"
+print s.type    # 2  (XF_TYPE_STR)
+print s.state   # 0  (XF_STATE_OK)
+print s.len     # 5
+```
+
+Type numeric codes: `void=0`, `num=1`, `str=2`, `map=3`, `set=4`, `arr=5`, `fn=6`, `tuple=9`
+
+### Type Casting
+
+```xf
+num n  = num("42")      # str → num
+str s  = str(123)       # num → str
+num x  = num("bad")     # fails → NAV state
+print (x ?? 0)          # recover with ??
 ```
 
 ---
 
-## Variables & Declarations
+## States
 
-Variables require an explicit type keyword on first declaration.
+Every value carries a **state** alongside its data. State takes priority over type in all operations.
+
+| State   | Code | Meaning                                                 |
+|---------|------|---------------------------------------------------------|
+| `OK`    | 0    | Value is valid and usable                               |
+| `ERR`   | 1    | Value carries a fault (e.g. division by zero)           |
+| `VOID`  | 2    | No return expected; value was discarded                 |
+| `NULL`  | 3    | No return expected; none was given                      |
+| `NAV`   | 4    | Return expected, but nothing was returned               |
+| `UNDEF` | 5    | Variable declared but not yet assigned                  |
+
+States propagate through arithmetic and expressions — if one operand is `ERR`, the result is `ERR`. Use `??` (null coalescing) to recover:
 
 ```xf
-num  count  = 0
-str  name   = "alice"
-arr  items  = [1, 2, 3]
-map  scores = {"alice": 95, "bob": 88}
-set  seen   = {"a", "b", "c"}
+num bad = 1 / 0         # ERR
+num ok  = bad ?? 0      # 0  — recovered
 ```
 
-**Uninitialized declaration** — state is `UNDEF` until assigned:
+Check state explicitly:
 
 ```xf
-num result
+num x = some_fn()
+if (x.state == 1) { print "error occurred" }
+if (x.state == 4) { print "NAV — function returned nothing" }
 ```
 
-**Walrus operator** `:=` — declare and assign in expression position:
+---
+
+## Variables and Declarations
+
+Variables must be declared with a type keyword before use:
 
 ```xf
-if (n := compute()) > 0 {
-    print n
+num   x = 10
+str   name = "alice"
+arr   items = [1, 2, 3]
+map   config = {"host": "localhost", "port": "8080"}
+set   colors = {"red", "green", "blue"}
+tuple point = (3.0, 4.0)
+```
+
+Declared but not assigned:
+
+```xf
+num x          # state is UNDEF until assigned
+x = 42         # now OK
+```
+
+### Walrus Operator `:=`
+
+Declare and assign in expression position:
+
+```xf
+if ((result := compute()) > 0) {
+    print "got:", result
 }
+```
+
+### Tuple Destructuring
+
+```xf
+tuple t = ("alice", 30)
+str name
+num age
+name, age = t
+print name    # alice
+print age     # 30
+```
+
+### Multi-Assignment
+
+```xf
+num a = 5
+num b = 3
+a, b = b, a      # swap — not yet supported; use temp var
 ```
 
 ---
@@ -184,7 +222,7 @@ if (n := compute()) > 0 {
 ### Arithmetic
 
 ```xf
-x + y    x - y    x * y    x / y    x % y    x ^ y   # ^ = exponentiation
+x + y    x - y    x * y    x / y    x % y    x ^ y
 x += 1   x -= 1   x *= 2   x /= 2   x %= 3
 x++      x--      ++x      --x
 ```
@@ -193,7 +231,7 @@ x++      x--      ++x      --x
 
 ```xf
 x == y    x != y    x < y    x > y    x <= y    x >= y
-x <=> y                    # three-way: returns -1, 0, or 1
+x <=> y   # spaceship: -1, 0, or 1
 ```
 
 ### Logical
@@ -205,110 +243,132 @@ x && y    x || y    !x
 ### String Concatenation
 
 ```xf
-str full = first .. " " .. last
-full ..= "!"
+str s = "hello" .. ", " .. "world"
+s ..= "!"      # append in-place
 ```
 
 ### Regex Match
 
 ```xf
-str line = "hello world"
-line ~ /world/         # true
-line !~ /missing/      # true
-line ~ /HELLO/i        # case-insensitive flag
-line ~ /^start/m       # multiline flag
+str s = "hello world"
+print s ~ /world/       # 1 (match)
+print s !~ /xyz/        # 1 (no match)
+print s ~ /WORLD/i      # 1 (case-insensitive)
+```
+
+Regex flags: `i` (case-insensitive), `m` (multiline), `g` (global), `x` (extended)
+
+### Null Coalescing
+
+```xf
+print (x ?? default)          # use x if OK, else default
+print (a ?? b ?? c ?? 0)      # chain
 ```
 
 ### Ternary
 
 ```xf
-str label = score >= 90 ? "pass" : "fail"
+num max = a > b ? a : b
 ```
 
-### Shell Pipe
-
-Pipe a value through a shell command; returns stdout as a string:
+### Pipe Function
 
 ```xf
-str result = "hello world" | "tr a-z A-Z"    # "HELLO WORLD"
+arr result = data |> transform |> filter
 ```
 
-### Pipe-to-Function
+### Spaceship
 
 ```xf
-result = value |> transform_fn
-```
-
-### Matrix / Array Element-wise
-
-```xf
-[1,2,3] .+ [4,5,6]    # [5, 7, 9]    element-wise add
-[2,4,6] .- [1,2,3]    # [1, 2, 3]    element-wise subtract
-[1,2,3] ./ [1,2,1]    # [1, 1, 3]    element-wise divide
-A .* B                 # true matrix multiply (nested arrays as rows)
+print (1 <=> 2)        # -1
+print ("a" <=> "b")    # -1
+print (2 <=> 2)        # 0
 ```
 
 ---
 
 ## Control Flow
 
-### if / elif / else
+### If / Elif / Else
 
 ```xf
-if x > 10 {
-    print "big"
-} elif x > 5 {
-    print "medium"
+if (x > 0) {
+    print "positive"
+} elif (x < 0) {
+    print "negative"
 } else {
-    print "small"
+    print "zero"
 }
 ```
 
-### while
+### While
 
 ```xf
-while i < 10 {
-    i++
+num i = 0
+while (i < 10) {
+    print i
+    i += 1
 }
 ```
 
-**Shorthand while** — `condition <> body`:
+### Shorthand While (`<>`)
 
 ```xf
-i < 10 <> print i++
+num n = 5
+n > 0 <> { print n; n -= 1 }
 ```
 
-### for-in
+### For
 
 ```xf
-for (item in items) {
-    print item
-}
-
-for (key in mymap) {
-    print key, mymap[key]
+for (x in [1, 2, 3, 4, 5]) {
+    print x
 }
 ```
 
-**Shorthand for** — `collection[iter] > body`:
+With index:
 
 ```xf
+for ((i, x) in arr) {
+    print i, x
+}
+```
+
+Iterating maps:
+
+```xf
+for ((k, v) in mymap) {
+    print k, "=", v
+}
+```
+
+### Shorthand For (`[]>`)
+
+```xf
+arr items = [10, 20, 30]
 items[x] > print x
-mymap[k] > print k, mymap[k]
+
+# With index
+items[i, x] > print i, x
+
+# With block body
+items[x] > {
+    print "item:", x
+}
 ```
 
-### next / exit
+### Break / Next / Exit
 
 ```xf
-next    # skip to next input record (in pattern-action context)
-exit    # terminate program
-```
+while (true) {
+    if (done) break
+}
 
-### delete
+NR > 0 {
+    if ($1 == "skip") next   # skip to next record
+}
 
-```xf
-delete arr[2]         # remove element at index 2
-delete map["key"]     # remove key from map
+if (error) exit(1)           # exit with code
 ```
 
 ---
@@ -322,29 +382,40 @@ num fn add(num a, num b) {
     return a + b
 }
 
-void fn greet(str name) {
-    print "hello, " .. name
+str fn greet(str name) {
+    return "Hello, " .. name
 }
 
-str fn fmt_score(str player, num score) {
-    return sprintf "%s: %g", player, score
+void fn log(str msg) {
+    print "[LOG]", msg
 }
 ```
 
-### First-class / Anonymous
+### Default Parameters
+
+```xf
+num fn power(num base, num exp = 2) {
+    return base ^ exp
+}
+print power(3)      # 9
+print power(3, 3)   # 27
+```
+
+### Anonymous Functions
 
 ```xf
 fn square = fn(num x) { return x * x }
-num r = square(5)    # 25
+print square(5)     # 25
 ```
 
-### Passing Functions as Arguments
+### Recursion
 
 ```xf
-num fn apply(fn f, num x) { return f(x) }
-
-fn double = fn(num x) { return x * 2 }
-print apply(double, 21)    # 42
+num fn fib(num n) {
+    if (n <= 1) { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+print fib(10)    # 55
 ```
 
 ---
@@ -354,656 +425,682 @@ print apply(double, 21)    # 42
 ### Arrays
 
 ```xf
-arr items = [10, 20, 30]
-items[0]                  # 10
-items.len                 # 3
-items[items.len - 1]      # last element
-
-push(items, 40)           # append; also: items.push(40)
-pop(items)                # remove + return last
-shift(items)              # remove + return first
-unshift(items, 5)         # prepend; also: items.unshift(5)
-remove(items, 1)          # remove by index
+arr a = [1, 2, 3]
+a[0]           # 1
+a[2] = 99      # set
+push(a, 4)     # append
+pop(a)         # remove last
+shift(a)       # remove first
+unshift(a, 0)  # prepend
+a.len          # length
+delete a[1]    # remove by index
 ```
 
 ### Maps
 
 ```xf
-map scores = {"alice": 95, "bob": 88}
-scores["alice"]                  # 95
-scores["carol"] = 72             # insert/update
-
-has(scores, "alice")             # 1  (also: scores.has("alice"))
-keys(scores)                     # ["alice", "bob", "carol"]
-values(scores)                   # [95, 88, 72]
-
-delete scores["bob"]
-scores.len                       # 2
+map m = {"name": "alice", "age": 30}
+m["name"]             # "alice"
+m["city"] = "NYC"     # add key
+delete m["age"]       # remove key
+has(m, "name")        # 1
+keys(m)               # arr of keys
+values(m)             # arr of values
 ```
 
 ### Sets
 
 ```xf
-set seen = {"a", "b", "c"}
-seen.has("a")                    # 1
-has(seen, "z")                   # 0
+set colors = {"red", "green", "blue"}
+push(colors, "yellow")     # add
+has(colors, "red")         # 1
+remove(colors, "green")    # remove
+```
+
+### Tuples
+
+```xf
+tuple t = ("alice", 30, "NYC")
+t[0]       # "alice"
+t[1]       # 30
+t.len      # 3
+
+# Destructure
+str name
+num age
+str city
+name, age, city = t
+```
+
+### Nested Structures
+
+```xf
+arr records = [
+    {"name": "alice", "score": 95},
+    {"name": "bob",   "score": 87}
+]
+print records[0]["name"]    # alice
+print records[1]["score"]   # 87
+```
+
+---
+
+## Iteration and Loops
+
+Arrays, maps, sets, and tuples are all iterable:
+
+```xf
+# Array
+arr a = [10, 20, 30]
+for (x in a) { print x }
+
+# Array with index
+for ((i, x) in a) { print i, x }
+
+# Map
+map m = {"a": 1, "b": 2}
+for ((k, v) in m) { print k, v }
+
+# Tuple
+tuple t = (1, 2, 3)
+for (x in t) { print x }
+
+# Shorthand
+a[x] > print x
+a[i, x] > print i, x
+m[k, v] > print k, v
 ```
 
 ---
 
 ## Pattern-Action Rules
 
-xf scripts can define `BEGIN`, `END`, and pattern-action rules that run against each line of input. The program structure mirrors awk.
+Pattern-action rules execute for each input record:
 
 ```xf
-BEGIN {
-    FS = ","
-    print "starting"
+FS = ","
+
+# Run for every record
+{ print $1, $2 }
+
+# Run only when NR > 1 (skip header)
+NR > 1 { print $1 }
+
+# Run when field matches regex
+$2 ~ /^[A-Z]/ { print "uppercase name:", $2 }
+
+# Built-in record variables
+# $0      — full record (raw line)
+# $1..$N  — individual fields
+# NR      — current record number (global)
+# NF      — number of fields in current record
+# FNR     — record number within current file
+# FS      — field separator (default: whitespace)
+# RS      — record separator (default: newline)
+# OFS     — output field separator
+# ORS     — output record separator
+```
+
+---
+
+## Threading
+
+```xf
+num fn worker(num id) {
+    num sum = 0
+    num i = 0
+    while (i < 1000) { sum += i; i += 1 }
+    return sum + id
 }
 
-# runs for every record where field 1 is greater than 100
-$1 > 100 {
-    print $2, $3
-}
+# Spawn returns a thread handle (num)
+num tid1 = spawn worker(1)
+num tid2 = spawn worker(2)
 
-# regex pattern — runs for lines that match
-/error/ {
-    print "FOUND:", $0
-}
+# join() blocks until the thread completes and returns its result
+num r1 = join(tid1)
+num r2 = join(tid2)
+print r1, r2
 
-# bare block — runs for every record
-{
-    count++
-}
-
-END {
-    print "total records:", count
-}
+# Statement form — join without capturing return value
+join tid1
 ```
 
-Running with input:
+Set the maximum concurrent jobs before spawning:
 
-```
-xf -f script.xf data.csv
+```xf
+# In the embedding API: xf_set_max_jobs(xf, 8)
 ```
 
 ---
 
-## Record Variables
-
-These implicit variables are updated automatically for each input record:
-
-| Variable  | Description                                      |
-|-----------|--------------------------------------------------|
-| `$0`      | Full current record (the whole line)             |
-| `$1`–`$N` | Individual fields, split by `FS`                 |
-| `NR`      | Global record number (across all files)          |
-| `FNR`     | Per-file record number                           |
-| `NF`      | Number of fields in the current record           |
-| `FS`      | Field separator (default: whitespace)            |
-| `RS`      | Record separator                                 |
-| `OFS`     | Output field separator                           |
-| `ORS`     | Output record separator                          |
+## Import
 
 ```xf
-BEGIN { FS = "\t" }
+import "mathlib.xf"
 
-$3 ~ /active/ {
-    printf "user %s joined on %s\n", $1, $2
-}
+# All top-level functions and variables from mathlib.xf
+# are now available in the current script.
+print clamp(150, 0, 100)    # 100
+print PI                    # 3.14159...
+
+# Double import of the same path is a no-op.
+import "mathlib.xf"
 ```
 
 ---
 
-## Stream & I/O
+## Core Module Reference
 
-### Shell Pipe Operator
-
-Write a value to a shell command's stdin; get stdout back as a string:
+### `core.math`
 
 ```xf
-str out   = "hello world" | "tr a-z A-Z"     # "HELLO WORLD"
-str lines = data | "sort -u | head -10"
+core.math.sin(x)      core.math.cos(x)     core.math.tan(x)
+core.math.asin(x)     core.math.acos(x)    core.math.atan(x)
+core.math.atan2(y,x)
+core.math.sqrt(x)     core.math.pow(x,y)   core.math.exp(x)
+core.math.log(x)      core.math.log2(x)    core.math.log10(x)
+core.math.abs(x)      core.math.floor(x)   core.math.ceil(x)
+core.math.round(x)    core.math.int(x)
+core.math.min(a,b)    core.math.max(a,b)   core.math.clamp(v,lo,hi)
+core.math.rand()      core.math.srand(seed)
+core.math.PI          core.math.E          core.math.INF
 ```
 
-### File I/O Functions
+### `core.str`
 
 ```xf
-read("file.txt")              # read entire file → str
-lines("file.txt")             # read file → arr of lines (stripped)
-write("out.txt", content)     # write str to file → 1 or 0
-append("log.txt", entry)      # append str to file → 1 or 0
+core.str.len(s)
+core.str.upper(s)       core.str.lower(s)
+core.str.trim(s)        core.str.ltrim(s)    core.str.rtrim(s)
+core.str.substr(s,start,len)
+core.str.index(s,sub)
+core.str.contains(s,sub)
+core.str.starts_with(s,prefix)
+core.str.ends_with(s,suffix)
+core.str.replace(s,old,new)
+core.str.replace_all(s,old,new)
+core.str.repeat(s,n)
+core.str.reverse(s)
+core.str.split(s,sep)
+core.str.join(arr,sep)
+core.str.concat(...)    # variadic
+core.str.sprintf(fmt, ...)
 ```
 
-### print / printf
+### `core.regex`
 
 ```xf
-print x                       # prints value + newline
-print x, y, z                 # space-separated
-printf "%s scored %g\n", name, score
-
-# output redirection
-print x > "output.txt"        # overwrite file
-print x >> "output.txt"       # append to file
-print x | "gzip > out.gz"     # pipe to command
+core.regex.test(str, pattern)              # → num (1/0)
+core.regex.test(str, pattern, flags)
+core.regex.match(str, pattern)             # → map {match, index, groups}
+core.regex.groups(str, pattern)            # → arr of capture strings
+core.regex.search(str, pattern)            # → arr of all match maps
+core.regex.replace(str, pattern, rep)      # first match
+core.regex.replace_all(str, pattern, rep)  # all matches
+core.regex.split(str, pattern)             # → arr
 ```
 
----
-
-## Output Formatting
-
-`outfmt` sets the structured output mode for subsequent `print` statements:
+### `core.format`
 
 ```xf
-outfmt "text"     # plain text (default)
-outfmt "csv"      # comma-separated values
-outfmt "tsv"      # tab-separated values
-outfmt "json"     # JSON
+core.format.format(template, ...)          # named/positional placeholders
+core.format.pad_left(s, width)
+core.format.pad_right(s, width)
+core.format.pad_center(s, width)
+core.format.pad_left(s, width, fill)
+core.format.truncate(s, max_len)
+core.format.truncate(s, max_len, ellipsis)
+core.format.wrap(s, width)                 # → arr of lines
+core.format.indent(s, n)
+core.format.indent(s, n, char)
+core.format.dedent(s)
+core.format.comma(n)                       # 1,234,567
+core.format.comma(n, decimals)
+core.format.fixed(n, decimals)             # 3.14
+core.format.sci(n)                         # 1.23e+04
+core.format.hex(n)                         # 0xff
+core.format.bin(n)                         # 0b1010
+core.format.percent(n, decimals)           # 42.5%
+core.format.duration(seconds)             # "1h 2m 3s"
+core.format.bytes(n)                       # "1.50 KB"
+core.format.json(value)                    # → str
+core.format.from_json(str)                 # → xf value
+core.format.csv_row(arr)
+core.format.csv_row(arr, sep)
+core.format.tsv_row(arr)
+core.format.table(arr_of_maps)
+core.format.table(arr_of_maps, col_order)
 ```
 
----
-
-## Substitution & Transliteration
-
-Applied to the current input record (`$0`) in pattern-action context:
+### `core.os`
 
 ```xf
-s/pattern/replacement/        # replace first match
-s/pattern/replacement/g       # replace all matches (global)
-s/pattern/replacement/i       # case-insensitive
-y/abc/ABC/                    # transliterate: map chars from→to
-tr/abc/ABC/                   # same as y///
+core.os.run(cmd)        # execute shell command, return stdout as str
+core.os.lines(path)     # read file → arr of lines
+core.os.env(name)       # read environment variable
+core.os.time()          # unix timestamp as num
 ```
 
----
-
-## Concurrency
-
-`spawn` schedules a function call to run concurrently. `join` blocks until all spawned jobs complete. Control the number of parallel workers with `-j N`.
+### `core.ds`
 
 ```xf
-void fn process(str file) {
-    arr data = lines(file)
-    num total = 0
-    data[row] > total += num(row)
-    printf "%s: %g\n", file, total
-}
-
-spawn process("a.txt")
-spawn process("b.txt")
-spawn process("c.txt")
-join
+core.ds.column(ds, col)               # extract column as arr
+core.ds.row(ds, idx)                  # get row by index → map
+core.ds.filter(ds, col, val)          # filter rows → arr
+core.ds.sort(ds, col)                 # sort ascending → arr
+core.ds.sort(ds, col, "desc")         # sort descending → arr
+core.ds.agg(ds, group_col, val_col)   # group-by aggregate → map
+core.ds.index(ds, col)                # build index map col→row
+core.ds.keys(ds)                      # column names → arr
+core.ds.transpose(ds)                 # rows↔cols
+core.ds.merge(ds1, ds2)               # join on shared key
+core.ds.merge(ds1, ds2, key)          # join on explicit key
+core.ds.flatten(arr_of_arr)           # flatten nested arrays
 ```
-
-```
-xf -j 4 -f script.xf
-```
-
----
-
-## Modules
-
-### import
-
-```xf
-import "utils.xf"
-```
-
-The `core` namespace is registered automatically at startup. Access it directly:
-
-```xf
-num r = core.math.sqrt(16)
-str s = core.str.upper("hello")
-```
-
----
-
-### core.math
-
-| Function / Constant         | Description                                   |
-|-----------------------------|-----------------------------------------------|
-| `core.math.sin(x)`          | Sine                                          |
-| `core.math.cos(x)`          | Cosine                                        |
-| `core.math.tan(x)`          | Tangent                                       |
-| `core.math.asin(x)`         | Arc sine                                      |
-| `core.math.acos(x)`         | Arc cosine                                    |
-| `core.math.atan(x)`         | Arc tangent                                   |
-| `core.math.atan2(y, x)`     | Two-argument arc tangent                      |
-| `core.math.sqrt(x)`         | Square root                                   |
-| `core.math.pow(x, y)`       | x to the power y                              |
-| `core.math.exp(x)`          | e^x                                           |
-| `core.math.log(x)`          | Natural log                                   |
-| `core.math.log2(x)`         | Log base 2                                    |
-| `core.math.log10(x)`        | Log base 10                                   |
-| `core.math.abs(x)`          | Absolute value                                |
-| `core.math.floor(x)`        | Floor                                         |
-| `core.math.ceil(x)`         | Ceiling                                       |
-| `core.math.round(x)`        | Round to nearest                              |
-| `core.math.int(x)`          | Truncate to integer                           |
-| `core.math.min(a, b)`       | Minimum                                       |
-| `core.math.max(a, b)`       | Maximum                                       |
-| `core.math.clamp(v, lo, hi)`| Clamp v between lo and hi                     |
-| `core.math.rand()`          | Random float in [0, 1)                        |
-| `core.math.srand(seed)`     | Seed the RNG                                  |
-| `core.math.PI`              | 3.14159265...                                 |
-| `core.math.E`               | 2.71828182...                                 |
-| `core.math.INF`             | Positive infinity                             |
-| `core.math.NAN`             | Not-a-number                                  |
-
----
-
-### core.str
-
-| Function                              | Description                                   |
-|---------------------------------------|-----------------------------------------------|
-| `core.str.len(s)`                     | Character length                              |
-| `core.str.upper(s)`                   | Uppercase                                     |
-| `core.str.lower(s)`                   | Lowercase                                     |
-| `core.str.trim(s)`                    | Strip leading and trailing whitespace         |
-| `core.str.ltrim(s)`                   | Strip leading whitespace                      |
-| `core.str.rtrim(s)`                   | Strip trailing whitespace                     |
-| `core.str.substr(s, start)`           | Substring from start                          |
-| `core.str.substr(s, start, len)`      | Substring with length                         |
-| `core.str.index(s, needle)`           | Byte offset of needle, or -1                  |
-| `core.str.contains(s, needle)`        | 1 if needle found, else 0                     |
-| `core.str.starts_with(s, prefix)`     | 1 if s starts with prefix                     |
-| `core.str.ends_with(s, suffix)`       | 1 if s ends with suffix                       |
-| `core.str.replace(s, old, new)`       | Replace first occurrence                      |
-| `core.str.replace_all(s, old, new)`   | Replace all occurrences                       |
-| `core.str.repeat(s, n)`               | Repeat string n times                         |
-| `core.str.reverse(s)`                 | Reverse string                                |
-| `core.str.sprintf(fmt, ...)`          | Printf-style format                           |
-| `core.str.concat(a, b, ...)`          | Join any number of strings                    |
-| `core.str.comp(a, b)`                 | strcmp-style: -1, 0, or 1                     |
-
----
-
-### core.os
-
-| Function                        | Description                                     |
-|---------------------------------|-------------------------------------------------|
-| `core.os.exec(cmd)`             | Run shell command, return exit code             |
-| `core.os.exit(code)`            | Exit program with code                          |
-| `core.os.time()`                | Unix timestamp in seconds                       |
-| `core.os.env(name)`             | Get environment variable → str                  |
-| `core.os.read(path)`            | Read entire file → str                          |
-| `core.os.write(path, data)`     | Write str to file → 1 or 0                      |
-| `core.os.append(path, data)`    | Append str to file → 1 or 0                     |
-| `core.os.lines(path)`           | Read file → arr of lines (newlines stripped)    |
-| `core.os.run(cmd)`              | Run shell command → stdout as str               |
-| `core.os.run_lines(cmd)`        | Run shell command → arr of output lines         |
 
 ---
 
 ## Built-in Functions
 
-These are available globally without any module import.
-
-### Math
+These are always available without a module prefix:
 
 ```xf
-sin(x)    cos(x)    sqrt(x)    abs(x)    int(x)
-rand()              # float in [0, 1)
-srand(seed)         # seed the RNG
-```
+# Collections
+push(coll, val)         # append to arr / add to set
+pop(arr)                # remove and return last element
+shift(arr)              # remove and return first element
+unshift(arr, val)       # prepend to arr
+remove(coll, key)       # remove by index (arr) or key (map/set)
+has(coll, key)          # → 1 if key exists
+keys(map)               # → arr of string keys
+values(map)             # → arr of values
 
-### String
+# I/O
+read(path_or_cmd)       # read file or pipe → str
+lines(path_or_cmd)      # read file or pipe → arr of lines
+write(path, str)        # write str to file
+append(path, str)       # append str to file
+close(path)             # flush and close cached file handle
+flush()                 # flush all open output handles
+flush(path)             # flush one handle
 
-```xf
-len(s)                     # character length
-toupper(s)
-tolower(s)
-trim(s)
-substr(s, start)
-substr(s, start, len)
-index(s, needle)           # byte offset or -1
-sprintf(fmt, ...)          # printf-style formatting
-column(s, n)               # extract nth whitespace-delimited column
-split(s, sep)              # split string → arr
-sub(pat, rep, target)      # replace first regex match in target
-gsub(pat, rep, target)     # replace all regex matches in target
-match(s, /re/)             # test match; sets $match and $captures
-```
+# System
+system(cmd)             # run shell command, return exit code
+exit(code)              # exit with code
 
-### Collections
-
-```xf
-len(coll)                  # element count for arr, map, set, or str
-push(arr, val)             # append to arr, return arr
-pop(arr)                   # remove + return last element
-shift(arr)                 # remove + return first element
-unshift(arr, val)          # prepend to arr, return arr
-remove(coll, idx)          # remove element by index or map key
-has(coll, key)             # membership test → 1 or 0
-keys(map)                  # insertion-ordered key arr
-values(map)                # insertion-ordered value arr
-```
-
-### I/O & System
-
-```xf
-read(path)                 # read file → str
-lines(path)                # read file → arr of lines
-write(path, data)          # write file → 1 or 0
-append(path, data)         # append to file → 1 or 0
-system(cmd)                # run shell command, return exit code
+# Threading
+join(handle)            # block on thread handle, return result
 ```
 
 ---
 
-## REPL
+## Small Examples
 
-Start the REPL with no arguments:
-
-```
-xf
-```
-
-**Line editing**
-
-| Key              | Action                       |
-|------------------|------------------------------|
-| `←` / `→`       | Move cursor                  |
-| `↑` / `↓`       | Navigate history             |
-| `Home` / `End`   | Jump to line start/end       |
-| `Ctrl-A` / `Ctrl-E` | Same as Home/End          |
-| `Ctrl-K`         | Kill to end of line          |
-| `Ctrl-U`         | Kill to start of line        |
-| `Ctrl-W`         | Kill previous word           |
-| `Ctrl-C`         | Cancel current line          |
-| `Ctrl-D`         | Exit on empty line           |
-
-**Commands**
-
-| Command       | Description                              |
-|---------------|------------------------------------------|
-| `:help`       | Show commands                            |
-| `:state`      | Show all bindings and their values       |
-| `:type x`     | Show type and state of variable `x`      |
-| `:load f`     | Load `.xf` file into current session     |
-| `:reload`     | Reload the last loaded file              |
-| `:history`    | Show input history                       |
-| `:disasm`     | Show VM bytecode disassembly             |
-| `:clear`      | Reset environment                        |
-| `:quit`       | Exit                                     |
-
-History is persisted to `~/.xf_history` across sessions.
-
----
-
-## Examples
-
-### Hello World
+### 1 — FizzBuzz
 
 ```xf
-print "hello, world"
-```
-
-### Sum a Column in a CSV File
-
-```xf
-# xf -f sum.xf data.csv
-BEGIN { FS = "," }
-{ total += num($2) }
-END   { print "total:", total }
-```
-
-### Word Frequency Counter
-
-```xf
-{
-    for (word in split($0, " ")) {
-        freq[word]++
+BEGIN {
+    num i = 1
+    while (i <= 30) {
+        if (i % 15 == 0) { print "FizzBuzz" }
+        elif (i % 3 == 0) { print "Fizz" }
+        elif (i % 5 == 0) { print "Buzz" }
+        else { print i }
+        i += 1
     }
 }
-END {
-    keys(freq)[k] > printf "%d\t%s\n", freq[k], k
-}
 ```
 
-### Filter Lines by Regex
-
-```xf
-# xf -e '/error/ { print NR, $0 }' app.log
-/error/ { print NR, $0 }
-```
-
-### State-Aware Error Handling
-
-```xf
-num val = num("not-a-number")
-
-if val.state == NAV {
-    print "conversion failed, using default"
-    val = 0
-}
-
-# coalesce: fallback if NAV or NULL
-num safe = val ?? -1
-```
-
-### Shell Pipeline Integration
-
-```xf
-str out    = core.os.run("cut -d: -f1 /etc/passwd")
-str sorted = out | "sort"
-arr users  = split(sorted, "\n")
-users[u] > print u
-```
-
-### Read, Transform, Write a File
-
-```xf
-arr data = core.os.lines("/tmp/input.txt")
-str result = ""
-data[line] > result ..= core.str.upper(line) .. "\n"
-core.os.write("/tmp/output.txt", result)
-```
-
-### Map and Set Operations
-
-```xf
-map inv = {"apples": 5, "bananas": 3}
-inv["oranges"] = 8
-delete inv["bananas"]
-
-print has(inv, "apples")    # 1
-print keys(inv)             # [apples, oranges]
-print values(inv)           # [5, 8]
-
-set visited = {"home", "about"}
-print visited.has("home")   # 1
-```
-
-### Matrix Arithmetic
-
-```xf
-arr A = [[1,2],[3,4]]
-arr B = [[5,6],[7,8]]
-
-arr C = A .* B              # matrix multiply
-arr D = A .+ B              # element-wise add → [[6,8],[10,12]]
-arr E = A ./ [[1,2],[1,2]]  # element-wise divide
-```
-
-### Anonymous Functions
-
-```xf
-fn double = fn(num x) { return x * 2 }
-fn apply  = fn(fn f, num x) { return f(x) }
-
-print apply(double, 21)     # 42
-```
-
-### Timed Benchmark
-
-```xf
-num t0 = core.os.time()
-num i = 0
-i < 1000000 <> i++
-printf "elapsed: %gs\n", core.os.time() - t0
-```
-
-### outfmt Structured Output
-
-```xf
-# xf -f report.xf data.tsv
-BEGIN { FS = "\t"; outfmt "json" }
-NR > 1 {
-    print $1, $2, $3
-}
-```
-
-### Spawn Parallel Jobs
-
-```xf
-void fn crunch(str file) {
-    arr rows = lines(file)
-    num total = 0
-    rows[r] > total += num(r)
-    printf "%s: %g\n", file, total
-}
-
-spawn crunch("a.txt")
-spawn crunch("b.txt")
-spawn crunch("c.txt")
-join
-```
-
-```
-xf -j 4 -f script.xf
-```
-
-### Math Module
-
-```xf
-num angle = core.math.PI / 4
-num s = core.math.sin(angle)
-num c = core.math.cos(angle)
-printf "sin(π/4) = %.4f, cos(π/4) = %.4f\n", s, c
-
-num clamped = core.math.clamp(score, 0, 100)
-```
-
-### String Module
-
-```xf
-str raw = "  Hello, World!  "
-str clean = core.str.trim(raw)
-str lower = core.str.lower(clean)
-num found = core.str.starts_with(lower, "hello")   # 1
-
-str joined = core.str.concat("a", "-", "b", "-", "c")  # "a-b-c"
-num order  = core.str.comp("alpha", "beta")             # -1
-```
-
----
-
-## Classic Programs
-
-### FizzBuzz
-
-```xf
-num i = 1
-while i <= 100 {
-    if i % 15 == 0      { print "FizzBuzz" }
-    elif i % 3 == 0     { print "Fizz" }
-    elif i % 5 == 0     { print "Buzz" }
-    else                { print i }
-    i++
-}
-```
-
-Shorthand form using `<>`:
-
-```xf
-num i = 1
-i <= 100 <> {
-    str out = (i % 3 == 0 ? "Fizz" : "") .. (i % 5 == 0 ? "Buzz" : "")
-    print (out.len > 0 ? out : str(i))
-    i++
-}
-```
-
----
-
-### Bubble Sort
-
-```xf
-arr fn bubble_sort(arr a) {
-    num n = a.len
-    num i = 0
-    while i < n - 1 {
-        num j = 0
-        while j < n - i - 1 {
-            if a[j] > a[j+1] {
-                num tmp = a[j]
-                a[j]   = a[j+1]
-                a[j+1] = tmp
-            }
-            j++
-        }
-        i++
-    }
-    return a
-}
-
-arr data = [64, 34, 25, 12, 22, 11, 90]
-arr sorted = bubble_sort(data)
-sorted[x] > printf "%g ", x
-print ""
-# => 11 12 22 25 34 64 90
-```
-
----
-
-### Fibonacci
-
-Iterative:
+### 2 — Fibonacci
 
 ```xf
 num fn fib(num n) {
-    if n <= 1 { return n }
-    num a = 0
-    num b = 1
-    num i = 2
-    while i <= n {
-        num tmp = a + b
-        a = b
-        b = tmp
-        i++
-    }
-    return b
-}
-
-num i = 0
-i <= 10 <> { printf "fib(%g) = %g\n", i, fib(i); i++ }
-```
-
-Recursive:
-
-```xf
-num fn fib(num n) {
-    if n <= 1 { return n }
+    if (n <= 1) { return n }
     return fib(n - 1) + fib(n - 2)
 }
+
+BEGIN {
+    num i = 0
+    while (i <= 15) {
+        print i, fib(i)
+        i += 1
+    }
+}
 ```
 
----
-
-### Factorial
+### 3 — Factorial
 
 ```xf
 num fn factorial(num n) {
-    if n <= 1 { return 1 }
+    if (n <= 1) { return 1 }
     return n * factorial(n - 1)
 }
 
-num i = 0
-i <= 12 <> { printf "%g! = %g\n", i, factorial(i); i++ }
+BEGIN {
+    print factorial(0)    # 1
+    print factorial(5)    # 120
+    print factorial(10)   # 3628800
+}
+```
+
+### 4 — Reverse a String
+
+```xf
+str fn reverse_str(str s) {
+    str out = ""
+    num i = s.len - 1
+    while (i >= 0) {
+        out ..= core.str.substr(s, i, 1)
+        i -= 1
+    }
+    return out
+}
+
+BEGIN {
+    print reverse_str("hello")     # olleh
+    print reverse_str("racecar")   # racecar
+}
+```
+
+### 5 — Count Words in a Stream
+
+```xf
+# Run: xf -f wordcount.xf file.txt
+num words = 0
+{ words += NF }
+END { print "words:", words }
+```
+
+### 6 — State and Error Recovery
+
+```xf
+BEGIN {
+    num a = 1 / 0           # ERR
+    print a.state           # 1
+
+    num b = a + 10          # ERR propagates
+    print b.state           # 1
+
+    num c = b ?? 99         # recover
+    print c                 # 99
+    print c.state           # 0 (OK)
+}
+```
+
+### 7 — Map Word Frequency
+
+```xf
+map freq = {}
+
+{
+    for (w in core.str.split($0, " ")) {
+        if (!has(freq, w)) { freq[w] = 0 }
+        freq[w] += 1
+    }
+}
+
+END {
+    freq[word, count] > print word, count
+}
+```
+
+### 8 — Sorting an Array
+
+```xf
+BEGIN {
+    arr nums = [5, 2, 8, 1, 9, 3]
+
+    # Bubble sort
+    num n = nums.len
+    num i = 0
+    while (i < n - 1) {
+        num j = 0
+        while (j < n - i - 1) {
+            if (nums[j] > nums[j + 1]) {
+                num tmp = nums[j]
+                nums[j] = nums[j + 1]
+                nums[j + 1] = tmp
+            }
+            j += 1
+        }
+        i += 1
+    }
+    nums[x] > print x
+}
+```
+
+### 9 — Regex Extraction
+
+```xf
+BEGIN {
+    str text = "Call us at 555-1234 or 800-9876"
+    arr matches = core.regex.search(text, "[0-9]{3}-[0-9]{4}")
+    matches[m] > print m["match"]
+    # 555-1234
+    # 800-9876
+}
+```
+
+### 10 — JSON Round-Trip
+
+```xf
+BEGIN {
+    map data = {"name": "alice", "scores": [90, 85, 92]}
+    str json = core.format.json(data)
+    print json
+    # {"name":"alice","scores":[90,85,92]}
+
+    map back = core.format.from_json(json)
+    print back["name"]        # alice
+    print back["scores"][0]   # 90
+}
+```
+
+### 11 — String Padding / Table
+
+```xf
+BEGIN {
+    arr rows = [
+        {"name": "Alice",   "score": "95"},
+        {"name": "Bob",     "score": "82"},
+        {"name": "Charlie", "score": "78"}
+    ]
+    print core.format.table(rows)
+}
+```
+
+### 12 — Tuple Destructuring
+
+```xf
+tuple fn min_max(arr a) {
+    num lo = a[0]
+    num hi = a[0]
+    a[x] > {
+        if (x < lo) { lo = x }
+        if (x > hi) { hi = x }
+    }
+    return (lo, hi)
+}
+
+BEGIN {
+    num lo
+    num hi
+    lo, hi = min_max([3, 1, 4, 1, 5, 9, 2, 6])
+    print "min:", lo    # 1
+    print "max:", hi    # 9
+}
+```
+
+### 13 — Import a Library
+
+```xf
+# mathlib.xf
+num fn clamp(num val, num lo, num hi) {
+    if (val < lo) { return lo }
+    if (val > hi) { return hi }
+    return val
+}
+num PI = 3.14159265358979
+```
+
+```xf
+# main.xf
+import "mathlib.xf"
+
+BEGIN {
+    print clamp(150, 0, 100)     # 100
+    print PI * 5 * 5             # 78.539...
+}
+```
+
+### 14 — Walrus Operator
+
+```xf
+str fn find_first(arr items, str prefix) {
+    items[x] > {
+        if ((m := core.regex.match(x, "^" .. prefix)) != NAV) {
+            return m["match"]
+        }
+    }
+    return ""
+}
+
+BEGIN {
+    arr words = ["apple", "banana", "avocado", "cherry"]
+    print find_first(words, "a")    # apple
+}
+```
+
+### 15 — Parallel Sum
+
+```xf
+num fn sum_range(num from, num to) {
+    num s = 0
+    num i = from
+    while (i <= to) { s += i; i += 1 }
+    return s
+}
+
+BEGIN {
+    num t1 = spawn sum_range(1, 500000)
+    num t2 = spawn sum_range(500001, 1000000)
+    num r1 = join(t1)
+    num r2 = join(t2)
+    print r1 + r2    # 500000500000
+}
+```
+
+### 16 — Null Coalescing Chain
+
+```xf
+BEGIN {
+    num a               # UNDEF
+    num b = 1 / 0       # ERR
+    num c = 42
+
+    print (a ?? b ?? c)    # 42
+    print (a ?? 0)         # 0
+    print (b ?? -1)        # -1
+}
+```
+
+### 17 — CSV Header Processing
+
+```xf
+FS = ","
+
+arr headers = []
+
+NR == 1 {
+    headers = core.str.split($0, ",")
+    next
+}
+
+NR > 1 {
+    map row = {}
+    num i = 0
+    while (i < headers.len) {
+        row[headers[i]] = $(i + 1)
+        i += 1
+    }
+    print core.format.json(row)
+}
+```
+
+### 18 — Set Operations
+
+```xf
+BEGIN {
+    set a = {"apple", "banana", "cherry"}
+    set b = {"banana", "cherry", "date"}
+
+    # Intersection
+    set inter = {}
+    a[fruit] > {
+        if (has(b, fruit)) { push(inter, fruit) }
+    }
+    inter[x] > print "both:", x
+
+    # Difference
+    set diff = {}
+    a[fruit] > {
+        if (!has(b, fruit)) { push(diff, fruit) }
+    }
+    diff[x] > print "only a:", x
+}
+```
+
+### 19 — Running Statistics
+
+```xf
+FS = ","
+num n = 0
+num sum = 0
+num sumsq = 0
+
+NR > 1 {
+    num val = num($2)
+    if (val.state == 0) {
+        n += 1
+        sum += val
+        sumsq += val * val
+    }
+}
+
+END {
+    num avg = sum / n
+    num variance = (sumsq / n) - (avg * avg)
+    num stddev = core.math.sqrt(variance)
+    print "n:", n
+    print "mean:", core.format.fixed(avg, 4)
+    print "stddev:", core.format.fixed(stddev, 4)
+}
+```
+
+### 20 — Pattern-Action with Multiple Rules
+
+```xf
+FS = ","
+
+num errors = 0
+num warnings = 0
+num ok_count = 0
+
+$3 ~ /ERROR/   { errors += 1;   print "ERR:", $2 }
+$3 ~ /WARN/    { warnings += 1; print "WRN:", $2 }
+$3 ~ /OK/      { ok_count += 1 }
+
+END {
+    print "Errors:", errors
+    print "Warnings:", warnings
+    print "OK:", ok_count
+}
 ```
 
 ---
+
+## Algorithms
 
 ### Binary Search
 
@@ -1011,220 +1108,619 @@ i <= 12 <> { printf "%g! = %g\n", i, factorial(i); i++ }
 num fn binary_search(arr a, num target) {
     num lo = 0
     num hi = a.len - 1
-    while lo <= hi {
-        num mid = int((lo + hi) / 2)
-        if a[mid] == target { return mid }
-        elif a[mid] < target { lo = mid + 1 }
-        else                 { hi = mid - 1 }
+    while (lo <= hi) {
+        num mid = core.math.int((lo + hi) / 2)
+        if (a[mid] == target) { return mid }
+        elif (a[mid] < target) { lo = mid + 1 }
+        else { hi = mid - 1 }
     }
     return -1
 }
 
-arr data   = [2, 5, 8, 12, 16, 23, 38, 45, 72, 91]
-num idx    = binary_search(data, 23)
-printf "found 23 at index %g\n", idx    # => 5
-printf "found 99 at index %g\n", binary_search(data, 99)  # => -1
+BEGIN {
+    arr sorted = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+    print binary_search(sorted, 7)     # 3
+    print binary_search(sorted, 10)    # -1
+    print binary_search(sorted, 1)     # 0
+    print binary_search(sorted, 19)    # 9
+}
 ```
 
----
-
-### Caesar Cipher
+### Quicksort
 
 ```xf
-str fn caesar(str text, num shift) {
-    shift = int(shift % 26)
-    arr chars = split(text, "")
-    str out = ""
-    chars[c] > {
-        num code = num(c)
-        if code >= 65 && code <= 90 {
-            out ..= str((code - 65 + shift) % 26 + 65)
-        } elif code >= 97 && code <= 122 {
-            out ..= str((code - 97 + shift) % 26 + 97)
+arr fn quicksort(arr a) {
+    if (a.len <= 1) { return a }
+    num pivot = a[0]
+    arr less = []
+    arr greater = []
+    num i = 1
+    while (i < a.len) {
+        if (a[i] <= pivot) { push(less, a[i]) }
+        else               { push(greater, a[i]) }
+        i += 1
+    }
+    arr sorted_less = quicksort(less)
+    arr sorted_greater = quicksort(greater)
+    arr result = []
+    sorted_less[x]    > push(result, x)
+    push(result, pivot)
+    sorted_greater[x] > push(result, x)
+    return result
+}
+
+BEGIN {
+    arr data = [3, 6, 8, 10, 1, 2, 1]
+    arr sorted = quicksort(data)
+    sorted[x] > print x    # 1 1 2 3 6 8 10
+}
+```
+
+### Merge Sort
+
+```xf
+arr fn merge(arr left, arr right) {
+    arr result = []
+    num i = 0
+    num j = 0
+    while (i < left.len && j < right.len) {
+        if (left[i] <= right[j]) {
+            push(result, left[i]); i += 1
         } else {
-            out ..= c
+            push(result, right[j]); j += 1
         }
     }
-    return out
+    while (i < left.len)  { push(result, left[i]);  i += 1 }
+    while (j < right.len) { push(result, right[j]); j += 1 }
+    return result
 }
 
-str msg     = "Hello, World!"
-str encoded = caesar(msg, 13)
-str decoded = caesar(encoded, 13)
-print encoded    # => Uryyb, Jbeyq!
-print decoded    # => Hello, World!
-```
+arr fn mergesort(arr a) {
+    if (a.len <= 1) { return a }
+    num mid = core.math.int(a.len / 2)
+    arr left = []
+    arr right = []
+    num i = 0
+    while (i < mid)      { push(left,  a[i]); i += 1 }
+    while (i < a.len)    { push(right, a[i]); i += 1 }
+    return merge(mergesort(left), mergesort(right))
+}
 
----
-
-### Word Count (streaming)
-
-Count words, lines, and characters from stdin or a file:
-
-```xf
-# xf -f wc.xf file.txt
 BEGIN {
-    num words = 0
-    num chars = 0
-}
-
-{
-    chars += len($0) + 1       # +1 for stripped newline
-    words += NF
-}
-
-END {
-    printf "%6g %6g %6g\n", NR, words, chars
+    arr sorted = mergesort([5, 3, 8, 1, 9, 2, 7])
+    sorted[x] > print x    # 1 2 3 5 7 8 9
 }
 ```
 
----
-
-### Palindrome Check
+### Sieve of Eratosthenes
 
 ```xf
-num fn is_palindrome(str s) {
-    s = core.str.lower(core.str.trim(s))
-    num l = 0
-    num r = s.len - 1
-    while l < r {
-        if substr(s, l, 1) != substr(s, r, 1) { return 0 }
-        l++
-        r--
+arr fn sieve(num limit) {
+    arr is_prime = []
+    num i = 0
+    while (i <= limit) { push(is_prime, 1); i += 1 }
+    is_prime[0] = 0
+    is_prime[1] = 0
+    num p = 2
+    while (p * p <= limit) {
+        if (is_prime[p]) {
+            num mult = p * p
+            while (mult <= limit) {
+                is_prime[mult] = 0
+                mult += p
+            }
+        }
+        p += 1
     }
-    return 1
+    arr primes = []
+    i = 2
+    while (i <= limit) {
+        if (is_prime[i]) { push(primes, i) }
+        i += 1
+    }
+    return primes
 }
 
-arr words = ["racecar", "hello", "level", "world", "madam"]
-words[w] > printf "%-10s %s\n", w, (is_palindrome(w) ? "palindrome" : "not palindrome")
+BEGIN {
+    arr primes = sieve(50)
+    primes[p] > print p
+    # 2 3 5 7 11 13 17 19 23 29 31 37 41 43 47
+}
+```
+
+### GCD and LCM
+
+```xf
+num fn gcd(num a, num b) {
+    while (b != 0) {
+        num t = b
+        b = a % b
+        a = t
+    }
+    return a
+}
+
+num fn lcm(num a, num b) {
+    return (a / gcd(a, b)) * b
+}
+
+BEGIN {
+    print gcd(48, 18)       # 6
+    print gcd(100, 75)      # 25
+    print lcm(4, 6)         # 12
+    print lcm(12, 18)       # 36
+}
+```
+
+### Tower of Hanoi
+
+```xf
+void fn hanoi(num n, str from, str to, str aux) {
+    if (n == 0) { return }
+    hanoi(n - 1, from, aux, to)
+    print "Move disk", n, "from", from, "to", to
+    hanoi(n - 1, aux, to, from)
+}
+
+BEGIN {
+    hanoi(3, "A", "C", "B")
+}
+```
+
+### Matrix Multiplication
+
+```xf
+# Represent matrix as arr-of-arr
+arr fn mat_mul(arr A, arr B, num n) {
+    arr C = []
+    num i = 0
+    while (i < n) {
+        arr row = []
+        num j = 0
+        while (j < n) { push(row, 0); j += 1 }
+        push(C, row)
+        i += 1
+    }
+    i = 0
+    while (i < n) {
+        num j = 0
+        while (j < n) {
+            num k = 0
+            while (k < n) {
+                C[i][j] += A[i][k] * B[k][j]
+                k += 1
+            }
+            j += 1
+        }
+        i += 1
+    }
+    return C
+}
+
+BEGIN {
+    arr A = [[1, 2], [3, 4]]
+    arr B = [[5, 6], [7, 8]]
+    arr C = mat_mul(A, B, 2)
+    print C[0][0], C[0][1]    # 19 22
+    print C[1][0], C[1][1]    # 43 50
+}
 ```
 
 ---
 
-### CSV Parser and Aggregator
+## Larger Examples
 
-Parse a CSV file, group by a column, and sum another:
+### 1 — CSV Analytics Pipeline
+
+Compute per-group statistics from a CSV file.
 
 ```xf
-# xf -f agg.xf sales.csv
-# Input columns: date, region, amount
+# analytics.xf
+# Input: CSV with columns id,name,department,salary
+# Usage: xf -f analytics.xf employees.csv
 
-BEGIN {
-    FS = ","
-}
+FS = ","
+
+map dept_total = {}
+map dept_count = {}
+num grand_total = 0
+num grand_n = 0
+
+NR == 1 { next }   # skip header
 
 NR > 1 {
-    totals[$2] += num($3)
+    str dept = $3
+    num salary = num($4)
+    if (salary.state != 0) { next }
+
+    if (!has(dept_total, dept)) {
+        dept_total[dept] = 0
+        dept_count[dept] = 0
+    }
+
+    dept_total[dept] += salary
+    dept_count[dept] += 1
+    grand_total += salary
+    grand_n += 1
 }
 
 END {
-    print "Region\tTotal"
-    keys(totals)[region] > printf "%-12s %.2f\n", region, totals[region]
+    print "Department Averages"
+    print "-------------------"
+    dept_total[dept, total] > {
+        num avg = total / dept_count[dept]
+        print dept, core.format.fixed(avg, 2)
+    }
+    print ""
+    print "Company Average:", core.format.fixed(grand_total / grand_n, 2)
 }
 ```
 
 ---
 
-### Top-N Lines by Field
+### 2 — Parallel Word Count
 
-Print the 5 lines with the highest value in column 2:
+Count word frequencies across a large file using threads.
 
 ```xf
-# xf -f topn.xf data.tsv
-BEGIN { FS = "\t" }
+# parallel_wc.xf
+BEGIN {
+    str path = ARGV[1] ?? "input.txt"
+    arr file_lines = lines(path)
+    num n = file_lines.len
+    num chunk = core.math.int(n / 4)
+
+    num fn count_chunk(arr chunk_lines) {
+        map freq = {}
+        chunk_lines[line] > {
+            arr words = core.str.split(line, " ")
+            words[w] > {
+                str word = core.str.lower(core.str.trim(w))
+                if (word.len > 0) {
+                    if (!has(freq, word)) { freq[word] = 0 }
+                    freq[word] += 1
+                }
+            }
+        }
+        return core.format.json(freq)
+    }
+
+    # Split file into 4 chunks and count in parallel
+    arr t = []
+    num i = 0
+    while (i < 4) {
+        num from = i * chunk
+        num to   = (i == 3) ? n : from + chunk
+        arr slice = []
+        num j = from
+        while (j < to) { push(slice, file_lines[j]); j += 1 }
+        push(t, spawn count_chunk(slice))
+        i += 1
+    }
+
+    # Merge results
+    map total = {}
+    t[tid] > {
+        map partial = core.format.from_json(join(tid))
+        partial[word, count] > {
+            if (!has(total, word)) { total[word] = 0 }
+            total[word] += count
+        }
+    }
+
+    # Print top 20 words
+    arr pairs = []
+    total[w, c] > push(pairs, (c, w))
+    arr sorted = core.ds.sort(pairs, 0, "desc")
+    num k = 0
+    while (k < 20 && k < sorted.len) {
+        print sorted[k][1], sorted[k][0]
+        k += 1
+    }
+}
+```
+
+---
+
+### 3 — Log Analyzer
+
+Parse nginx/apache access logs, report error rates and top paths.
+
+```xf
+# log_analyzer.xf
+# Input: Combined log format
+# 127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /apache_pb.gif HTTP/1.0" 200 2326
+
+map status_count = {}
+map path_count = {}
+num total = 0
 
 {
-    push(rows, $0)
-    push(vals, num($2))
+    # Extract status code and path from log line
+    map m = core.regex.match($0, "\"(GET|POST|PUT|DELETE) ([^ ]+) HTTP/[0-9.]+ ([0-9]{3})")
+    if (m.state != 0) { next }
+
+    arr groups = m["groups"]
+    str method = groups[0]
+    str path   = groups[1]
+    str status = groups[2]
+
+    total += 1
+    if (!has(status_count, status)) { status_count[status] = 0 }
+    status_count[status] += 1
+
+    if (!has(path_count, path)) { path_count[path] = 0 }
+    path_count[path] += 1
 }
 
 END {
-    # bubble sort parallel arrays descending
-    num n = rows.len
+    print "Total requests:", total
+    print ""
+    print "Status codes:"
+    status_count[code, n] > {
+        print " ", code, n, core.format.percent(n / total, 1)
+    }
+
+    print ""
+    print "Top 10 paths:"
+    arr by_hits = []
+    path_count[p, c] > push(by_hits, {"path": p, "hits": c})
+    arr sorted = core.ds.sort(by_hits, "hits", "desc")
     num i = 0
-    while i < n - 1 {
-        num j = 0
-        while j < n - i - 1 {
-            if vals[j] < vals[j+1] {
-                num  tv = vals[j];  vals[j] = vals[j+1];  vals[j+1] = tv
-                str  tr = rows[j];  rows[j] = rows[j+1];  rows[j+1] = tr
-            }
-            j++
+    while (i < 10 && i < sorted.len) {
+        print " ", sorted[i]["hits"], sorted[i]["path"]
+        i += 1
+    }
+}
+```
+
+---
+
+### 4 — Simple Key-Value Store
+
+An in-memory KV store exposed through a REPL-like interface.
+
+```xf
+# kv_store.xf
+BEGIN {
+    map store = {}
+    map ttl   = {}
+    num now   = core.os.time()
+
+    void fn kv_set(str key, str val) {
+        store[key] = val
+        print "OK"
+    }
+
+    str fn kv_get(str key) {
+        if (!has(store, key)) { return "(nil)" }
+        return store[key]
+    }
+
+    void fn kv_del(str key) {
+        if (has(store, key)) {
+            delete store[key]
+            print "1"
+        } else {
+            print "0"
         }
-        i++
     }
-    num k = 0
-    k < 5 <> { print rows[k]; k++ }
-}
-```
 
----
+    void fn kv_keys() {
+        store[k, v] > print k
+    }
 
-### State-Safe Division
-
-Demonstrates how `NAV` propagation short-circuits a chain of operations:
-
-```xf
-num fn safe_div(num a, num b) {
-    if b == 0 { return num(NAV) }
-    return a / b
-}
-
-arr pairs = [[10, 2], [9, 0], [8, 4], [6, 0], [15, 3]]
-
-pairs[p] > {
-    num result = safe_div(p[0], p[1])
-    if result.state == OK {
-        printf "%g / %g = %g\n", p[0], p[1], result
-    } else {
-        printf "%g / %g = [NAV — division by zero]\n", p[0], p[1]
+    arr cmds = lines("commands.txt")
+    cmds[line] > {
+        arr parts = core.str.split(core.str.trim(line), " ")
+        str cmd = parts[0]
+        if (cmd == "SET") {
+            kv_set(parts[1], parts[2])
+        } elif (cmd == "GET") {
+            print kv_get(parts[1])
+        } elif (cmd == "DEL") {
+            kv_del(parts[1])
+        } elif (cmd == "KEYS") {
+            kv_keys()
+        }
     }
 }
 ```
 
 ---
 
-### Generate and Filter Primes
+### 5 — Parallel Statistics on CSV
+
+Compute mean and standard deviation in parallel across a large CSV.
 
 ```xf
-num fn is_prime(num n) {
-    if n < 2 { return 0 }
-    num i = 2
-    while i * i <= n {
-        if n % i == 0 { return 0 }
-        i++
+# parallel_stats.xf
+FS = ","
+
+str fn compute_stats(arr rows) {
+    num n = 0
+    num sum = 0
+    num sumsq = 0
+    rows[row] > {
+        num val = num(row[2])
+        if (val.state == 0) {
+            n += 1
+            sum += val
+            sumsq += val * val
+        }
     }
-    return 1
+    if (n == 0) { return core.format.json({"n": 0}) }
+    num avg = sum / n
+    num variance = (sumsq / n) - (avg * avg)
+    num stddev = core.math.sqrt(variance)
+    return core.format.json({
+        "n":      n,
+        "sum":    sum,
+        "sumsq":  sumsq,
+        "mean":   avg,
+        "stddev": stddev
+    })
 }
 
-arr primes = []
-num n = 2
-n <= 100 <> {
-    if is_prime(n) { push(primes, n) }
-    n++
+arr all_rows = []
+
+NR > 1 {
+    push(all_rows, [$1, $2, $3])
 }
 
-printf "primes up to 100 (%g found):\n", primes.len
-primes[p] > printf "%g ", p
-print ""
+END {
+    num chunk_size = core.math.int(all_rows.len / 4)
+    arr tids = []
+    num i = 0
+    while (i < 4) {
+        arr chunk = []
+        num from = i * chunk_size
+        num to   = i == 3 ? all_rows.len : from + chunk_size
+        num j = from
+        while (j < to) { push(chunk, all_rows[j]); j += 1 }
+        num tid = spawn compute_stats(chunk)
+        push(tids, tid)
+        i += 1
+    }
+
+    num total_n = 0
+    num total_sum = 0
+    num total_sumsq = 0
+
+    tids[tid] > {
+        map r = core.format.from_json(join(tid))
+        if (r["n"] > 0) {
+            total_n     += r["n"]
+            total_sum   += r["sum"]
+            total_sumsq += r["sumsq"]
+        }
+    }
+
+    num mean = total_sum / total_n
+    num variance = (total_sumsq / total_n) - (mean * mean)
+    num stddev = core.math.sqrt(variance)
+
+    print "n:     ", total_n
+    print "mean:  ", core.format.fixed(mean, 6)
+    print "stddev:", core.format.fixed(stddev, 6)
+}
 ```
 
 ---
 
-### Parallel File Processing
+### 6 — Sentiment Analyzer (Stream + Aggregation)
 
-Hash each file independently, then collect results:
+Classify rows from a dataset by rating and compute per-group metrics — the same workload used in the IMDB validation run.
 
 ```xf
-# xf -j 4 -f hash.xf
+# sentiment.xf
+# Input CSV: id,text,label,rating
+FS  = ","
+OFS = "|"
 
-arr files = core.os.run_lines("find /var/log -name '*.log' -maxdepth 1")
+map label_count = {}
+map label_score = {}
+num total = 0
 
-void fn checksum(str path) {
-    str sum = core.os.run("md5sum " .. path)
-    print sum
+NR == 1 { next }    # header
+
+NR > 1 {
+    str label  = $3
+    num rating = num($4)
+
+    if (rating.state != 0) { next }
+
+    total += 1
+    if (!has(label_count, label)) {
+        label_count[label] = 0
+        label_score[label] = 0
+    }
+    label_count[label] += 1
+    label_score[label] += rating
 }
 
-files[f] > spawn checksum(f)
-join
+END {
+    print "label", "count", "avg_rating"
+    label_count[lbl, cnt] > {
+        num avg = label_score[lbl] / cnt
+        print lbl, cnt, core.format.fixed(avg, 4)
+    }
+    print "total records:", total
+}
 ```
+
+---
+
+### 7 — Data Transformation Pipeline
+
+Read JSON, transform records, output CSV.
+
+```xf
+# transform.xf
+BEGIN {
+    str raw = read("data.json")
+    arr records = core.format.from_json(raw)
+
+    # Normalize and tag each record
+    arr out = []
+    records[rec] > {
+        str name  = core.str.upper(core.str.trim(rec["name"] ?? ""))
+        num score = num(rec["score"] ?? 0)
+        str grade = score >= 90 ? "A"
+                  : score >= 80 ? "B"
+                  : score >= 70 ? "C"
+                  : "F"
+        push(out, {"name": name, "score": score, "grade": grade})
+    }
+
+    # Sort by score descending
+    arr sorted = core.ds.sort(out, "score", "desc")
+
+    # Print as CSV
+    print "name,score,grade"
+    sorted[row] > {
+        print core.format.csv_row([row["name"], str(row["score"]), row["grade"]])
+    }
+}
+```
+
+---
+
+## Embedding XF in C
+
+XF can be embedded via `libxf`:
+
+```c
+#include "xf.h"
+
+xf_State *xf = xf_newstate();
+xf_set_format(xf, XF_FMT_CSV, XF_FMT_TEXT);
+xf_set_max_jobs(xf, 8);
+
+xf_load_string(xf, "BEGIN { print \"hello\" }");
+xf_feed_file(xf, stdin);
+xf_run_end(xf);
+
+if (xf_had_error(xf)) {
+    fprintf(stderr, "Error: %s\n", xf_last_error(xf));
+}
+
+xf_close(xf);
+```
+
+Key API functions:
+
+| Function | Description |
+|----------|-------------|
+| `xf_newstate()` | Allocate a new XF interpreter state |
+| `xf_close(xf)` | Free all resources |
+| `xf_load_string(xf, src)` | Load script source |
+| `xf_feed_line(xf, line, len)` | Feed one record |
+| `xf_feed_file(xf, fp)` | Feed from a FILE* |
+| `xf_run_end(xf)` | Trigger END block |
+| `xf_set_format(xf, in, out)` | Set input/output format |
+| `xf_set_max_jobs(xf, n)` | Set thread pool size |
+| `xf_had_error(xf)` | Check for errors |
+| `xf_last_error(xf)` | Get last error message |
+| `xf_clear_error(xf)` | Clear error state |
+

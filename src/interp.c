@@ -695,6 +695,31 @@ static bool lvalue_store(Interp *it, Expr *target, xf_Value val) {
                      XF_TYPE_NAMES[container.type]);
         return false;
     }
+    /* ── tuple destructuring: (a, b) = expr ──────────────────────────
+     * RHS is a tuple  → unpack element-by-element.
+     * RHS is a scalar → broadcast the same value to every target.   */
+    if (target->kind == EXPR_TUPLE_LIT) {
+        size_t n = target->as.tuple_lit.count;
+        bool is_tuple_rhs = (val.state == XF_STATE_OK &&
+                             val.type  == XF_TYPE_TUPLE &&
+                             val.data.tuple);
+        size_t have = is_tuple_rhs ? xf_tuple_len(val.data.tuple) : 0;
+        for (size_t i = 0; i < n; i++) {
+            xf_Value elem;
+            if (is_tuple_rhs) {
+                elem = (i < have)
+                    ? xf_value_retain(xf_tuple_get(val.data.tuple, i))
+                    : xf_val_nav(XF_TYPE_VOID);
+            } else {
+                elem = xf_value_retain(val);   /* broadcast scalar */
+            }
+            bool ok = lvalue_store(it, target->as.tuple_lit.items[i], elem);
+            xf_value_release(elem);
+            if (!ok) return false;
+        }
+        return true;
+    }
+
     interp_error(it, target->loc, "invalid assignment target");
     return false;
 }
@@ -912,6 +937,27 @@ xf_Value interp_call_builtin(Interp *it, const char *name,
         int code = (argc>0) ? (int)xf_coerce_num(args[0]).data.num : 0;
         exit(code);
     }
+    if (strcmp(name, "join") == 0 && argc == 1) {
+    xf_Value handle = args[0];
+    xf_Value join_result = xf_val_null();
+    if (handle.state == XF_STATE_OK && handle.type == XF_TYPE_NUM) {
+        uint32_t hid = (uint32_t)handle.data.num;
+        pthread_mutex_lock(&g_spawn_mu);
+        SpawnCtx *found = NULL; size_t found_idx = 0;
+        for (size_t i = 0; i < g_spawn_count; i++) {
+            if (g_spawn[i].id == hid) { found = &g_spawn[i]; found_idx = i; break; }
+        }
+        pthread_t tid = found ? found->tid : 0;
+        pthread_mutex_unlock(&g_spawn_mu);
+        if (tid) {
+            pthread_join(tid, NULL);
+            pthread_mutex_lock(&g_spawn_mu);
+            if (found) { join_result = found->result; g_spawn[found_idx] = g_spawn[--g_spawn_count]; }
+            pthread_mutex_unlock(&g_spawn_mu);
+        }
+    }
+    return join_result;
+}
     if (strcmp(name,"push")==0 && argc==2) {
         if (args[0].state==XF_STATE_OK&&args[0].type==XF_TYPE_ARR&&args[0].data.arr)
             xf_arr_push(args[0].data.arr, args[1]);

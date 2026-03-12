@@ -1,5 +1,5 @@
 BEGIN {
-    str path = "tests/data_1k.csv"
+    str path = "tests/data_10m.csv"
     arr lines = core.os.lines(path)
     num total = core.generics.length(lines)
     print "Lines read : " .. total
@@ -78,7 +78,7 @@ BEGIN {
         exit(1)
     }
 
-    arr chunks  = core.process.split(dataset, 10)
+    arr chunks  = core.process.split(dataset, 100000)
     num nchunks = core.generics.length(chunks)
     print "Chunks     : " .. nchunks
 

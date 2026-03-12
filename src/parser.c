@@ -88,9 +88,9 @@ static void synchronize(Parser *p) {
         switch (cur_kind(p)) {
             case TK_KW_FN:
             case TK_KW_NUM: case TK_KW_STR: case TK_KW_MAP:
-            case TK_KW_SET: case TK_KW_ARR: case TK_KW_TUPLE: 
-            case TK_KW_VOID: case TK_KW_IF:    case TK_KW_WHILE: 
-            case TK_KW_FOR: case TK_KW_BEGIN: case TK_KW_END:   
+            case TK_KW_SET: case TK_KW_ARR: case TK_KW_TUPLE:
+            case TK_KW_VOID: case TK_KW_IF:    case TK_KW_WHILE:
+            case TK_KW_FOR: case TK_KW_BEGIN: case TK_KW_END:
             case TK_KW_RETURN: case TK_KW_PRINT: case TK_LBRACE:
                 return;
             default: advance(p); break;
@@ -424,6 +424,20 @@ if (t->kind == TK_LPAREN) {
         expect(p, TK_RPAREN, "expected ')' after cast expression");
         return ast_cast(to_type, operand, loc);
     }
+
+    /* FIX: allow join(...) as a builtin call expression.
+     * When the parser sees TK_KW_JOIN followed by '(', treat 'join'
+     * as an ordinary identifier so parse_postfix can build a call node.
+     * The statement path in parse_stmt / parse_rule only fires when
+     * join is NOT followed by '(', so the statement form is unchanged. */
+    if (t->kind == TK_KW_JOIN) {
+        advance(p);
+        xf_Str *name = xf_str_from_cstr("join");
+        Expr *e = ast_ident(name, loc);
+        xf_str_release(name);
+        return e;
+    }
+
     parser_error(p, "expected expression");
     advance(p);
     return ast_num(0, loc);
@@ -888,7 +902,9 @@ Stmt *parse_spawn(Parser *p) {
     return ast_spawn(call, loc);
 }
 
-/* join handle ; */
+/* join handle ;
+ * Only called when join is NOT followed by '(' — in that case
+ * it is parsed as an expression (builtin call) instead. */
 Stmt *parse_join(Parser *p) {
     Loc loc = cur(p)->loc;
     advance(p);
@@ -1012,7 +1028,11 @@ Stmt *parse_stmt(Parser *p) {
     if (check(p, TK_KW_PRINTF))  return parse_printf(p);
     if (check(p, TK_KW_OUTFMT))  return parse_outfmt(p);
     if (check(p, TK_KW_SPAWN))  return parse_spawn(p);
-    if (check(p, TK_KW_JOIN))   return parse_join(p);
+    /* FIX: only treat 'join' as a statement when NOT followed by '('.
+     * When followed by '(', fall through to expr-stmt so it parses as
+     * a builtin call expression: r = join(tid) */
+    if (check(p, TK_KW_JOIN) && peek_at(p, 1)->kind != TK_LPAREN)
+        return parse_join(p);
     if (check(p, TK_KW_IMPORT)) return parse_import(p);
 
     if (check(p, TK_KW_NEXT)) {
@@ -1152,7 +1172,9 @@ TopLevel *parse_rule(Parser *p) {
     }
 
     /* statement-starting keywords that can never be a pattern expression —
-       route directly through parse_stmt and wrap as TOP_STMT */
+       route directly through parse_stmt and wrap as TOP_STMT.
+       FIX: TK_KW_JOIN only routes as a statement when NOT followed by '(';
+       otherwise it falls through to expression parsing as a builtin call. */
     if (is_type_kw(p)              ||
         check(p, TK_KW_IF)        ||
         check(p, TK_KW_WHILE)     ||
@@ -1162,7 +1184,7 @@ TopLevel *parse_rule(Parser *p) {
         check(p, TK_KW_OUTFMT)    ||
         check(p, TK_KW_RETURN)    ||
         check(p, TK_KW_SPAWN)     ||
-        check(p, TK_KW_JOIN)      ||
+        (check(p, TK_KW_JOIN) && peek_at(p, 1)->kind != TK_LPAREN) ||
         check(p, TK_KW_NEXT)      ||
         check(p, TK_KW_EXIT)      ||
         check(p, TK_KW_BREAK)     ||
