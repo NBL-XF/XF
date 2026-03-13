@@ -89,7 +89,7 @@ static void synchronize(Parser *p) {
             case TK_KW_FN:
             case TK_KW_NUM: case TK_KW_STR: case TK_KW_MAP:
             case TK_KW_SET: case TK_KW_ARR: case TK_KW_TUPLE:
-            case TK_KW_VOID: case TK_KW_IF:    case TK_KW_WHILE:
+            case TK_KW_VOID: case TK_KW_BOOL: case TK_KW_IF: case TK_KW_WHILE:
             case TK_KW_FOR: case TK_KW_BEGIN: case TK_KW_END:
             case TK_KW_RETURN: case TK_KW_PRINT: case TK_LBRACE:
                 return;
@@ -158,7 +158,7 @@ static bool is_type_kw(Parser *p) {
     switch (cur_kind(p)) {
         case TK_KW_NUM: case TK_KW_STR: case TK_KW_MAP:
         case TK_KW_SET: case TK_KW_ARR: case TK_KW_TUPLE:
-        case TK_KW_FN: case TK_KW_VOID: return true;
+        case TK_KW_FN:  case TK_KW_VOID: case TK_KW_BOOL: return true;
         default: return false;
     }
 }
@@ -177,6 +177,7 @@ uint8_t parse_type(Parser *p) {
         case TK_KW_ARR:  advance(p); return XF_TYPE_ARR;
         case TK_KW_TUPLE: advance(p); return XF_TYPE_TUPLE;
         case TK_KW_FN:   advance(p); return XF_TYPE_FN;
+        case TK_KW_BOOL: advance(p); return XF_TYPE_BOOL;
         case TK_KW_VOID: advance(p); return XF_TYPE_VOID;
         default:
             parser_error(p, "expected type keyword");
@@ -438,6 +439,16 @@ if (t->kind == TK_LPAREN) {
         return e;
     }
 
+    /* state literals: OK ERR NULL NAV VOID UNDEF TRUE FALSE */
+    if (t->kind == TK_KW_OK)     { advance(p); return ast_state_lit(XF_STATE_OK,    loc); }
+    if (t->kind == TK_KW_ERR)    { advance(p); return ast_state_lit(XF_STATE_ERR,   loc); }
+    if (t->kind == TK_KW_NULL)   { advance(p); return ast_state_lit(XF_STATE_NULL,  loc); }
+    if (t->kind == TK_KW_NAV)    { advance(p); return ast_state_lit(XF_STATE_NAV,   loc); }
+    if (t->kind == TK_KW_VOID_S) { advance(p); return ast_state_lit(XF_STATE_VOID,  loc); }
+    if (t->kind == TK_KW_UNDEF)  { advance(p); return ast_state_lit(XF_STATE_UNDEF, loc); }
+    if (t->kind == TK_KW_TRUE)   { advance(p); return ast_state_lit(XF_STATE_TRUE,  loc); }
+    if (t->kind == TK_KW_FALSE)  { advance(p); return ast_state_lit(XF_STATE_FALSE, loc); }
+
     parser_error(p, "expected expression");
     advance(p);
     return ast_num(0, loc);
@@ -684,6 +695,10 @@ Expr *parse_assign(Parser *p) {
         case TK_SLASH_EQ:    op = ASSIGNOP_DIV;    break;
         case TK_PERCENT_EQ:  op = ASSIGNOP_MOD;    break;
         case TK_DOT_DOT_EQ:  op = ASSIGNOP_CONCAT; break;
+        case TK_DOT_PLUS_EQ:  op = ASSIGNOP_MADD; break;
+case TK_DOT_MINUS_EQ: op = ASSIGNOP_MSUB; break;
+case TK_DOT_STAR_EQ:  op = ASSIGNOP_MMUL; break;
+case TK_DOT_SLASH_EQ: op = ASSIGNOP_MDIV; break;
         default: return left;
     }
     advance(p);

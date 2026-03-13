@@ -69,12 +69,15 @@ static void write_ch(char c)         { write(STDOUT_FILENO, &c, 1); }
 
 static void cursor_left(int n) {
     if (n <= 0) return;
-    char buf[32]; snprintf(buf, sizeof(buf), "\x1b[%dD", n);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\x1b[%dD", n);
     write_str(buf);
 }
+
 static void __attribute__((unused)) cursor_right(int n) {
     if (n <= 0) return;
-    char buf[32]; snprintf(buf, sizeof(buf), "\x1b[%dC", n);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\x1b[%dC", n);
     write_str(buf);
 }
 
@@ -115,21 +118,25 @@ void history_free(History *h) {
 
 void history_push(History *h, const char *line) {
     if (!line || !*line) return;
+
     /* don't duplicate last entry */
-    if (h->count > 0 && strcmp(h->entries[h->count-1], line) == 0) {
+    if (h->count > 0 && strcmp(h->entries[h->count - 1], line) == 0) {
         h->cursor = -1;
         return;
     }
+
     /* cap */
     if (h->count >= REPL_HIST_MAX) {
         free(h->entries[0]);
-        memmove(h->entries, h->entries+1, sizeof(char*)*(h->count-1));
+        memmove(h->entries, h->entries + 1, sizeof(char *) * (h->count - 1));
         h->count--;
     }
+
     if (h->count >= h->cap) {
         h->cap *= 2;
-        h->entries = realloc(h->entries, sizeof(char*)*h->cap);
+        h->entries = realloc(h->entries, sizeof(char *) * h->cap);
     }
+
     h->entries[h->count++] = strdup(line);
     h->cursor = -1;
 }
@@ -137,22 +144,27 @@ void history_push(History *h, const char *line) {
 void history_load(History *h, const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return;
+
     char line[REPL_LINE_MAX];
     while (fgets(line, sizeof(line), f)) {
         size_t n = strlen(line);
-        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = '\0';
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+            line[--n] = '\0';
         if (n > 0) history_push(h, line);
     }
+
     fclose(f);
 }
 
 void history_save(const History *h, const char *path) {
     FILE *f = fopen(path, "w");
     if (!f) return;
+
     /* save last REPL_HIST_MAX entries */
     size_t start = h->count > REPL_HIST_MAX ? h->count - REPL_HIST_MAX : 0;
     for (size_t i = start; i < h->count; i++)
         fprintf(f, "%s\n", h->entries[i]);
+
     fclose(f);
 }
 
@@ -168,7 +180,10 @@ const char *history_prev(History *h) {
 const char *history_next(History *h) {
     if (h->cursor < 0) return NULL;
     h->cursor++;
-    if (h->cursor >= (int)h->count) { h->cursor = -1; return NULL; }
+    if (h->cursor >= (int)h->count) {
+        h->cursor = -1;
+        return NULL;
+    }
     return h->entries[h->cursor];
 }
 
@@ -178,7 +193,7 @@ const char *history_next(History *h) {
  * ============================================================ */
 
 static void ed_insert(LineEdit *ed, char c) {
-    if (ed->len >= REPL_LINE_MAX-1) return;
+    if (ed->len >= REPL_LINE_MAX - 1) return;
     memmove(ed->buf + ed->cur + 1, ed->buf + ed->cur, ed->len - ed->cur);
     ed->buf[ed->cur++] = c;
     ed->buf[++ed->len] = '\0';
@@ -186,14 +201,14 @@ static void ed_insert(LineEdit *ed, char c) {
 
 static void ed_delete_back(LineEdit *ed) {    /* backspace */
     if (ed->cur == 0) return;
-    memmove(ed->buf + ed->cur-1, ed->buf + ed->cur, ed->len - ed->cur);
+    memmove(ed->buf + ed->cur - 1, ed->buf + ed->cur, ed->len - ed->cur);
     ed->buf[--ed->len] = '\0';
     ed->cur--;
 }
 
 static void ed_delete_fwd(LineEdit *ed) {     /* Del */
     if (ed->cur >= ed->len) return;
-    memmove(ed->buf + ed->cur, ed->buf + ed->cur+1, ed->len - ed->cur - 1);
+    memmove(ed->buf + ed->cur, ed->buf + ed->cur + 1, ed->len - ed->cur - 1);
     ed->buf[--ed->len] = '\0';
 }
 
@@ -217,12 +232,14 @@ static void ed_kill_bol(LineEdit *ed) {       /* Ctrl-U */
 
 static void ed_kill_word(LineEdit *ed) {      /* Ctrl-W */
     size_t end = ed->cur;
-    while (end > 0 && ed->buf[end-1] == ' ') end--;
-    while (end > 0 && ed->buf[end-1] != ' ') end--;
+    while (end > 0 && ed->buf[end - 1] == ' ') end--;
+    while (end > 0 && ed->buf[end - 1] != ' ') end--;
+
     size_t kill = ed->cur - end;
     memcpy(ed->kill_buf, ed->buf + end, kill);
     ed->kill_buf[kill] = '\0';
     ed->kill_len = kill;
+
     memmove(ed->buf + end, ed->buf + ed->cur, ed->len - ed->cur);
     ed->len -= kill;
     ed->buf[ed->len] = '\0';
@@ -230,12 +247,13 @@ static void ed_kill_word(LineEdit *ed) {      /* Ctrl-W */
 }
 
 static void ed_yank(LineEdit *ed) {           /* Ctrl-Y */
-    for (size_t i = 0; i < ed->kill_len; i++) ed_insert(ed, ed->kill_buf[i]);
+    for (size_t i = 0; i < ed->kill_len; i++)
+        ed_insert(ed, ed->kill_buf[i]);
 }
 
 static void ed_set(LineEdit *ed, const char *s) {
     size_t n = strlen(s);
-    if (n >= REPL_LINE_MAX) n = REPL_LINE_MAX-1;
+    if (n >= REPL_LINE_MAX) n = REPL_LINE_MAX - 1;
     memcpy(ed->buf, s, n);
     ed->buf[n] = '\0';
     ed->len = ed->cur = n;
@@ -259,9 +277,13 @@ const char *repl_readline(Repl *r, const char *prompt) {
         /* fallback: no tty, use fgets */
         printf("%s", prompt);
         fflush(stdout);
+
         if (!fgets(ed->buf, REPL_LINE_MAX, stdin)) return NULL;
+
         size_t n = strlen(ed->buf);
-        while (n > 0 && (ed->buf[n-1]=='\n'||ed->buf[n-1]=='\r')) ed->buf[--n]='\0';
+        while (n > 0 && (ed->buf[n - 1] == '\n' || ed->buf[n - 1] == '\r'))
+            ed->buf[--n] = '\0';
+
         ed->len = ed->cur = n;
         return n ? ed->buf : NULL;
     }
@@ -282,10 +304,14 @@ const char *repl_readline(Repl *r, const char *prompt) {
         }
 
         if (c == 4) {           /* Ctrl-D — EOF on empty line */
-            if (ed->len == 0) { write_str("\r\n"); return NULL; }
+            if (ed->len == 0) {
+                write_str("\r\n");
+                return NULL;
+            }
             ed_delete_fwd(ed);
             goto redraw;
         }
+
         if (c == 3) {           /* Ctrl-C — cancel line */
             write_str("^C\r\n");
             ed_clear(ed);
@@ -293,17 +319,20 @@ const char *repl_readline(Repl *r, const char *prompt) {
             write_str(prompt);
             continue;
         }
-        if (c == 1) { ed->cur = 0; goto redraw; }          /* Ctrl-A home */
-        if (c == 5) { ed->cur = ed->len; goto redraw; }    /* Ctrl-E end  */
-        if (c == 11) { ed_kill_eol(ed); goto redraw; }     /* Ctrl-K      */
-        if (c == 21) { ed_kill_bol(ed); goto redraw; }     /* Ctrl-U      */
-        if (c == 23) { ed_kill_word(ed); goto redraw; }    /* Ctrl-W      */
-        if (c == 25) { ed_yank(ed); goto redraw; }         /* Ctrl-Y      */
-        if (c == 12) {                                       /* Ctrl-L clear */
+
+        if (c == 1)  { ed->cur = 0;       goto redraw; } /* Ctrl-A home */
+        if (c == 5)  { ed->cur = ed->len; goto redraw; } /* Ctrl-E end  */
+        if (c == 11) { ed_kill_eol(ed);   goto redraw; } /* Ctrl-K      */
+        if (c == 21) { ed_kill_bol(ed);   goto redraw; } /* Ctrl-U      */
+        if (c == 23) { ed_kill_word(ed);  goto redraw; } /* Ctrl-W      */
+        if (c == 25) { ed_yank(ed);       goto redraw; } /* Ctrl-Y      */
+
+        if (c == 12) { /* Ctrl-L clear */
             write_str("\x1b[2J\x1b[H");
             goto redraw;
         }
-        if (c == 127 || c == 8) {   /* Backspace / Ctrl-H */
+
+        if (c == 127 || c == 8) { /* Backspace / Ctrl-H */
             ed_delete_back(ed);
             goto redraw;
         }
@@ -312,67 +341,78 @@ const char *repl_readline(Repl *r, const char *prompt) {
         if (c == 27) {
             unsigned char s2[2];
             if (read(STDIN_FILENO, s2, 1) <= 0) continue;
+
             if (s2[0] == '[') {
                 unsigned char s3[4];
                 if (read(STDIN_FILENO, s3, 1) <= 0) continue;
+
                 if (s3[0] >= '0' && s3[0] <= '9') {
                     /* extended: ESC [ n ~ or ESC [ 1 ; mod C/D */
                     unsigned char s4;
                     read(STDIN_FILENO, &s4, 1);
+
                     if (s4 == '~') {
                         if (s3[0] == '3') { ed_delete_fwd(ed); goto redraw; }
-                        if (s3[0] == '1' || s3[0] == '7') { ed->cur = 0; goto redraw; }
+                        if (s3[0] == '1' || s3[0] == '7') { ed->cur = 0;       goto redraw; }
                         if (s3[0] == '4' || s3[0] == '8') { ed->cur = ed->len; goto redraw; }
                     } else if (s4 == ';' && s3[0] == '1') {
                         /* ESC [ 1 ; mod dir — modifier + arrow */
                         unsigned char mod, dir;
                         read(STDIN_FILENO, &mod, 1);
                         read(STDIN_FILENO, &dir, 1);
+
                         if (mod == '5' || mod == '2') {
                             if (dir == 'C') {   /* Ctrl/Shift-Right: word forward */
-                                while (ed->cur < ed->len && ed->buf[ed->cur] == ' ')  ed->cur++;
-                                while (ed->cur < ed->len && ed->buf[ed->cur] != ' ')  ed->cur++;
+                                while (ed->cur < ed->len && ed->buf[ed->cur] == ' ')
+                                    ed->cur++;
+                                while (ed->cur < ed->len && ed->buf[ed->cur] != ' ')
+                                    ed->cur++;
                                 goto redraw;
                             }
                             if (dir == 'D') {   /* Ctrl/Shift-Left: word backward */
-                                while (ed->cur > 0 && ed->buf[ed->cur-1] == ' ')  ed->cur--;
-                                while (ed->cur > 0 && ed->buf[ed->cur-1] != ' ')  ed->cur--;
+                                while (ed->cur > 0 && ed->buf[ed->cur - 1] == ' ')
+                                    ed->cur--;
+                                while (ed->cur > 0 && ed->buf[ed->cur - 1] != ' ')
+                                    ed->cur--;
                                 goto redraw;
                             }
                         }
                     }
                 } else {
                     switch (s3[0]) {
-                    case 'A': {   /* Up — history prev */
-                        const char *prev = history_prev(&r->hist);
-                        if (prev) ed_set(ed, prev);
-                        goto redraw;
-                    }
-                    case 'B': {   /* Down — history next */
-                        const char *next = history_next(&r->hist);
-                        if (next) ed_set(ed, next);
-                        else      ed_clear(ed);
-                        goto redraw;
-                    }
-                    case 'C':   /* Right */
-                        if (ed->cur < ed->len) ed->cur++;
-                        goto redraw;
-                    case 'D':   /* Left */
-                        if (ed->cur > 0) ed->cur--;
-                        goto redraw;
-                    case 'H':   /* Home (xterm) */
-                        ed->cur = 0; goto redraw;
-                    case 'F':   /* End  (xterm) */
-                        ed->cur = ed->len; goto redraw;
+                        case 'A': {   /* Up — history prev */
+                            const char *prev = history_prev(&r->hist);
+                            if (prev) ed_set(ed, prev);
+                            goto redraw;
+                        }
+                        case 'B': {   /* Down — history next */
+                            const char *next = history_next(&r->hist);
+                            if (next) ed_set(ed, next);
+                            else      ed_clear(ed);
+                            goto redraw;
+                        }
+                        case 'C': /* Right */
+                            if (ed->cur < ed->len) ed->cur++;
+                            goto redraw;
+                        case 'D': /* Left */
+                            if (ed->cur > 0) ed->cur--;
+                            goto redraw;
+                        case 'H': /* Home (xterm) */
+                            ed->cur = 0;
+                            goto redraw;
+                        case 'F': /* End (xterm) */
+                            ed->cur = ed->len;
+                            goto redraw;
                     }
                 }
             } else if (s2[0] == 'O') {
                 /* ESC O sequences */
                 unsigned char s3[2];
                 read(STDIN_FILENO, s3, 1);
-                if (s3[0] == 'H') { ed->cur = 0; goto redraw; }
+                if (s3[0] == 'H') { ed->cur = 0;       goto redraw; }
                 if (s3[0] == 'F') { ed->cur = ed->len; goto redraw; }
             }
+
             continue;
         }
 
@@ -401,10 +441,10 @@ static bool handle_command(Repl *r, const char *cmd_line) {
     char arg[REPL_LINE_MAX] = {0};
     sscanf(cmd_line, "%63s %4095[^\n]", cmd, arg);
 
-    if (strcmp(cmd,"quit")==0 || strcmp(cmd,"q")==0 || strcmp(cmd,"exit")==0)
+    if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0 || strcmp(cmd, "exit") == 0)
         return false;
 
-    if (strcmp(cmd,"help")==0) {
+    if (strcmp(cmd, "help") == 0) {
         printf("  :help            this message\r\n");
         printf("  :state           show all variable bindings\r\n");
         printf("  :type <name>     show type and state of a variable\r\n");
@@ -417,12 +457,12 @@ static bool handle_command(Repl *r, const char *cmd_line) {
         return true;
     }
 
-    if (strcmp(cmd,"state")==0) {
+    if (strcmp(cmd, "state") == 0) {
         sym_print_all(r->syms);
         return true;
     }
 
-    if (strcmp(cmd,"type")==0 && arg[0]) {
+    if (strcmp(cmd, "type") == 0 && arg[0]) {
         Symbol *s = sym_lookup(r->syms, arg, strlen(arg));
         if (s) {
             printf("  %s : %s [%s]\n", arg,
@@ -433,45 +473,66 @@ static bool handle_command(Repl *r, const char *cmd_line) {
         return true;
     }
 
-    if (strcmp(cmd,"history")==0) {
+    if (strcmp(cmd, "history") == 0) {
         History *h = &r->hist;
-        size_t start = h->count > 20 ? h->count-20 : 0;
+        size_t start = h->count > 20 ? h->count - 20 : 0;
         for (size_t i = start; i < h->count; i++)
-            printf("  %3zu  %s\n", i+1, h->entries[i]);
+            printf("  %3zu  %s\n", i + 1, h->entries[i]);
         return true;
     }
 
-    if (strcmp(cmd,"clear")==0) {
+    if (strcmp(cmd, "clear") == 0) {
         sym_free(r->syms);
         sym_init(r->syms);
         sym_register_builtins(r->syms);
+
         interp_free(r->interp);
         interp_init(r->interp, r->syms, r->vm);
+
         printf("  environment cleared\r\n");
         return true;
     }
 
-    if (strcmp(cmd,"load")==0 && arg[0]) {
+    if (strcmp(cmd, "load") == 0 && arg[0]) {
         free(r->last_load);
         r->last_load = strdup(arg);
-        /* fall through to load — return true means keep running */
+
         FILE *f = fopen(arg, "r");
-        if (!f) { printf("ERR cannot open '%s'\n", arg); return true; }
-        fseek(f, 0, SEEK_END); long sz=ftell(f); rewind(f);
-        char *buf = malloc((size_t)sz+1);
-        size_t n = fread(buf, 1, (size_t)sz, f); buf[n]='\0'; fclose(f);
+        if (!f) {
+            printf("ERR cannot open '%s'\n", arg);
+            return true;
+        }
+
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        rewind(f);
+
+        char *buf = malloc((size_t)sz + 1);
+        size_t n = fread(buf, 1, (size_t)sz, f);
+        buf[n] = '\0';
+        fclose(f);
+
         Lexer lex;
         xf_lex_init(&lex, buf, n, XF_SRC_FILE, arg);
         xf_tokenize(&lex);
+
         Program *prog = parse(&lex, r->syms);
-        if (prog) { interp_run_program(r->interp, prog); ast_program_free(prog); }
-        xf_lex_free(&lex); free(buf);
+        if (prog) {
+            interp_run_program(r->interp, prog);
+            ast_program_free(prog);
+        }
+
+        xf_lex_free(&lex);
+        free(buf);
         return true;
     }
 
-    if (strcmp(cmd,"reload")==0) {
-        if (!r->last_load) { printf("  no file loaded yet\r\n"); return true; }
-        /* fake a :load call */
+    if (strcmp(cmd, "reload") == 0) {
+        if (!r->last_load) {
+            printf("  no file loaded yet\r\n");
+            return true;
+        }
+
         char tmp[REPL_LINE_MAX];
         snprintf(tmp, sizeof(tmp), "load %s", r->last_load);
         return handle_command(r, tmp);
@@ -479,6 +540,25 @@ static bool handle_command(Repl *r, const char *cmd_line) {
 
     printf("  unknown command ':%s' — try :help\n", cmd);
     return true;
+}
+
+
+/* ============================================================
+ * AST lifetime helpers
+ * ============================================================ */
+
+/*
+ * REPL-defined top-level functions currently borrow their body AST:
+ * interp_eval_top() installs the fn into the symbol table, but does
+ * not steal/clone the body. So if we ast_top_free(TOP_FN) immediately
+ * after evaluating it, later calls will dereference freed memory.
+ *
+ * Until fn bodies become owned by xf_Fn itself, keep TOP_FN AST nodes
+ * alive for the duration of the REPL session.
+ */
+static bool repl_item_should_free_now(const TopLevel *item) {
+    if (!item) return false;
+    return item->kind != TOP_FN;
 }
 
 
@@ -491,6 +571,7 @@ void repl_init(Repl *r, Interp *interp, SymTable *syms, VM *vm) {
     r->interp = interp;
     r->syms   = syms;
     r->vm     = vm;
+
     history_init(&r->hist);
 
     /* load history from home dir */
@@ -512,6 +593,7 @@ void repl_free(Repl *r) {
         snprintf(path, sizeof(path), "%s/%s", home, REPL_HIST_FILE);
         history_save(&r->hist, path);
     }
+
     exit_raw_mode();
     history_free(&r->hist);
     free(r->last_load);
@@ -519,24 +601,25 @@ void repl_free(Repl *r) {
 }
 
 void repl_run(Repl *r) {
-printf(
-" #************             **********************#\r\n"
-"   ***********            *********************#\r\n"
-"    #**********         *********************#\r\n"
-"      **********       *********************\r\n"
-"        ********      *******\r\n"
-"         #********* *** *********\r\n"
-"           ********** ***********\r\n"
-"             ********* **********\r\n"
-"          *** #********* ********\r\n"
-"        ******* **********\r\n"
-"      *********      *********\r\n"
-"    **********        *********\r\n"
-"   **********           **********\r\n"
-" ***********             ****#******\r\n"
-"************              ************\r\n"
-);
-        write_str("xf " XF_VERSION "  (:help for commands, :quit to exit)\r\n");
+    printf(
+        " #************             **********************#\r\n"
+        "   ***********            *********************#\r\n"
+        "    #**********         *********************#\r\n"
+        "      **********       *********************\r\n"
+        "        ********      *******\r\n"
+        "         #********* *** *********\r\n"
+        "           ********** ***********\r\n"
+        "             ********* **********\r\n"
+        "          *** #********* ********\r\n"
+        "        ******* **********\r\n"
+        "      *********      *********\r\n"
+        "    **********        *********\r\n"
+        "   **********           **********\r\n"
+        " ***********             ****#******\r\n"
+        "************              ************\r\n"
+    );
+
+    write_str("xf " XF_VERSION "  (:help for commands, :quit to exit)\r\n");
 
     /* accumulate multi-line input */
     char   src_buf[65536];
@@ -547,9 +630,13 @@ printf(
         const char *line   = repl_readline(r, prompt);
 
         if (!line) {
-            if (src_len == 0) { write_str("\r\n"); break; }
+            if (src_len == 0) {
+                write_str("\r\n");
+                break;
+            }
             /* EOF mid-expression — discard and exit */
-            write_str("\r\n"); break;
+            write_str("\r\n");
+            break;
         }
 
         /* blank line — if accumulating, try to parse what we have */
@@ -581,11 +668,14 @@ printf(
 
         /* record in history (trimmed) */
         char trimmed[REPL_LINE_MAX];
-        strncpy(trimmed, src_buf, sizeof(trimmed)-1);
-        trimmed[sizeof(trimmed)-1] = '\0';
+        strncpy(trimmed, src_buf, sizeof(trimmed) - 1);
+        trimmed[sizeof(trimmed) - 1] = '\0';
+
         /* strip trailing newline for history */
         size_t tl = strlen(trimmed);
-        while (tl > 0 && (trimmed[tl-1]=='\n'||trimmed[tl-1]=='\r')) trimmed[--tl]='\0';
+        while (tl > 0 && (trimmed[tl - 1] == '\n' || trimmed[tl - 1] == '\r'))
+            trimmed[--tl] = '\0';
+
         history_push(&r->hist, trimmed);
         history_reset_cursor(&r->hist);
 
@@ -597,14 +687,18 @@ printf(
         xf_lex_free(&lex);
 
         if (item) {
+            bool free_now = repl_item_should_free_now(item);
+
             xf_Value result = interp_eval_top(r->interp, item);
-            ast_top_free(item);
+
+            if (free_now) {
+                ast_top_free(item);
+            }
 
             /* print result for expression statements */
             if (result.state != XF_STATE_NULL && result.state != XF_STATE_VOID) {
                 xf_value_repl_print(result);
-            }
-            else{
+            } else {
                 printf("\n\n");
             }
             fflush(stdout);

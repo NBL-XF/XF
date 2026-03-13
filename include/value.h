@@ -33,20 +33,28 @@
 #define XF_STATE_NULL          3   /* no return expected, none given       */
 #define XF_STATE_NAV           4   /* return expected, nothing returned    */
 #define XF_STATE_UNDEF         5   /* declared but not yet assigned        */
+#define XF_STATE_TRUE          6   /* boolean true  (terminal)            */
+#define XF_STATE_FALSE         7   /* boolean false (terminal)            */
 
-#define XF_STATE_COUNT         6
+#define XF_STATE_COUNT         8
 
 /* is state terminal (no further collapse possible) */
 #define XF_STATE_IS_TERMINAL(s) \
-    ((s) == XF_STATE_OK   || \
-     (s) == XF_STATE_ERR  || \
-     (s) == XF_STATE_VOID || \
-     (s) == XF_STATE_NULL || \
-     (s) == XF_STATE_NAV)
+    ((s) == XF_STATE_OK    || \
+     (s) == XF_STATE_ERR   || \
+     (s) == XF_STATE_VOID  || \
+     (s) == XF_STATE_NULL  || \
+     (s) == XF_STATE_NAV   || \
+     (s) == XF_STATE_TRUE  || \
+     (s) == XF_STATE_FALSE)
 
 /* is state an error condition */
 #define XF_STATE_IS_ERROR(s) \
     ((s) == XF_STATE_ERR || (s) == XF_STATE_NAV)
+
+/* is state a boolean */
+#define XF_STATE_IS_BOOL(s) \
+    ((s) == XF_STATE_TRUE || (s) == XF_STATE_FALSE)
 
 /* is state unresolved */
 #define XF_STATE_IS_PENDING(s) \
@@ -54,7 +62,7 @@
 
 /* human-readable state names */
 static const char *const XF_STATE_NAMES[XF_STATE_COUNT] = {
-    "OK", "ERR", "VOID", "NULL", "NAV", "UNDEF"
+    "OK", "ERR", "VOID", "NULL", "NAV", "UNDEF", "TRUE", "FALSE"
 };
 
 
@@ -71,9 +79,11 @@ static const char *const XF_STATE_NAMES[XF_STATE_COUNT] = {
 #define XF_TYPE_REGEX  7
 #define XF_TYPE_MODULE 8
 #define XF_TYPE_TUPLE  9
-#define XF_TYPE_COUNT  10
+#define XF_TYPE_BOOL   10
+#define XF_TYPE_COMPLEX 11
+#define XF_TYPE_COUNT  12
 static const char *const XF_TYPE_NAMES[XF_TYPE_COUNT] = {
-    "void", "num", "str", "map", "set", "arr", "fn", "regex", "module","tuple"
+    "void", "num", "str", "map", "set", "arr", "fn", "regex", "module", "tuple", "bool","complex"
 };
 
 
@@ -113,6 +123,10 @@ struct xf_str {
     uint32_t    hash;       /* cached hash, 0 = not computed */
     char        data[];     /* flexible array, null-terminated */
 };
+typedef struct {
+    double re;
+    double im;
+} xf_complex_t;
 
 xf_str_t *xf_str_new(const char *data, size_t len);
 xf_str_t *xf_str_from_cstr(const char *cstr);
@@ -233,6 +247,7 @@ struct xf_value {
         xf_fn_t     *fn;
         xf_regex_t  *re;
         xf_module_t *mod;
+        xf_complex_t complex;
         
     } data;
 
@@ -295,6 +310,7 @@ void         xf_module_release(xf_module_t *m);
 void         xf_module_set(xf_module_t *m, const char *name, xf_value_t val);
 xf_value_t   xf_module_get(const xf_module_t *m, const char *name);
 xf_value_t   xf_val_ok_module(xf_module_t *m);
+xf_Value xf_val_ok_complex(double re, double im);
 xf_value_t   xf_val_native_fn(const char *name, uint8_t ret_type,
                                xf_value_t (*fn)(xf_value_t *args, size_t argc));
 
@@ -323,6 +339,11 @@ xf_value_t xf_val_void(xf_value_t inner);
 
 /* pending state constructors */
 xf_value_t xf_val_undef(uint8_t type);
+
+/* boolean state constructors */
+xf_value_t xf_val_true(void);
+xf_value_t xf_val_false(void);
+xf_value_t xf_val_ok_bool(bool b);
 
 /* convenience */
 #define XF_NULL  (xf_val_null())

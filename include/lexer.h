@@ -43,6 +43,7 @@ typedef enum {
     TK_KW_TUPLE,
     TK_KW_FN,         /* fn                                     */
     TK_KW_VOID,       /* void  (type)                           */
+    TK_KW_BOOL,       /* bool                                   */
 
     /* ── state keywords ────────────────────────────────────── */
     TK_KW_OK,         /* OK                                     */
@@ -51,6 +52,8 @@ typedef enum {
     TK_KW_NULL,       /* NULL                                   */
     TK_KW_VOID_S,     /* VOID  (state, distinct from void type) */
     TK_KW_UNDEF,      /* UNDEF                                  */
+    TK_KW_TRUE,       /* TRUE                                   */
+    TK_KW_FALSE,      /* FALSE                                  */
 
     /* ── control keywords ──────────────────────────────────── */
     TK_KW_BEGIN,      /* BEGIN                                  */
@@ -167,7 +170,10 @@ typedef enum {
     TK_NEWLINE,       /* significant newline in REPL mode       */
     TK_EOF,
     TK_ERROR,
-
+    TK_DOT_PLUS_EQ,   /* .+= */
+TK_DOT_MINUS_EQ,  /* .-= */
+TK_DOT_STAR_EQ,   /* .*= */
+TK_DOT_SLASH_EQ,  /* ./= */
 } TokenKind;
 
 

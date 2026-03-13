@@ -274,7 +274,14 @@ static xf_Value cm_floor(xf_Value *args, size_t argc) { NEED(1); MATH1(floor); }
 static xf_Value cm_ceil(xf_Value *args, size_t argc)  { NEED(1); MATH1(ceil);  }
 static xf_Value cm_round(xf_Value *args, size_t argc) { NEED(1); MATH1(round); }
 static xf_Value cm_int(xf_Value *args, size_t argc)   { NEED(1); MATH1(trunc); }
-
+static xf_Value cm_ln(xf_Value *args, size_t argc) {
+    NEED(1);
+    xf_Value n = xf_coerce_num(args[0]);
+    if (n.state != XF_STATE_OK) return n;
+    if (n.data.num <= 0.0)
+        return xf_val_err(xf_err_new("ln domain error", "<core.math>", 0, 0), XF_TYPE_NUM);
+    return xf_val_ok_num(log(n.data.num));
+}
 static xf_Value cm_atan2(xf_Value *args, size_t argc) { NEED(2); MATH2(atan2); }
 static xf_Value cm_pow(xf_Value *args, size_t argc)   { NEED(2); MATH2(pow);   }
 
@@ -1214,6 +1221,7 @@ static xf_module_t *build_math(void) {
     FN("atan",  XF_TYPE_NUM, cm_atan);
     FN("atan2", XF_TYPE_NUM, cm_atan2);
     FN("sqrt",  XF_TYPE_NUM, cm_sqrt);
+    FN("ln", XF_TYPE_NUM, cm_ln);
     FN("pow",   XF_TYPE_NUM, cm_pow);
     FN("exp",   XF_TYPE_NUM, cm_exp);
     FN("log",   XF_TYPE_NUM, cm_log);
@@ -1231,8 +1239,9 @@ static xf_module_t *build_math(void) {
     FN("srand", XF_TYPE_VOID, cm_srand);
 
     /* numeric constants */
-    xf_module_set(m, "PI",  xf_val_ok_num(M_PI));
-    xf_module_set(m, "E",   xf_val_ok_num(M_E));
+    xf_module_set(m, "i", xf_val_ok_complex(0.0, 1.0));
+    xf_module_set(m, "pi",  xf_val_ok_num(M_PI));
+    xf_module_set(m, "e",   xf_val_ok_num(M_E));
     xf_module_set(m, "INF", xf_val_ok_num(INFINITY));
     xf_module_set(m, "NAN", xf_val_ok_num(NAN));
 
@@ -2824,7 +2833,6 @@ typedef struct {
     xf_Value  result;   /* written by thread before exit */
     bool      done;
 } ProcCtx;
-
 static void *cp_thread_fn(void *arg) {
     ProcCtx *ctx = (ProcCtx *)arg;
     xf_fn_t *fn  = ctx->fn;
@@ -2834,22 +2842,15 @@ static void *cp_thread_fn(void *arg) {
         ctx->result = xf_val_null();
     } else if (fn->is_native && fn->native_v) {
         ctx->result = fn->native_v(&chunk_val, 1);
-    } else if (g_fn_caller && g_fn_caller_vm) {
-        /* XF-language fn: delegate to interpreter callback */
-        ctx->result = g_fn_caller(g_fn_caller_vm, g_fn_caller_syms, fn, &chunk_val, 1);
     } else {
-        /* callback not registered yet — fall back to NAV */
+        /* Disable XF-language worker execution for now. */
         ctx->result = xf_val_nav(XF_TYPE_FN);
     }
 
-    /* xf_val_ok_arr retained chunk_val — release our local ref now that
-     * the fn call is done.  cp_run will release ctx->chunk separately. */
     xf_value_release(chunk_val);
-
     ctx->done = true;
     return NULL;
 }
-
 /* ── cp_worker(fn, data) → map {fn, data} ───────────────────── */
 static xf_Value cp_worker(xf_Value *args, size_t argc) {
     NEED(2);
@@ -3019,28 +3020,33 @@ static xf_Value cp_run(xf_Value *args, size_t argc) {
     NEED(1);
     if (args[0].state != XF_STATE_OK || args[0].type != XF_TYPE_ARR || !args[0].data.arr)
         return xf_val_nav(XF_TYPE_ARR);
-    xf_arr_t *workers = args[0].data.arr;
-    size_t    nw      = workers->len < CP_MAX_WORKERS ? workers->len : CP_MAX_WORKERS;
 
-    /* allocate ctx array and thread id array on the stack */
-    ProcCtx  *ctxs = calloc(nw, sizeof(ProcCtx));
+    xf_arr_t *workers = args[0].data.arr;
+    size_t nw = workers->len < CP_MAX_WORKERS ? workers->len : CP_MAX_WORKERS;
+
+    ProcCtx   *ctxs = calloc(nw, sizeof(ProcCtx));
     pthread_t *tids = calloc(nw, sizeof(pthread_t));
+    if (!ctxs || !tids) {
+        free(ctxs);
+        free(tids);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
 
     xf_Str *k_fn   = xf_str_from_cstr("fn");
     xf_Str *k_data = xf_str_from_cstr("data");
 
-    /* launch threads */
     for (size_t i = 0; i < nw; i++) {
         xf_Value wv = workers->items[i];
         if (wv.state != XF_STATE_OK || wv.type != XF_TYPE_MAP || !wv.data.map) {
-            ctxs[i].result = xf_val_nav(XF_TYPE_VOID);
+            ctxs[i].result = xf_val_null();
             ctxs[i].done   = true;
             tids[i]        = 0;
             continue;
         }
-        xf_map_t *wm   = wv.data.map;
-        xf_Value  fv   = xf_map_get(wm, k_fn);
-        xf_Value  dv   = xf_map_get(wm, k_data);
+
+        xf_map_t *wm = wv.data.map;
+        xf_Value fv  = xf_map_get(wm, k_fn);
+        xf_Value dv  = xf_map_get(wm, k_data);
 
         xf_fn_t  *fn   = (fv.state == XF_STATE_OK && fv.type == XF_TYPE_FN) ? fv.data.fn : NULL;
         xf_arr_t *data = (dv.state == XF_STATE_OK && dv.type == XF_TYPE_ARR) ? dv.data.arr : NULL;
@@ -3049,28 +3055,32 @@ static xf_Value cp_run(xf_Value *args, size_t argc) {
         ctxs[i].chunk  = data ? (xf_arr_retain(data), data) : xf_arr_new();
         ctxs[i].done   = false;
         ctxs[i].result = xf_val_null();
+        tids[i]        = 0;
 
-        if (fn) {
-            /* dispatch to thread — cp_thread_fn handles both native and XF fns */
-            pthread_attr_t attr;
-            pthread_attr_init(&attr);
-            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-            pthread_create(&tids[i], &attr, cp_thread_fn, &ctxs[i]);
-            pthread_attr_destroy(&attr);
-        } else {
-            tids[i]        = 0;
+        /* TEMPORARY SAFETY RULE: native-only in process.run */
+        if (!fn || !fn->is_native || !fn->native_v) {
+            ctxs[i].result = xf_val_nav(XF_TYPE_FN);
+            ctxs[i].done   = true;
+            continue;
+        }
+
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+        if (pthread_create(&tids[i], &attr, cp_thread_fn, &ctxs[i]) != 0) {
+            tids[i] = 0;
             ctxs[i].result = xf_val_null();
             ctxs[i].done   = true;
         }
+        pthread_attr_destroy(&attr);
     }
 
-    /* join threads and collect results */
     xf_arr_t *out = xf_arr_new();
     for (size_t i = 0; i < nw; i++) {
         if (tids[i]) pthread_join(tids[i], NULL);
         xf_arr_push(out, ctxs[i].result);
-        xf_value_release(ctxs[i].result); 
-        xf_arr_release(ctxs[i].chunk);
+        xf_value_release(ctxs[i].result);
+        if (ctxs[i].chunk) xf_arr_release(ctxs[i].chunk);
     }
 
     xf_str_release(k_fn);
@@ -3082,7 +3092,6 @@ static xf_Value cp_run(xf_Value *args, size_t argc) {
     xf_arr_release(out);
     return v;
 }
-
 static xf_module_t *build_process(void) {
     xf_module_t *m = xf_module_new("core.process");
     FN("worker", XF_TYPE_MAP, cp_worker);
@@ -3612,7 +3621,75 @@ static xf_Value cd_flatten_arr_deep(xf_arr_t *in, bool deep) {
     xf_arr_release(out);
     return r;
 }
+/* ── expand(map-of-arr) → arr of map ─────────────────────────
+ * Inverse of transpose():
+ *
+ *   {
+ *     "name": ["alice", "bob"],
+ *     "age":  [30, 25]
+ *   }
+ *
+ * becomes:
+ *
+ *   [
+ *     {"name":"alice","age":30},
+ *     {"name":"bob","age":25}
+ *   ]
+ *
+ * Rules:
+ *   - input must be XF_TYPE_MAP
+ *   - only keys whose values are arrays participate
+ *   - row count is the maximum column length
+ *   - shorter columns fill with NAV(void)
+ */
+static xf_Value cd_expand(xf_Value *args, size_t argc) {
+    NEED(1);
 
+    xf_Value src = args[0];
+    if (src.state != XF_STATE_OK) return src;
+    if (src.type != XF_TYPE_MAP || !src.data.map)
+        return xf_val_nav(XF_TYPE_ARR);
+
+    xf_map_t *cols = src.data.map;
+
+    /* determine output row count = max column length */
+    size_t rows = 0;
+    for (size_t i = 0; i < cols->order_len; i++) {
+        xf_Str *k = cols->order[i];
+        xf_Value cv = xf_map_get(cols, k);
+        if (cv.state == XF_STATE_OK && cv.type == XF_TYPE_ARR && cv.data.arr) {
+            if (cv.data.arr->len > rows) rows = cv.data.arr->len;
+        }
+    }
+
+    xf_arr_t *out = xf_arr_new();
+
+    for (size_t r = 0; r < rows; r++) {
+        xf_map_t *row = xf_map_new();
+
+        for (size_t c = 0; c < cols->order_len; c++) {
+            xf_Str *k = cols->order[c];
+            xf_Value cv = xf_map_get(cols, k);
+
+            if (cv.state == XF_STATE_OK && cv.type == XF_TYPE_ARR && cv.data.arr) {
+                xf_Value cell =
+                    (r < cv.data.arr->len)
+                        ? xf_value_retain(cv.data.arr->items[r])
+                        : xf_val_nav(XF_TYPE_VOID);
+
+                xf_map_set(row, k, cell);
+            }
+        }
+
+        xf_Value rv = xf_val_ok_map(row);
+        xf_arr_push(out, rv);
+        xf_map_release(row);
+    }
+
+    xf_Value v = xf_val_ok_arr(out);
+    xf_arr_release(out);
+    return v;
+}
 static xf_Value cd_flatten(xf_Value *args, size_t argc) {
     NEED(1);
     xf_Value src = args[0];
@@ -4034,7 +4111,7 @@ static void *cd_stream_thread(void *arg) {
     } else {
         ctx->result = xf_val_nav(XF_TYPE_FN);
     }
-xf_value_release(chunk_val); 
+xf_value_release(chunk_val);
     ctx->done = true;
     return NULL;
 }
@@ -4149,6 +4226,7 @@ static xf_module_t *build_ds(void) {
     FN("values",    XF_TYPE_ARR, cd_values);
     FN("filter",       XF_TYPE_ARR, cd_filter);
     FN("transpose",    XF_TYPE_MAP, cd_transpose);
+    FN("expand", XF_TYPE_ARR, cd_expand);
     FN("flatten",      XF_TYPE_ARR, cd_flatten);
     FN("agg_parallel", XF_TYPE_MAP, cd_agg_parallel);
     FN("stream",       XF_TYPE_ARR, cd_stream);

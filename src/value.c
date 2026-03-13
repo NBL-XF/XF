@@ -379,7 +379,15 @@ void xf_arr_delete(xf_arr_t *a, size_t idx) {
 
 #define MAP_INIT_CAP  16
 #define MAP_LOAD_MAX  0.7   /* rehash when load > 70% */
-
+xf_Value xf_val_ok_complex(double re, double im) {
+    xf_Value v;
+    memset(&v, 0, sizeof(v));
+    v.state = XF_STATE_OK;
+    v.type  = XF_TYPE_COMPLEX;
+    v.data.complex.re = re;
+    v.data.complex.im = im;
+    return v;
+}
 static size_t map_find_slot(const xf_map_t *m, const xf_str_t *key) {
     uint32_t h    = xf_str_hash((xf_str_t *)key);
     size_t   mask = m->cap - 1;
@@ -530,6 +538,18 @@ xf_value_t xf_val_undef(uint8_t type) {
     return (xf_value_t){ .state = XF_STATE_UNDEF, .type = type };
 }
 
+xf_value_t xf_val_true(void) {
+    return (xf_value_t){ .state = XF_STATE_TRUE, .type = XF_TYPE_BOOL };
+}
+
+xf_value_t xf_val_false(void) {
+    return (xf_value_t){ .state = XF_STATE_FALSE, .type = XF_TYPE_BOOL };
+}
+
+xf_value_t xf_val_ok_bool(bool b) {
+    return b ? xf_val_true() : xf_val_false();
+}
+
 
 
 /* ============================================================
@@ -567,8 +587,11 @@ xf_value_t xf_snapshot(const xf_atomic_value_t *av) {
  * ============================================================ */
 
 xf_value_t xf_coerce_num(xf_value_t v) {
+    if (v.state == XF_STATE_TRUE)  return xf_val_ok_num(1.0);
+    if (v.state == XF_STATE_FALSE) return xf_val_ok_num(0.0);
     if (v.state != XF_STATE_OK) return v;
     if (v.type == XF_TYPE_NUM)  return v;
+    if (v.type == XF_TYPE_BOOL) return xf_val_ok_num(v.data.num != 0.0 ? 1.0 : 0.0);
     if (v.type == XF_TYPE_STR) {
         char *end;
         double n = strtod(v.data.str->data, &end);
@@ -578,10 +601,29 @@ xf_value_t xf_coerce_num(xf_value_t v) {
     return xf_val_nav(XF_TYPE_NUM);
 }
 xf_value_t xf_coerce_str(xf_value_t v) {
+    if (v.state == XF_STATE_TRUE) {
+        xf_str_t *s = xf_str_from_cstr("true");
+        xf_value_t out = xf_val_ok_str(s);
+        xf_str_release(s);
+        return out;
+    }
+    if (v.state == XF_STATE_FALSE) {
+        xf_str_t *s = xf_str_from_cstr("false");
+        xf_value_t out = xf_val_ok_str(s);
+        xf_str_release(s);
+        return out;
+    }
     if (v.state != XF_STATE_OK) return v;
 
     if (v.type == XF_TYPE_STR)
         return xf_value_retain(v);
+
+    if (v.type == XF_TYPE_BOOL) {
+        xf_str_t *s = xf_str_from_cstr(v.data.num != 0.0 ? "true" : "false");
+        xf_value_t out = xf_val_ok_str(s);
+        xf_str_release(s);
+        return out;
+    }
 
     char buf[64];
     if (v.type == XF_TYPE_NUM) {
@@ -595,7 +637,24 @@ xf_value_t xf_coerce_str(xf_value_t v) {
         xf_str_release(s);
         return out;
     }
+if (v.type == XF_TYPE_COMPLEX) {
+    char buf[96];
+    double re = v.data.complex.re;
+    double im = v.data.complex.im;
 
+    if (re == 0.0) {
+        snprintf(buf, sizeof(buf), "%.14gi", im);
+    } else if (im < 0.0) {
+        snprintf(buf, sizeof(buf), "%.14g%.14gi", re, im);
+    } else {
+        snprintf(buf, sizeof(buf), "%.14g+%.14gi", re, im);
+    }
+
+    xf_str_t *s = xf_str_from_cstr(buf);
+    xf_value_t out = xf_val_ok_str(s);
+    xf_str_release(s);
+    return out;
+}
     if (v.type == XF_TYPE_TUPLE) {
         xf_tuple_t *t = v.data.tuple;
         size_t cap = 64;
@@ -694,14 +753,16 @@ bool xf_can_coerce(xf_value_t v, uint8_t target_type) {
  * ============================================================ */
 
 uint8_t xf_dominant_state(xf_value_t a, xf_value_t b) {
-    /* ERR > NAV > UNDEF > VOID > NULL > OK */
+    /* ERR > NAV > UNDEF > VOID > NULL > TRUE > FALSE > OK */
     static const uint8_t priority[XF_STATE_COUNT] = {
-        [XF_STATE_OK]   = 0,
-        [XF_STATE_NULL] = 1,
-        [XF_STATE_VOID] = 2,
-        [XF_STATE_UNDEF]= 3,
-        [XF_STATE_NAV]  = 4,
-        [XF_STATE_ERR]  = 5,
+        [XF_STATE_OK]    = 0,
+        [XF_STATE_FALSE] = 1,
+        [XF_STATE_TRUE]  = 2,
+        [XF_STATE_NULL]  = 3,
+        [XF_STATE_VOID]  = 4,
+        [XF_STATE_UNDEF] = 5,
+        [XF_STATE_NAV]   = 6,
+        [XF_STATE_ERR]   = 7,
     };
     return priority[a.state] >= priority[b.state] ? a.state : b.state;
 }
@@ -738,8 +799,27 @@ xf_value_t xf_collect_err(xf_value_t *children, size_t n,
  * ============================================================ */
 
 static void print_value_data(xf_value_t v) {
+    /* boolean states print directly without needing data union */
+    if (v.state == XF_STATE_TRUE)  { printf("true");  return; }
+    if (v.state == XF_STATE_FALSE) { printf("false"); return; }
     if (v.state != XF_STATE_OK && v.state != XF_STATE_VOID) return;
     switch (v.type) {
+    case XF_TYPE_COMPLEX: {
+    double re = v.data.complex.re;
+    double im = v.data.complex.im;
+
+    if (re == 0.0) {
+        printf("%.15gi", im);
+    } else if (im < 0.0) {
+        printf("%.15g%.15gi", re, im);
+    } else {
+        printf("%.15g+%.15gi", re, im);
+    }
+    break;
+}
+        case XF_TYPE_BOOL:
+            printf(v.data.num != 0.0 ? "true" : "false");
+            break;
         case XF_TYPE_NUM:
             if (v.data.num == (long long)v.data.num)
                 printf("%lld", (long long)v.data.num);
@@ -841,12 +921,13 @@ void xf_value_print(xf_value_t v) {
 }
 
 void xf_value_repl_print(xf_value_t v) {
-    /* "=> 3  [num, OK]" */
+    /* "=> true  [bool, TRUE]" */
     printf("=> ");
     print_value_data(v);
+    uint8_t type = (XF_STATE_IS_BOOL(v.state)) ? XF_TYPE_BOOL : v.type;
     printf("  [%s, %s]\r\n",
-           XF_TYPE_NAMES[v.type],
-           XF_STATE_NAMES[v.state]);
+           XF_TYPE_NAMES[type < XF_TYPE_COUNT ? type : 0],
+           XF_STATE_NAMES[v.state < XF_STATE_COUNT ? v.state : 0]);
 }
 
 void xf_err_print(xf_err_t *e) {

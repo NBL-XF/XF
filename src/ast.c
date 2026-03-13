@@ -217,6 +217,12 @@ Expr *ast_fn(uint8_t ret, Param *params, size_t pc, Stmt *body, Loc loc) {
     return e;
 }
 
+Expr *ast_state_lit(uint8_t state, Loc loc) {
+    Expr *e = expr_alloc(EXPR_STATE_LIT, loc);
+    e->as.state_lit.state = state;
+    return e;
+}
+
 /* ============================================================
  * LoopBind constructors
  * ============================================================ */
@@ -531,6 +537,7 @@ void ast_expr_free(Expr *e) {
             free(e->as.fn.params);
             ast_stmt_free(e->as.fn.body);
             break;
+        case EXPR_STATE_LIT: break;  /* uint8_t only — nothing to free */
         default: break;
     }
     free(e);
@@ -766,6 +773,10 @@ void ast_expr_print(const Expr *e, int d) {
             printf("FN_LITERAL ->%s (params=%zu)\n",
                    type_name(e->as.fn.return_type), e->as.fn.param_count);
             ast_stmt_print(e->as.fn.body, d+1);
+            break;
+        case EXPR_STATE_LIT:
+            printf("STATE_LIT %s\n", XF_STATE_NAMES[e->as.state_lit.state < XF_STATE_COUNT
+                                                     ? e->as.state_lit.state : 0]);
             break;
         default:
             printf("EXPR(%d)\n", e->kind);

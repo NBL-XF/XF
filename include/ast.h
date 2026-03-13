@@ -87,6 +87,9 @@ typedef enum {
     /* ── anonymous function ───────────────────────────────── */
     EXPR_FN,          /* fn(params) { body }                    */
 
+    /* ── state literal ────────────────────────────────────── */
+    EXPR_STATE_LIT,   /* OK ERR NULL NAV VOID UNDEF TRUE FALSE  */
+
 } ExprKind;
 
 
@@ -124,6 +127,10 @@ typedef enum {
     ASSIGNOP_DIV,      /* /=                                    */
     ASSIGNOP_MOD,      /* %=                                    */
     ASSIGNOP_CONCAT,   /* ..=                                   */
+    ASSIGNOP_MADD,   /* .+= */
+    ASSIGNOP_MSUB,   /* .-= */
+    ASSIGNOP_MMUL,   /* .*= */
+    ASSIGNOP_MDIV,   /* ./= */
 } AssignOp;
 
 
@@ -295,6 +302,9 @@ struct Expr {
             size_t   param_count;
             Stmt    *body;        /* STMT_BLOCK                 */
         } fn;
+
+        /* EXPR_STATE_LIT — state keyword used as a value */
+        struct { uint8_t state; } state_lit;
 
     } as;
 };
@@ -571,6 +581,7 @@ Expr *ast_cast(uint8_t to_type, Expr *operand, Loc loc);
 Expr *ast_pipe_fn(Expr *left, Expr *right, Loc loc);
 Expr *ast_spread(Expr *operand, Loc loc);
 Expr *ast_fn(uint8_t ret, Param *params, size_t pc, Stmt *body, Loc loc);
+Expr *ast_state_lit(uint8_t state, Loc loc);
 
 /* loop binding constructors */
 LoopBind *ast_loop_bind_name(xf_Str *name, Loc loc);

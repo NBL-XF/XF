@@ -53,6 +53,7 @@ typedef struct {
      * threads never race with the main thread's split_record. */
     bool       use_rec_snap;
     RecordCtx  rec_snap;
+    bool is_worker;
 } Interp;
 
 /* Route record context reads/writes through snapshot when in worker thread */

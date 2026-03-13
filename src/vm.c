@@ -539,7 +539,11 @@ static void split_record(VM *vm, const char *rec, size_t len) {
  * ============================================================ */
 
 static bool is_truthy(xf_Value v) {
+    /* boolean states resolve without touching the data union */
+    if (v.state == XF_STATE_TRUE)  return true;
+    if (v.state == XF_STATE_FALSE) return false;
     if (v.state != XF_STATE_OK) return false;
+    if (v.type == XF_TYPE_BOOL) return v.data.num != 0.0;
     if (v.type == XF_TYPE_NUM)  return v.data.num != 0.0;
     if (v.type == XF_TYPE_STR)  return v.data.str && v.data.str->len > 0;
     return true;
@@ -674,8 +678,8 @@ VMResult vm_run_chunk(VM *vm, Chunk *chunk) {
             vm_push(vm, frame->chunk->consts[idx]);
             break;
         }
-        case OP_PUSH_TRUE:  vm_push(vm, val_num(1.0)); break;
-        case OP_PUSH_FALSE: vm_push(vm, val_num(0.0)); break;
+        case OP_PUSH_TRUE:  vm_push(vm, xf_val_true());  break;
+        case OP_PUSH_FALSE: vm_push(vm, xf_val_false()); break;
         case OP_PUSH_NULL:  vm_push(vm, xf_val_null()); break;
         case OP_PUSH_UNDEF: vm_push(vm, xf_val_undef(XF_TYPE_VOID)); break;
 
