@@ -152,6 +152,7 @@ void xf_token_free(Token *tok) {
 static inline bool at_end(const Lexer *l)      { return l->pos >= l->src_len; }
 static inline char peek(const Lexer *l)         { return at_end(l) ? '\0' : l->src[l->pos]; }
 static inline char peek2(const Lexer *l)        { return (l->pos+1 < l->src_len) ? l->src[l->pos+1] : '\0'; }
+static inline char peekn(const Lexer *l, size_t n) { return (l->pos+n < l->src_len) ? l->src[l->pos+n] : '\0'; }
 
 static inline char advance(Lexer *l) {
     char c = l->src[l->pos++];
@@ -236,20 +237,24 @@ static void skip_ws(Lexer *l) {
 
 static Token scan_number(Lexer *l, size_t start, Loc loc) {
     bool is_hex = false;
+    bool allow_merge = true;
     if (l->src[start] == '0' && (peek(l) == 'x' || peek(l) == 'X')) {
         advance(l);
         while (isxdigit((unsigned char)peek(l))) advance(l);
         is_hex = true;
+        allow_merge = false;
     } else {
         while (isdigit((unsigned char)peek(l))) advance(l);
         if (peek(l) == '.' && isdigit((unsigned char)peek2(l))) {
             advance(l);
             while (isdigit((unsigned char)peek(l))) advance(l);
+            allow_merge = false;
         }
         if (peek(l) == 'e' || peek(l) == 'E') {
             advance(l);
             if (peek(l) == '+' || peek(l) == '-') advance(l);
             while (isdigit((unsigned char)peek(l))) advance(l);
+            allow_merge = false;
         }
     }
     Token t = make_tok(l, TK_NUM, start, loc);
@@ -257,6 +262,15 @@ static Token scan_number(Lexer *l, size_t start, Loc loc) {
     size_t len = t.lexeme_len < 63 ? t.lexeme_len : 63;
     memcpy(buf, t.lexeme, len); buf[len] = '\0';
     t.val.num = is_hex ? (double)strtoll(buf, NULL, 16) : strtod(buf, NULL);
+
+    if (allow_merge && peek(l) == '>' && peek2(l) != '=' && peek2(l) != '>') {
+        advance(l);
+        t.kind = TK_MERGE_GT;
+        t.lexeme_len = l->pos - start;
+        l->after_value = false;
+        return t;
+    }
+
     l->after_value = true;
     return t;
 }
@@ -512,7 +526,17 @@ static Token *next(Lexer *l) {
         case '^': t = make_tok(l, TK_CARET, start, loc); break;
 
         case '=':
-            if (match(l, '=')) { t = make_tok(l, TK_EQ_EQ, start, loc); l->after_value = false; break; }
+            if (match(l, '=')) {
+                if (match(l, '>')) { t = make_tok(l, TK_SHIFT_ARROW, start, loc); l->after_value = false; break; }
+                t = make_tok(l, TK_EQ_EQ, start, loc); l->after_value = false; break;
+            }
+            if (match(l, '-')) {
+                if (match(l, '>') && match(l, '[') && match(l, ']')) {
+                    t = make_tok(l, TK_EXPAND_ARRAY, start, loc); l->after_value = true; break;
+                }
+                t = error_tok(l, "unexpected '=-', did you mean '=->[]'?"); break;
+            }
+            if (match(l, '>')) { t = make_tok(l, TK_PUSH_ARROW, start, loc); l->after_value = false; break; }
             t = make_tok(l, TK_EQ, start, loc); l->after_value = false; break;
 
         case '!':
@@ -522,6 +546,7 @@ static Token *next(Lexer *l) {
 
         case '<':
             if (match(l, '=')) {
+                if (match(l, '=')) { t = make_tok(l, TK_UNSHIFT_ARROW, start, loc); l->after_value = false; break; } /* <== */
                 if (match(l, '>')) { t = make_tok(l, TK_SPACESHIP, start, loc); break; } /* <=> */
                 t = make_tok(l, TK_LT_EQ, start, loc); break;                            /* <=  */
             }
@@ -600,7 +625,12 @@ static Token *next(Lexer *l) {
         case '}': if (l->brace_depth   > 0) l->brace_depth--;   l->after_value = true;  t = make_tok(l, TK_RBRACE,   start, loc); break;
         case '(': l->paren_depth++;   l->after_value = false; t = make_tok(l, TK_LPAREN,   start, loc); break;
         case ')': if (l->paren_depth   > 0) l->paren_depth--;   l->after_value = true;  t = make_tok(l, TK_RPAREN,   start, loc); break;
-        case '[': l->bracket_depth++; l->after_value = false; t = make_tok(l, TK_LBRACKET, start, loc); break;
+        case '[':
+            if (peek(l) == ']' && peek2(l) == '-' && peekn(l, 2) == '>' && peekn(l, 3) == '=') {
+                advance(l); advance(l); advance(l); advance(l);
+                t = make_tok(l, TK_FLATTEN_ASSIGN, start, loc); l->after_value = false; break;
+            }
+            l->bracket_depth++; l->after_value = false; t = make_tok(l, TK_LBRACKET, start, loc); break;
         case ']': if (l->bracket_depth > 0) l->bracket_depth--; l->after_value = true;  t = make_tok(l, TK_RBRACKET, start, loc); break;
         case ',': l->after_value = false; t = make_tok(l, TK_COMMA,     start, loc); break;
         case ';': l->after_value = false; t = make_tok(l, TK_SEMICOLON, start, loc); break;
@@ -707,6 +737,12 @@ const char *xf_token_kind_name(TokenKind kind) {
         case TK_PERCENT_EQ:   return "%=";
         case TK_PLUS_PLUS:    return "++";
         case TK_MINUS_MINUS:  return "--";
+        case TK_PUSH_ARROW:   return "=>";
+        case TK_SHIFT_ARROW:  return "==>";
+        case TK_UNSHIFT_ARROW:return "<==";
+        case TK_FLATTEN_ASSIGN:return "[]->=";
+        case TK_EXPAND_ARRAY: return "=->[]";
+        case TK_MERGE_GT:     return "3>";
         case TK_EQ_EQ:        return "==";
         case TK_BANG_EQ:      return "!=";
         case TK_LT:           return "<";

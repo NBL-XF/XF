@@ -163,6 +163,90 @@ static bool is_type_kw(Parser *p) {
     }
 }
 
+static bool is_expr_terminator_kind(TokenKind k) {
+    switch (k) {
+        case TK_SEMICOLON:
+        case TK_NEWLINE:
+        case TK_EOF:
+        case TK_RBRACE:
+        case TK_RPAREN:
+        case TK_RBRACKET:
+        case TK_COMMA:
+        case TK_COLON:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static Expr *make_ident_cstr(const char *name, Loc loc) {
+    xf_Str *s = xf_str_from_cstr(name);
+    Expr *e = ast_ident(s, loc);
+    xf_str_release(s);
+    return e;
+}
+
+static Expr *make_member_cstr(Expr *obj, const char *field, Loc loc) {
+    xf_Str *s = xf_str_from_cstr(field);
+    Expr *e = ast_member(obj, s, loc);
+    xf_str_release(s);
+    return e;
+}
+
+static Expr *make_call_n(Expr *callee, Expr **args, size_t argc, Loc loc) {
+    return ast_call(callee, args, argc, loc);
+}
+
+static Expr *make_builtin_call1(const char *name, Expr *a, Loc loc) {
+    Expr **args = malloc(sizeof(Expr *));
+    args[0] = a;
+    return make_call_n(make_ident_cstr(name, loc), args, 1, loc);
+}
+
+static Expr *make_builtin_call2(const char *name, Expr *a, Expr *b, Loc loc) {
+    Expr **args = malloc(sizeof(Expr *) * 2);
+    args[0] = a;
+    args[1] = b;
+    return make_call_n(make_ident_cstr(name, loc), args, 2, loc);
+}
+
+static Expr *make_core_ds_call1(const char *name, Expr *a, Loc loc) {
+    Expr **args = malloc(sizeof(Expr *));
+    args[0] = a;
+    Expr *callee = make_member_cstr(make_member_cstr(make_ident_cstr("core", loc), "ds", loc), name, loc);
+    return make_call_n(callee, args, 1, loc);
+}
+
+static Expr *make_core_ds_call2(const char *name, Expr *a, Expr *b, Loc loc) {
+    Expr **args = malloc(sizeof(Expr *) * 2);
+    args[0] = a;
+    args[1] = b;
+    Expr *callee = make_member_cstr(make_member_cstr(make_ident_cstr("core", loc), "ds", loc), name, loc);
+    return make_call_n(callee, args, 2, loc);
+}
+
+static Expr *clone_expr_min(const Expr *e) {
+    if (!e) return NULL;
+    switch (e->kind) {
+        case EXPR_IDENT:
+            return ast_ident(e->as.ident.name, e->loc);
+        case EXPR_FIELD:
+            return ast_field(e->as.field.index, e->loc);
+        case EXPR_MEMBER:
+            return ast_member(clone_expr_min(e->as.member.obj), e->as.member.field, e->loc);
+        case EXPR_SUBSCRIPT:
+            return ast_subscript(clone_expr_min(e->as.subscript.obj), clone_expr_min(e->as.subscript.key), e->loc);
+        case EXPR_NUM:
+            return ast_num(e->as.num, e->loc);
+        case EXPR_STR:
+            return ast_str(e->as.str.value, e->loc);
+        case EXPR_STATE_LIT:
+            return ast_state_lit(e->as.state_lit.state, e->loc);
+        default:
+            return NULL;
+    }
+}
+
 
 /* ============================================================
  * Type keyword → XF_TYPE_*
@@ -439,6 +523,15 @@ if (t->kind == TK_LPAREN) {
         return e;
     }
 
+    /* spawn fn(args) as an expression — yields a numeric thread handle.
+     * The bare statement form (parse_spawn → STMT_SPAWN) only fires when
+     * spawn is not inside an expression context, so there's no ambiguity. */
+    if (t->kind == TK_KW_SPAWN) {
+        advance(p);
+        Expr *call = parse_postfix(p);
+        return ast_spawn_expr(call, loc);
+    }
+
     /* state literals: OK ERR NULL NAV VOID UNDEF TRUE FALSE */
     if (t->kind == TK_KW_OK)     { advance(p); return ast_state_lit(XF_STATE_OK,    loc); }
     if (t->kind == TK_KW_ERR)    { advance(p); return ast_state_lit(XF_STATE_ERR,   loc); }
@@ -509,6 +602,16 @@ Expr *parse_postfix(Parser *p) {
         if (check(p, TK_MINUS_MINUS)) {
             advance(p);
             e = ast_unary(UNOP_POST_DEC, e, loc);
+            continue;
+        }
+        if (check(p, TK_SHIFT_ARROW)) {
+            advance(p);
+            e = make_builtin_call1("shift", e, loc);
+            continue;
+        }
+        if (check(p, TK_EXPAND_ARRAY)) {
+            advance(p);
+            e = make_core_ds_call1("expand", e, loc);
             continue;
         }
         /* pipe-fn:  expr |> fn */
@@ -588,6 +691,16 @@ Expr *parse_compare(Parser *p) {
     Expr *left = parse_concat(p);
     for (;;) {
         Loc loc = cur(p)->loc;
+        if (check(p, TK_LT_EQ) && is_expr_terminator_kind(peek_at(p, 1)->kind)) {
+            advance(p);
+            left = make_builtin_call1("pop", left, loc);
+            continue;
+        }
+        if (check(p, TK_MERGE_GT)) {
+            advance(p);
+            left = make_core_ds_call2("merge", left, parse_concat(p), loc);
+            continue;
+        }
         if (match_tok(p, TK_LT))        { left = ast_binary(BINOP_LT,       left, parse_concat(p), loc); continue; }
         if (match_tok(p, TK_GT))        { left = ast_binary(BINOP_GT,       left, parse_concat(p), loc); continue; }
         if (match_tok(p, TK_LT_EQ))     { left = ast_binary(BINOP_LTE,      left, parse_concat(p), loc); continue; }
@@ -684,6 +797,24 @@ Expr *parse_assign(Parser *p) {
         Expr *e = ast_walrus(name, XF_TYPE_VOID, val, loc);
         xf_str_release(name);
         return e;
+    }
+
+    if (check(p, TK_PUSH_ARROW)) {
+        advance(p);
+        return make_builtin_call2("push", left, parse_assign(p), loc);
+    }
+    if (check(p, TK_UNSHIFT_ARROW)) {
+        advance(p);
+        return make_builtin_call2("unshift", left, parse_assign(p), loc);
+    }
+    if (check(p, TK_FLATTEN_ASSIGN)) {
+        advance(p);
+        Expr *dup = clone_expr_min(left);
+        if (!dup) {
+            parser_error(p, "flatten shorthand requires a simple assignable target");
+            return left;
+        }
+        return ast_assign(ASSIGNOP_EQ, left, make_core_ds_call1("flatten", dup, loc), loc);
     }
 
     AssignOp op;

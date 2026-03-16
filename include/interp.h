@@ -47,6 +47,12 @@ typedef struct {
     /* implicit vars: $err, populated by interp_error */
     xf_Value  last_err;   /* XF_STATE_NULL when no error has occurred */
 
+    /* imported program ASTs — kept alive so fn bodies remain valid.
+     * freed in interp_free(). */
+    Program **imp_progs;
+    size_t    imp_prog_count;
+    size_t    imp_prog_cap;
+
     /* per-thread record context snapshot (set by worker threads).
      * When use_rec_snap is true, all $N/$0/NR/NF/FS/OFS/ORS reads
      * and writes go through rec_snap instead of vm->rec, so worker

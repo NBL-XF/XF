@@ -164,14 +164,53 @@ static xf_module_t *build_format(void);
 static xf_module_t *build_process(void);
 
 /* ── XF-function execution callback (set by interp.c at startup) */
-static xf_fn_caller_t g_fn_caller    = NULL;
-static void          *g_fn_caller_vm  = NULL;
-static void          *g_fn_caller_syms = NULL;  /* parent SymTable for global visibility */
+/*
+ * Keep two layers of callback context:
+ *   1) process-wide defaults for normal / helper pthread entry points
+ *   2) thread-local overrides for spawned XF workers with private SymTables
+ *
+ * This avoids cross-thread clobbering of the active SymTable pointer while
+ * still letting worker threads created inside core.* fall back to the most
+ * recently registered global interpreter context.
+ */
+static xf_fn_caller_t g_fn_caller       = NULL;
+static void          *g_fn_caller_vm    = NULL;
+static void          *g_fn_caller_syms  = NULL;  /* process-wide default */
+
+static _Thread_local xf_fn_caller_t tl_fn_caller      = NULL;
+static _Thread_local void          *tl_fn_caller_vm   = NULL;
+static _Thread_local void          *tl_fn_caller_syms = NULL;
+
+static inline xf_fn_caller_t core_get_fn_caller(void) {
+    return tl_fn_caller ? tl_fn_caller : g_fn_caller;
+}
+static inline void *core_get_fn_caller_vm(void) {
+    return tl_fn_caller_vm ? tl_fn_caller_vm : g_fn_caller_vm;
+}
+static inline void *core_get_fn_caller_syms(void) {
+    return tl_fn_caller_syms ? tl_fn_caller_syms : g_fn_caller_syms;
+}
 
 void core_set_fn_caller(void *vm, void *syms, xf_fn_caller_t caller) {
-    g_fn_caller_vm   = vm;
-    g_fn_caller_syms = syms;
-    g_fn_caller      = caller;
+    /* Update the calling thread's active view unconditionally. */
+    tl_fn_caller_vm   = vm;
+    tl_fn_caller_syms = syms;
+    if (caller) tl_fn_caller = caller;
+
+    /*
+     * Refresh the process-wide defaults only when the caller provides a real
+     * callback.  Worker threads may rebind just their thread-local SymTable
+     * with caller == NULL or with the same callback without stomping other
+     * threads' private views.
+     */
+    if (caller) {
+        g_fn_caller      = caller;
+        g_fn_caller_vm   = vm;
+        g_fn_caller_syms = syms;
+    } else {
+        if (vm)   g_fn_caller_vm   = vm;
+        if (syms) g_fn_caller_syms = syms;
+    }
 }
 /* forward decl: regex helpers used by core.str and core.generics
  * (defined in the core.regex section further down) */
@@ -2948,9 +2987,13 @@ static xf_Value cp_assign(xf_Value *args, size_t argc) {
         if (fn) {
             if (fn->is_native && fn->native_v) {
                 fn_out = fn->native_v(&row_in, 1);
-            } else if (fn_is_xf && g_fn_caller && g_fn_caller_vm) {
-                fn_out = g_fn_caller(g_fn_caller_vm, g_fn_caller_syms,
-                                     fn, &row_in, 1);
+            } else {
+                xf_fn_caller_t caller = core_get_fn_caller();
+                void *caller_vm = core_get_fn_caller_vm();
+                void *caller_syms = core_get_fn_caller_syms();
+                if (fn_is_xf && caller && caller_vm) {
+                    fn_out = caller(caller_vm, caller_syms, fn, &row_in, 1);
+                }
             }
             if (fn_out.state == XF_STATE_OK && fn_out.type == XF_TYPE_MAP)
                 row_v = fn_out;
@@ -3921,6 +3964,9 @@ typedef struct {
     const char *akey;        /* agg key or NULL — borrowed          */
     xf_fn_t    *fn;          /* optional transform fn (borrowed)    */
     xf_map_t   *result;      /* written by thread before exit       */
+    void       *caller_vm;
+    void       *caller_syms;
+    xf_fn_caller_t caller;
     bool        done;
 } PaggCtx;
 
@@ -3928,6 +3974,9 @@ static void *cd_pagg_thread(void *arg) {
     PaggCtx  *ctx = (PaggCtx *)arg;
     xf_arr_t *ds  = ctx->chunk;
     xf_fn_t  *fn  = ctx->fn;
+
+    if (ctx->caller)
+        core_set_fn_caller(ctx->caller_vm, ctx->caller_syms, ctx->caller);
 
     xf_map_t *out = xf_map_new();
     for (size_t i = 0; i < ds->len; i++) {
@@ -3938,8 +3987,12 @@ static void *cd_pagg_thread(void *arg) {
             xf_Value xformed = xf_val_nav(XF_TYPE_VOID);
             if (fn->is_native && fn->native_v) {
                 xformed = fn->native_v(&row_v, 1);
-            } else if (g_fn_caller && g_fn_caller_vm) {
-                xformed = g_fn_caller(g_fn_caller_vm, g_fn_caller_syms, fn, &row_v, 1);
+            } else {
+                xf_fn_caller_t caller = core_get_fn_caller();
+                void *caller_vm = core_get_fn_caller_vm();
+                void *caller_syms = core_get_fn_caller_syms();
+                if (caller && caller_vm)
+                    xformed = caller(caller_vm, caller_syms, fn, &row_v, 1);
             }
             if (xformed.state == XF_STATE_OK && xformed.type == XF_TYPE_MAP)
                 row_v = xformed;  /* use transformed row; caller still owns original */
@@ -4013,6 +4066,9 @@ static xf_Value cd_agg_parallel(xf_Value *args, size_t argc) {
     PaggCtx    ctxs[CD_PAGG_MAX];
     pthread_t  tids[CD_PAGG_MAX];
     xf_arr_t  *chunks[CD_PAGG_MAX];
+    xf_fn_caller_t caller = core_get_fn_caller();
+    void *caller_vm = core_get_fn_caller_vm();
+    void *caller_syms = core_get_fn_caller_syms();
     size_t     nthreads = 0;
 
     for (size_t i = 0; i < n; i++) {
@@ -4027,9 +4083,12 @@ static xf_Value cd_agg_parallel(xf_Value *args, size_t argc) {
         ctxs[nthreads].chunk  = chunk;
         ctxs[nthreads].gkey   = gkey;
         ctxs[nthreads].akey   = akey;
-        ctxs[nthreads].fn     = fn;
-        ctxs[nthreads].result = NULL;
-        ctxs[nthreads].done   = false;
+        ctxs[nthreads].fn         = fn;
+        ctxs[nthreads].result     = NULL;
+        ctxs[nthreads].caller     = caller;
+        ctxs[nthreads].caller_vm  = caller_vm;
+        ctxs[nthreads].caller_syms= caller_syms;
+        ctxs[nthreads].done       = false;
 
         pthread_attr_t attr;
         pthread_attr_init(&attr);
@@ -4095,6 +4154,9 @@ return __tmp;
 typedef struct {
     xf_arr_t *chunk;    /* owned: the data passed to fn */
     xf_fn_t  *fn;       /* borrowed native fn */
+    void     *caller_vm;
+    void     *caller_syms;
+    xf_fn_caller_t caller;
     xf_Value  result;
     bool      done;
 } StreamCtx;
@@ -4104,14 +4166,22 @@ static void *cd_stream_thread(void *arg) {
     xf_fn_t   *fn  = ctx->fn;
     xf_Value chunk_val = xf_val_ok_arr(ctx->chunk);
 
+    if (ctx->caller)
+        core_set_fn_caller(ctx->caller_vm, ctx->caller_syms, ctx->caller);
+
     if (fn->is_native && fn->native_v) {
         ctx->result = fn->native_v(&chunk_val, 1);
-    } else if (g_fn_caller && g_fn_caller_vm) {
-        ctx->result = g_fn_caller(g_fn_caller_vm, g_fn_caller_syms, fn, &chunk_val, 1);
     } else {
-        ctx->result = xf_val_nav(XF_TYPE_FN);
+        xf_fn_caller_t caller = core_get_fn_caller();
+        void *caller_vm = core_get_fn_caller_vm();
+        void *caller_syms = core_get_fn_caller_syms();
+        if (caller && caller_vm) {
+            ctx->result = caller(caller_vm, caller_syms, fn, &chunk_val, 1);
+        } else {
+            ctx->result = xf_val_nav(XF_TYPE_FN);
+        }
     }
-xf_value_release(chunk_val);
+    xf_value_release(chunk_val);
     ctx->done = true;
     return NULL;
 }
@@ -4160,6 +4230,9 @@ static xf_Value cd_stream(xf_Value *args, size_t argc) {
 
     StreamCtx *ctxs = calloc(nsrc, sizeof(StreamCtx));
     pthread_t *tids = calloc(nsrc, sizeof(pthread_t));
+    xf_fn_caller_t caller = core_get_fn_caller();
+    void *caller_vm = core_get_fn_caller_vm();
+    void *caller_syms = core_get_fn_caller_syms();
 
     /* build chunks and launch threads */
     for (size_t i = 0; i < nsrc; i++) {
@@ -4178,10 +4251,13 @@ static xf_Value cd_stream(xf_Value *args, size_t argc) {
             xf_arr_push(chunk, xf_value_retain(sv));
         }
 
-        ctxs[i].chunk  = chunk;
-        ctxs[i].fn     = fn;
-        ctxs[i].result = xf_val_null();
-        ctxs[i].done   = false;
+        ctxs[i].chunk       = chunk;
+        ctxs[i].fn          = fn;
+        ctxs[i].caller      = caller;
+        ctxs[i].caller_vm   = caller_vm;
+        ctxs[i].caller_syms = caller_syms;
+        ctxs[i].result      = xf_val_null();
+        ctxs[i].done        = false;
 
         pthread_attr_t attr;
         pthread_attr_init(&attr);

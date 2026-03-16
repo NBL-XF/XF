@@ -106,6 +106,14 @@ typedef enum {
     TK_PLUS_PLUS,     /* ++                                     */
     TK_MINUS_MINUS,   /* --                                     */
 
+    /* ── shorthand collection / dataset operators ──────────── */
+    TK_PUSH_ARROW,    /* =>   push                              */
+    TK_SHIFT_ARROW,   /* ==>  shift                             */
+    TK_UNSHIFT_ARROW, /* <==  unshift                           */
+    TK_FLATTEN_ASSIGN,/* []->= flatten-and-assign sugar         */
+    TK_EXPAND_ARRAY,  /* =->[] expand sugar                     */
+    TK_MERGE_GT,      /* 3>  merge sugar                        */
+
     /* ── comparison operators ──────────────────────────────── */
     TK_EQ_EQ,         /* ==                                     */
     TK_BANG_EQ,       /* !=                                     */

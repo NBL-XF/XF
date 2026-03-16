@@ -35,7 +35,7 @@
  *   xf -f csv:json data.csv     file conversion (no explicit program needed)
  * ============================================================ */
 
-#define XF_VERSION "0.9.10"
+#define XF_VERSION "0.9.13"
 
 /* ------------------------------------------------------------
  * Format helpers

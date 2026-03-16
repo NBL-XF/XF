@@ -86,6 +86,7 @@ typedef enum {
 
     /* ── anonymous function ───────────────────────────────── */
     EXPR_FN,          /* fn(params) { body }                    */
+    EXPR_SPAWN,       /* spawn fn(args)  — expr yielding handle */
 
     /* ── state literal ────────────────────────────────────── */
     EXPR_STATE_LIT,   /* OK ERR NULL NAV VOID UNDEF TRUE FALSE  */
@@ -302,6 +303,9 @@ struct Expr {
             size_t   param_count;
             Stmt    *body;        /* STMT_BLOCK                 */
         } fn;
+
+        /* EXPR_SPAWN — spawn fn(args), evaluates to numeric handle */
+        struct { Expr *call; } spawn_expr;
 
         /* EXPR_STATE_LIT — state keyword used as a value */
         struct { uint8_t state; } state_lit;
@@ -581,6 +585,7 @@ Expr *ast_cast(uint8_t to_type, Expr *operand, Loc loc);
 Expr *ast_pipe_fn(Expr *left, Expr *right, Loc loc);
 Expr *ast_spread(Expr *operand, Loc loc);
 Expr *ast_fn(uint8_t ret, Param *params, size_t pc, Stmt *body, Loc loc);
+Expr *ast_spawn_expr(Expr *call, Loc loc);
 Expr *ast_state_lit(uint8_t state, Loc loc);
 
 /* loop binding constructors */

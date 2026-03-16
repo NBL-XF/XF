@@ -48,13 +48,49 @@ typedef struct {
 } SpawnCtx;
 static pthread_mutex_t g_spawn_mu    = PTHREAD_MUTEX_INITIALIZER;
 static SpawnCtx        g_spawn[XF_SPAWN_MAX];
-static size_t          g_spawn_count = 0;
+static size_t          g_spawn_live  = 0;   /* number of occupied slots */
 static uint32_t        g_spawn_next  = 1;  /* 0 reserved for "no handle" */
 static void copy_globals_from(SymTable *dst, SymTable *src);
 static void *spawn_thread_fn(void *arg);
+static xf_Value interp_exec_xf_fn(void *vm_ptr, void *syms_ptr,
+                                  xf_fn_t *fn, xf_Value *args, size_t argc);
 static xf_Value mat_mul(xf_Value a, xf_Value b);
 static xf_Value arr_broadcast(xf_Value a, xf_Value b, int op);
 static xf_Value val_concat(xf_Value a, xf_Value b);
+
+static SpawnCtx *find_spawn_ctx_by_id(uint32_t hid) {
+    if (hid == 0) return NULL;
+    for (size_t i = 0; i < XF_SPAWN_MAX; i++) {
+        if (g_spawn[i].id == hid) return &g_spawn[i];
+    }
+    return NULL;
+}
+
+static SpawnCtx *alloc_spawn_ctx(void) {
+    if (g_spawn_live >= XF_SPAWN_MAX) return NULL;
+    for (size_t i = 0; i < XF_SPAWN_MAX; i++) {
+        if (g_spawn[i].id == 0) {
+            memset(&g_spawn[i], 0, sizeof(g_spawn[i]));
+            g_spawn_live++;
+            return &g_spawn[i];
+        }
+    }
+    return NULL;
+}
+
+static void free_spawn_ctx_slot(SpawnCtx *ctx) {
+    if (!ctx || ctx->id == 0) return;
+    if (ctx->snap_ready) {
+        sym_free(&ctx->snap_syms);
+        ctx->snap_ready = false;
+    }
+    xf_value_release(ctx->result);
+    xf_value_release(ctx->fn_val);
+    for (size_t i = 0; i < ctx->argc && i < 64; i++) xf_value_release(ctx->args[i]);
+    memset(ctx, 0, sizeof(*ctx));
+    if (g_spawn_live > 0) g_spawn_live--;
+}
+
 static bool start_spawn_ctx(SpawnCtx *ctx) {
     if (!ctx) return false;
     if (ctx->started) return true;
@@ -96,6 +132,8 @@ static void *spawn_thread_fn(void *arg) {
     it.vm        = ctx->vm;
     it.last_err  = xf_val_null();
 
+    core_set_fn_caller(ctx->vm, &syms, interp_exec_xf_fn);
+
     vm_rec_snapshot(ctx->vm, &it.rec_snap);
     it.use_rec_snap = true;
 
@@ -134,9 +172,13 @@ static void *spawn_thread_fn(void *arg) {
         }
     }
 
-    for (size_t i = 0; i < ctx->argc; i++) xf_value_release(ctx->args[i]);
-    xf_value_release(ctx->fn_val);
-    if (ctx->snap_ready) sym_free(&ctx->snap_syms);
+    /* IMPORTANT: ctx owns fn_val/args for the lifetime of the spawn slot.
+     * Do NOT release them here.
+     *
+     * The join/free path releases the slot after pthread_join(). Releasing
+     * here as well causes a double-release/use-after-free when the slot is
+     * later reclaimed, which showed up as a bus error under fan-out tests.
+     */
     interp_free(&it);
     vm_rec_snapshot_free(&it.rec_snap);
     sym_free(&syms);
@@ -195,16 +237,17 @@ static xf_Value interp_exec_xf_fn(void *vm_ptr, void *syms_ptr,
     sym_init(&syms);
     if (parent_st) copy_globals_from(&syms, parent_st);
 
-    /* Initialise the private Interp WITHOUT calling core_set_fn_caller.
-     * Re-registering here would clobber g_fn_caller_syms with this
-     * thread's private (and short-lived) SymTable pointer, causing any
-     * concurrent or subsequent thread calling g_fn_caller to dereference
-     * a dangling pointer — the exact source of the NAV-return bug. */
+    /* Bind a thread-local callback context for this private interpreter.
+     * core_set_fn_caller() now uses thread-local overrides, so this worker
+     * can safely point core.* callback paths at its private SymTable
+     * without clobbering sibling threads. */
     Interp it;
     memset(&it, 0, sizeof(it));
     it.syms     = &syms;
     it.vm       = vm;
     it.last_err = xf_val_null();
+
+    core_set_fn_caller(vm, &syms, interp_exec_xf_fn);
 
     /* Snapshot record context — worker sees the record at call time */
     vm_rec_snapshot(vm, &it.rec_snap);
@@ -449,9 +492,16 @@ void interp_init(Interp *it, SymTable *syms, VM *vm) {
     it->syms     = syms;
     it->vm       = vm;
     it->last_err = xf_val_null();
-    if (vm) core_set_fn_caller(vm, syms, NULL);
+    if (vm) core_set_fn_caller(vm, syms, interp_exec_xf_fn);
 }
-void interp_free(Interp *it) { (void)it; }
+void interp_free(Interp *it) {
+    for (size_t i = 0; i < it->imp_prog_count; i++)
+        ast_program_free(it->imp_progs[i]);
+    free(it->imp_progs);
+    it->imp_progs      = NULL;
+    it->imp_prog_count = 0;
+    it->imp_prog_cap   = 0;
+}
 
 /* ──────────────────────────────────────────────────────────────────────
  * interp_call_core — delegate to a core.MODULE.FN native function.
@@ -1140,34 +1190,37 @@ if (strcmp(name, "join") == 0 && argc == 1) {
     if (handle.state == XF_STATE_OK && handle.type == XF_TYPE_NUM) {
         uint32_t hid = (uint32_t)handle.data.num;
 
-        SpawnCtx *ctx = NULL;
+        /* Phase 1: find the entry and copy tid by value while holding the
+         * lock.  We must NOT keep a pointer into g_spawn[] across the lock
+         * release — another concurrent join could swap-remove that slot,
+         * leaving us with a dangling pointer and a stale tid.              */
+        pthread_t tid = (pthread_t)0;
+        bool need_join = false;
 
         pthread_mutex_lock(&g_spawn_mu);
-        for (size_t i = 0; i < g_spawn_count; i++) {
-            if (g_spawn[i].id == hid) {
-                ctx = &g_spawn[i];
-                break;
-            }
+        SpawnCtx *slot = find_spawn_ctx_by_id(hid);
+        if (slot) {
+            /* Lazily start the thread if spawn was deferred. */
+            if (!slot->started)
+                start_spawn_ctx(slot);
+            tid = slot->tid;          /* copy by value — safe after unlock */
+            need_join = slot->started;
         }
         pthread_mutex_unlock(&g_spawn_mu);
 
-        if (ctx && !ctx->joined) {
-            if (!ctx->started) {
-                if (!start_spawn_ctx(ctx)) {
-                    return xf_val_null();
-                }
-            }
+        /* Phase 2: block until the thread exits (tid is a plain value, not
+         * a pointer into g_spawn[], so the array can be mutated freely).   */
+        if (need_join) {
+            pthread_join(tid, NULL);
 
-            pthread_join(ctx->tid, NULL);
-
+            /* Phase 3: re-acquire, copy result, then swap-remove the entry.
+             * Copy result BEFORE the swap so the self-assign case
+             * (i == g_spawn_count-1) doesn't clobber it.                   */
             pthread_mutex_lock(&g_spawn_mu);
-            for (size_t i = 0; i < g_spawn_count; i++) {
-                if (g_spawn[i].id == hid) {
-                    join_result = g_spawn[i].result;
-                    g_spawn[i].joined = true;
-                    g_spawn[i] = g_spawn[--g_spawn_count];
-                    break;
-                }
+            SpawnCtx *slot = find_spawn_ctx_by_id(hid);
+            if (slot) {
+                join_result = xf_value_retain(slot->result);
+                free_spawn_ctx_slot(slot);
             }
             pthread_mutex_unlock(&g_spawn_mu);
         }
@@ -2282,6 +2335,61 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
         return xf_val_ok_fn(fn);
     }
 
+    case EXPR_SPAWN: {
+        if (it->is_worker)
+            return xf_val_ok_num(0.0);
+
+        Expr *call_expr = e->as.spawn_expr.call;
+        if (!call_expr || call_expr->kind != EXPR_CALL)
+            return xf_val_ok_num(0.0);
+
+        xf_Value callee = interp_eval_expr(it, call_expr->as.call.callee);
+        size_t argc = call_expr->as.call.argc < 64 ? call_expr->as.call.argc : 64;
+        xf_Value sargs[64];
+        for (size_t i = 0; i < argc; i++)
+            sargs[i] = interp_eval_expr(it, call_expr->as.call.args[i]);
+
+        pthread_mutex_lock(&g_spawn_mu);
+        if (g_spawn_live >= XF_SPAWN_MAX ||
+            callee.state != XF_STATE_OK ||
+            callee.type  != XF_TYPE_FN  ||
+            !callee.data.fn) {
+            pthread_mutex_unlock(&g_spawn_mu);
+            xf_value_release(callee);
+            for (size_t i = 0; i < argc; i++) xf_value_release(sargs[i]);
+            return xf_val_ok_num(0.0);
+        }
+
+        SpawnCtx *ctx = alloc_spawn_ctx();
+        if (!ctx) {
+            pthread_mutex_unlock(&g_spawn_mu);
+            xf_value_release(callee);
+            for (size_t i = 0; i < argc; i++) xf_value_release(sargs[i]);
+            return xf_val_ok_num(0.0);
+        }
+        ctx->id = g_spawn_next++;
+        ctx->vm = it->vm;
+        sym_init(&ctx->snap_syms);
+        copy_globals_from(&ctx->snap_syms, it->syms);
+        ctx->snap_ready = true;
+        ctx->fn_val = callee;
+        ctx->argc   = argc;
+        for (size_t i = 0; i < argc; i++) ctx->args[i] = sargs[i];
+
+        uint32_t handle_id = ctx->id;
+        pthread_mutex_unlock(&g_spawn_mu);
+
+        if (!start_spawn_ctx(ctx)) {
+            pthread_mutex_lock(&g_spawn_mu);
+            SpawnCtx *slot = find_spawn_ctx_by_id(handle_id);
+            if (slot) free_spawn_ctx_slot(slot);
+            pthread_mutex_unlock(&g_spawn_mu);
+            return xf_val_ok_num(0.0);
+        }
+
+        return xf_val_ok_num((double)handle_id);
+    }
+
     case EXPR_STATE_LIT:
         return (xf_Value){
             .state = e->as.state_lit.state,
@@ -2617,9 +2725,31 @@ case STMT_PRINT: {
         Program *imp_prog = parse(&imp_lex, it->syms);
 
         if (imp_prog) {
-            for (size_t ii = 0; ii < imp_prog->count; ii++)
-                interp_eval_top(it, imp_prog->items[ii]);
-            ast_program_free(imp_prog);
+            /* Declaration pass only — mirror interp_run_program's first pass.
+             * Imported BEGIN/END blocks must NOT fire at import time, and
+             * pattern-action rules have no record context to run against.
+             * Only TOP_FN (registers fn in syms) and TOP_STMT (top-level
+             * variable declarations / assignments) are evaluated here. */
+            for (size_t ii = 0; ii < imp_prog->count; ii++) {
+                TopLevel *t = imp_prog->items[ii];
+                if (t->kind == TOP_BEGIN || t->kind == TOP_END ||
+                    t->kind == TOP_RULE)
+                    continue;
+                interp_eval_top(it, t);
+                if (it->had_error) break;
+            }
+
+            /* DO NOT free imp_prog here — build_fn() stores a raw pointer
+             * into top->as.fn.body.  Freeing the AST now would leave every
+             * imported function body dangling (→ garbage stmt kind / segfault).
+             * Instead, keep the program alive and free it in interp_free(). */
+            if (it->imp_prog_count >= it->imp_prog_cap) {
+                size_t new_cap = it->imp_prog_cap ? it->imp_prog_cap * 2 : 8;
+                it->imp_progs  = realloc(it->imp_progs,
+                                         new_cap * sizeof(Program *));
+                it->imp_prog_cap = new_cap;
+            }
+            it->imp_progs[it->imp_prog_count++] = imp_prog;
         } else {
             interp_error(it, s->loc, "import: parse error in '%s'", imp_path);
         }
@@ -2671,7 +2801,7 @@ case STMT_SPAWN: {
         sargs[i] = interp_eval_expr(it, call_expr->as.call.args[i]);
 
     pthread_mutex_lock(&g_spawn_mu);
-    if (g_spawn_count >= XF_SPAWN_MAX ||
+    if (g_spawn_live >= XF_SPAWN_MAX ||
         callee.state != XF_STATE_OK ||
         callee.type != XF_TYPE_FN ||
         !callee.data.fn) {
@@ -2681,8 +2811,13 @@ case STMT_SPAWN: {
         return xf_val_ok_num(0.0);
     }
 
-    SpawnCtx *ctx = &g_spawn[g_spawn_count++];
-    memset(ctx, 0, sizeof(*ctx));
+    SpawnCtx *ctx = alloc_spawn_ctx();
+    if (!ctx) {
+        pthread_mutex_unlock(&g_spawn_mu);
+        xf_value_release(callee);
+        for (size_t i = 0; i < argc; i++) xf_value_release(sargs[i]);
+        return xf_val_ok_num(0.0);
+    }
     ctx->id = g_spawn_next++;
     ctx->vm = it->vm;
     sym_init(&ctx->snap_syms);
@@ -2697,12 +2832,8 @@ case STMT_SPAWN: {
 
     if (!start_spawn_ctx(ctx)) {
         pthread_mutex_lock(&g_spawn_mu);
-        for (size_t i = 0; i < g_spawn_count; i++) {
-            if (g_spawn[i].id == handle_id) {
-                g_spawn[i] = g_spawn[--g_spawn_count];
-                break;
-            }
-        }
+        SpawnCtx *slot = find_spawn_ctx_by_id(handle_id);
+        if (slot) free_spawn_ctx_slot(slot);
         pthread_mutex_unlock(&g_spawn_mu);
         return xf_val_ok_num(0.0);
     }
@@ -2716,35 +2847,31 @@ case STMT_JOIN: {
     if (handle.state == XF_STATE_OK && handle.type == XF_TYPE_NUM) {
         uint32_t hid = (uint32_t)handle.data.num;
 
-        SpawnCtx *ctx = NULL;
+        /* Phase 1: copy tid by value while holding the lock — never keep
+         * a pointer into g_spawn[] across a lock release.                  */
+        pthread_t tid = (pthread_t)0;
+        bool need_join = false;
 
         pthread_mutex_lock(&g_spawn_mu);
-        for (size_t i = 0; i < g_spawn_count; i++) {
-            if (g_spawn[i].id == hid) {
-                ctx = &g_spawn[i];
-                break;
-            }
+        SpawnCtx *slot = find_spawn_ctx_by_id(hid);
+        if (slot) {
+            if (!slot->started)
+                start_spawn_ctx(slot);
+            tid = slot->tid;
+            need_join = slot->started;
         }
         pthread_mutex_unlock(&g_spawn_mu);
 
-        if (ctx && !ctx->joined) {
-            if (!ctx->started) {
-                if (!start_spawn_ctx(ctx)) {
-                    xf_value_release(handle);
-                    return xf_val_null();
-                }
-            }
+        /* Phase 2: block outside the lock using the copied tid value.      */
+        if (need_join) {
+            pthread_join(tid, NULL);
 
-            pthread_join(ctx->tid, NULL);
-
+            /* Phase 3: copy result first, then swap-remove.                */
             pthread_mutex_lock(&g_spawn_mu);
-            for (size_t i = 0; i < g_spawn_count; i++) {
-                if (g_spawn[i].id == hid) {
-                    join_result = g_spawn[i].result;
-                    g_spawn[i].joined = true;
-                    g_spawn[i] = g_spawn[--g_spawn_count];
-                    break;
-                }
+            SpawnCtx *slot = find_spawn_ctx_by_id(hid);
+            if (slot) {
+                join_result = xf_value_retain(slot->result);
+                free_spawn_ctx_slot(slot);
             }
             pthread_mutex_unlock(&g_spawn_mu);
         }

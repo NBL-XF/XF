@@ -1723,4 +1723,3 @@ Key API functions:
 | `xf_had_error(xf)` | Check for errors |
 | `xf_last_error(xf)` | Get last error message |
 | `xf_clear_error(xf)` | Clear error state |
-
