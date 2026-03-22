@@ -537,7 +537,8 @@ if (t->kind == TK_LPAREN) {
     if (t->kind == TK_KW_ERR)    { advance(p); return ast_state_lit(XF_STATE_ERR,   loc); }
     if (t->kind == TK_KW_NULL)   { advance(p); return ast_state_lit(XF_STATE_NULL,  loc); }
     if (t->kind == TK_KW_NAV)    { advance(p); return ast_state_lit(XF_STATE_NAV,   loc); }
-    if (t->kind == TK_KW_VOID_S) { advance(p); return ast_state_lit(XF_STATE_VOID,  loc); }
+    if (t->kind == TK_KW_VOID_S ||
+        t->kind == TK_KW_VOID)   { advance(p); return ast_state_lit(XF_STATE_VOID,  loc); }
     if (t->kind == TK_KW_UNDEF)  { advance(p); return ast_state_lit(XF_STATE_UNDEF, loc); }
     if (t->kind == TK_KW_TRUE)   { advance(p); return ast_state_lit(XF_STATE_TRUE,  loc); }
     if (t->kind == TK_KW_FALSE)  { advance(p); return ast_state_lit(XF_STATE_FALSE, loc); }

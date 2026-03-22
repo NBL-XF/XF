@@ -852,7 +852,14 @@ static void print_value_data(xf_value_t v) {
                     if (i) printf(", ");
                     xf_str_t *k = m->order[i];
                     size_t slot = map_find_slot(m, k);
-                    printf("%s: ", k->data);
+                    /* Print key: bare if it's a pure integer, quoted otherwise */
+                    {
+                        char *end;
+                        strtod(k->data, &end);
+                        bool is_num = (end != k->data && *end == '\0');
+                        if (is_num) printf("%s: ", k->data);
+                        else        printf("\"%s\": ", k->data);
+                    }
                     print_value_data(m->slots[slot].val);
                 }
             }

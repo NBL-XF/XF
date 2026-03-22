@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <unistd.h>
 
 #include "../include/value.h"
 #include "../include/lexer.h"
@@ -476,8 +477,14 @@ int main(int argc, char **argv) {
     if (cfg.print_all && !cfg.no_implicit_print && !has_rules)
         passthrough = true;
 
+    /* Any -e / -r / -t code should feed records from files or stdin.
+     * Previously only TOP_RULE items set has_rules, so bare statements like
+     * `print $0` (which parse as TOP_STMT) silently skipped record feeding. */
+    bool has_user_code = cfg.inline_count > 0 || cfg.script_file
+                         || cfg.transform_count > 0;
+
     /* ── Stream records ─────────────────────────────────────── */
-    if (prog && (has_rules || passthrough)) {
+    if (prog && (has_rules || passthrough || has_user_code)) {
         if (cfg.input_count > 0) {
             for (size_t fi = 0; fi < cfg.input_count && !it.exiting; fi++) {
                 FILE *f = fopen(cfg.input_files[fi], "r");
@@ -490,8 +497,13 @@ int main(int argc, char **argv) {
                 fclose(f);
                 if (rc || it.had_error) goto done;
             }
-        } else if (cfg.transform_count > 0 || passthrough) {
-            /* -t with no files, or passthrough mode: read from stdin */
+        } else if (cfg.transform_count > 0 || passthrough
+                   || ((cfg.inline_count > 0 || cfg.script_file)
+                       && !isatty(STDIN_FILENO))) {
+            /* Read stdin only when it is a pipe/file, not an interactive
+             * terminal.  Without this guard, `xf -r script.xf` (no input
+             * files, stdin is a tty) would block waiting for keyboard input
+             * even when the script is a pure BEGIN block. */
             rc = xf_driver_feed_file(&it, prog, stdin, "<stdin>", passthrough);
             if (rc || it.had_error) goto done;
         }

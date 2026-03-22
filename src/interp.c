@@ -1142,18 +1142,28 @@ static void print_structured(Interp *it, xf_Value *vals, size_t count,
 typedef struct { const char *name; const char *mod; const char *fn; } CoreRoute;
 
 static const CoreRoute k_core_routes[] = {
-    /* math */
-    { "abs",   "math", "abs"   }, { "cos",   "math", "cos"   },
-    { "int",   "math", "int"   }, { "rand",  "math", "rand"  },
-    { "sin",   "math", "sin"   }, { "sqrt",  "math", "sqrt"  },
-    { "srand", "math", "srand" },
-    /* string */
-    { "column",  "str", "column"      }, { "gsub",    "str", "replace_all" },
-    { "index",   "str", "index"       }, { "len",     "str", "len"         },
-    { "lower",   "str", "lower"       }, { "sprintf", "str", "sprintf"     },
-    { "sub",     "str", "replace"     }, { "substr",  "str", "substr"      },
-    { "tolower", "str", "lower"       }, { "toupper", "str", "upper"       },
-    { "trim",    "str", "trim"        }, { "upper",   "str", "upper"       },
+    { "abs",     "math", "abs"         },
+    { "column",  "str",  "column"      },
+    { "cos",     "math", "cos"         },
+    { "gsub",    "str",  "replace_all" },
+    { "index",   "str",  "index"       },
+    { "int",     "math", "int"         },
+    { "len",     "str",  "len"         },
+    { "lower",   "str",  "lower"       },
+    { "match",   "regex",    "match"  },
+    { "rand",    "math", "rand"        },
+    { "sin",     "math", "sin"         },
+    { "split",   "generics", "split"  }, 
+    { "sprintf", "str",  "sprintf"     },
+    { "sqrt",    "math", "sqrt"        },
+    { "srand",   "math", "srand"       },
+    { "sub",     "str",  "replace"     },
+    { "substr",  "str",  "substr"      },
+    { "time",    "os",       "time"   }, 
+    { "tolower", "str",  "lower"       },
+    { "toupper", "str",  "upper"       },
+    { "trim",    "str",  "trim"        },
+    { "upper",   "str",  "upper"       },
 };
 #define CORE_ROUTE_COUNT (sizeof(k_core_routes)/sizeof(k_core_routes[0]))
 
@@ -1227,6 +1237,9 @@ if (strcmp(name, "join") == 0 && argc == 1) {
     }
 
     return join_result;
+}
+if (strcmp(name, "join") == 0 && argc == 2) {
+    return interp_call_core(it, "generics", "join", args, argc);
 }
                 if (strcmp(name,"push")==0 && argc==2) {
         if (args[0].state==XF_STATE_OK&&args[0].type==XF_TYPE_ARR&&args[0].data.arr)
@@ -2226,108 +2239,35 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
         interp_error(it, e->loc, "unknown member '.%s'", field);
         return xf_val_nav(XF_TYPE_VOID);
     }
+case EXPR_PIPE_FN: {
+    xf_Value left = interp_eval_expr(it, e->as.pipe_fn.left);
+    Expr *rhs = e->as.pipe_fn.right;
 
-    case EXPR_PIPE_FN: {
-        xf_Value left = interp_eval_expr(it, e->as.pipe_fn.left);
-        Expr *rhs = e->as.pipe_fn.right;
-
-        if (rhs->kind == EXPR_IDENT) {
-            const char *name = rhs->as.ident.name->data;
-            xf_Value r = interp_call_builtin(it, name, &left, 1);
-            if (r.state != XF_STATE_NAV) return r;
-        }
-
-        if (rhs->kind == EXPR_MEMBER) {
-            xf_Value obj = interp_eval_expr(it, rhs->as.member.obj);
-            const char *mname = rhs->as.member.field->data;
-            xf_Value margs[2] = { obj, left };
-
-            xf_Value mr = interp_call_builtin(it, mname, margs, 2);
-            if (mr.state != XF_STATE_NAV) {
-                xf_value_release(obj);
-                return mr;
-            }
-
-            xf_Value callee = interp_eval_expr(it, rhs);
-            xf_value_release(obj);
-
-            if (callee.state == XF_STATE_OK && callee.type == XF_TYPE_FN && callee.data.fn) {
-                xf_Fn *fn = callee.data.fn;
-
-                if (fn->is_native && fn->native_v)
-                    return fn->native_v(&left, 1);
-
-                if (!fn->is_native) {
-                    Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
-                    fn_sc->fn_ret_type = fn->return_type;
-
-                    if (fn->param_count > 0) {
-                        Symbol *ps = sym_declare(it->syms, fn->params[0].name,
-                                                 SYM_PARAM, fn->params[0].type, e->loc);
-                        if (ps) {
-                            ps->value = left;
-                            ps->state = left.state;
-                            ps->is_defined = true;
-                        }
-                    }
-
-                    it->returning = false;
-                    interp_eval_stmt(it, (Stmt *)fn->body);
-                    xf_Value ret = it->returning ? it->return_val : xf_val_null();
-                    it->returning = false;
-
-                    scope_free(sym_pop(it->syms));
-
-                    if (fn->return_type != XF_TYPE_VOID && ret.state == XF_STATE_NULL)
-                        ret = xf_val_nav(fn->return_type);
-
-                    return ret;
-                }
-            }
-
-            interp_error(it, e->loc, "pipe target '%s' is not callable", mname);
-            return xf_val_nav(XF_TYPE_VOID);
-        }
-
-        xf_Value callee = interp_eval_expr(it, rhs);
-        if (callee.state == XF_STATE_OK && callee.type == XF_TYPE_FN && callee.data.fn) {
-            xf_Fn *fn = callee.data.fn;
-
-            if (fn->is_native && fn->native_v)
-                return fn->native_v(&left, 1);
-
-            if (!fn->is_native) {
-                Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
-                fn_sc->fn_ret_type = fn->return_type;
-
-                if (fn->param_count > 0) {
-                    Symbol *ps = sym_declare(it->syms, fn->params[0].name,
-                                             SYM_PARAM, fn->params[0].type, e->loc);
-                    if (ps) {
-                        ps->value = left;
-                        ps->state = left.state;
-                        ps->is_defined = true;
-                    }
-                }
-
-                it->returning = false;
-                interp_eval_stmt(it, (Stmt *)fn->body);
-                xf_Value ret = it->returning ? it->return_val : xf_val_null();
-                it->returning = false;
-
-                scope_free(sym_pop(it->syms));
-
-                if (fn->return_type != XF_TYPE_VOID && ret.state == XF_STATE_NULL)
-                    ret = xf_val_nav(fn->return_type);
-
-                return ret;
-            }
-        }
-
-        interp_error(it, e->loc, "pipe target is not callable");
-        return xf_val_nav(XF_TYPE_VOID);
+    if (rhs->kind == EXPR_IDENT) {
+        xf_Value r = interp_call_builtin(it, rhs->as.ident.name->data, &left, 1);
+        if (r.state != XF_STATE_NAV) return r;
     }
 
+    if (rhs->kind == EXPR_MEMBER) {
+        xf_Value obj   = interp_eval_expr(it, rhs->as.member.obj);
+        const char *mn = rhs->as.member.field->data;
+        xf_Value margs[2] = { obj, left };
+        xf_Value mr = interp_call_builtin(it, mn, margs, 2);
+        if (mr.state != XF_STATE_NAV) { xf_value_release(obj); return mr; }
+        xf_value_release(obj);
+    }
+
+    xf_Value callee = interp_eval_expr(it, rhs);
+    if (callee.state == XF_STATE_OK && callee.type == XF_TYPE_FN && callee.data.fn) {
+        xf_Fn *fn = callee.data.fn;
+        if (fn->is_native && fn->native_v)
+            return fn->native_v(&left, 1);
+        return interp_exec_xf_fn(it->vm, it->syms, fn, &left, 1);
+    }
+
+    interp_error(it, e->loc, "pipe target is not callable");
+    return xf_val_nav(XF_TYPE_VOID);
+}
     case EXPR_FN: {
         xf_Fn *fn = build_fn(NULL, e->as.fn.return_type,
                              e->as.fn.params, e->as.fn.param_count,
@@ -2924,8 +2864,11 @@ xf_Value interp_eval_top(Interp *it, TopLevel *top) {
 int interp_run_program(Interp *it, Program *prog) {
     for (size_t i = 0; i < prog->count; i++) {
         TopLevel *t = prog->items[i];
+        /* Skip BEGIN/END (handled separately), TOP_RULE (per-record), and
+         * TOP_STMT (bare -e statements — these now also run per-record in
+         * interp_feed_record; running them here too would double-execute). */
         if (t->kind == TOP_BEGIN || t->kind == TOP_END ||
-            t->kind == TOP_RULE) continue;
+            t->kind == TOP_RULE  || t->kind == TOP_STMT) continue;
         interp_eval_top(it, t);
         if (it->exiting || it->had_error) return it->had_error ? 1 : 0;
     }
@@ -2980,16 +2923,27 @@ void interp_feed_record(Interp *it, Program *prog,
 
     for (size_t i = 0; i < prog->count; i++) {
         TopLevel *t = prog->items[i];
-        if (t->kind != TOP_RULE) continue;
-        if (t->as.rule.pattern) {
-            xf_Value pat = interp_eval_expr(it, t->as.rule.pattern);
-            xf_value_release(pat);
-            if (!is_truthy(pat)) continue;
+        /* Execute both pattern-action rules (TOP_RULE) and bare statements
+         * (TOP_STMT) against every record.  This is what makes
+         *   xf -e 'print $0' file.txt
+         * print every line — without it, TOP_STMT items only ran once at
+         * startup (in interp_run_program) before any records were loaded. */
+        if (t->kind == TOP_RULE) {
+            if (t->as.rule.pattern) {
+                xf_Value pat = interp_eval_expr(it, t->as.rule.pattern);
+                xf_value_release(pat);
+                if (!is_truthy(pat)) continue;
+            }
+            it->nexting = false;
+            interp_eval_stmt(it, t->as.rule.body);
+            if (it->nexting) { it->nexting = false; break; }
+            if (it->exiting || it->had_error) return;
+        } else if (t->kind == TOP_STMT) {
+            it->nexting = false;
+            interp_eval_top(it, t);
+            if (it->nexting) { it->nexting = false; break; }
+            if (it->exiting || it->had_error) return;
         }
-        it->nexting = false;
-        interp_eval_stmt(it, t->as.rule.body);
-        if (it->nexting) { it->nexting = false; break; }
-        if (it->exiting || it->had_error) return;
     }
 }
 bool interp_compile_program(Interp *it, Program *prog) {

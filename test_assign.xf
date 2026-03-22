@@ -1,0 +1,127 @@
+BEGIN {
+    str path = "tests/data_1k.csv"
+
+    # ── 1. Load the file ────────────────────────────────────────
+    arr lines = core.os.lines(path)
+    num total = core.generics.length(lines)
+    print "Lines read : " .. total
+
+    if (total < 2) {
+        print "ERROR: file has fewer than 2 lines — check path"
+        exit(1)
+    }
+
+    # ── 2. Parse the header row ─────────────────────────────────
+    arr headers = core.generics.split(lines[0], ",")
+    num ncols   = core.generics.length(headers)
+    print "Columns    : " .. ncols .. "  →  " .. core.generics.join(headers, ", ")
+
+    # ── 3. Build arr-of-maps dataset ────────────────────────────
+    # Use core.ds.stream over the file so we get {line, nr, file}
+    # rows without loading the whole file again, then parse in-fn.
+    #
+    # Alternatively, build directly from the lines array we already
+    # have (simpler for a test):
+
+    arr dataset = []
+
+    num i = 1
+    while (i < total) {
+        arr fields = core.generics.split(lines[i], ",")
+        map row    = {}
+        num j = 0
+        while (j < ncols) {
+            row[headers[j]] = fields[j]
+            j = j + 1
+        }
+        push(dataset, row)
+        i = i + 1
+    }
+
+    num nrows = core.generics.length(dataset)
+    print "Dataset    : " .. nrows .. " rows"
+
+    # ── 4. Verify first raw row looks sane ──────────────────────
+    print "Row[0] raw : " .. core.format.json(core.ds.row(dataset, 0))
+
+    # ── 5. Run process.assign with a simple transform ────────────
+    #       The transform adds a "_checked" flag to every row.
+    #       If the double-release bug is present this will corrupt
+    #       memory and typically crash or return garbage.
+
+    map fn mark_row(map row) {
+        row["_checked"] = 1
+        return row
+    }
+
+    arr assigned = core.process.assign(dataset, mark_row)
+
+    num assigned_len = core.generics.length(assigned)
+    print "Assigned   : " .. assigned_len .. " rows"
+
+    # ── 6. Confirm the output is a plain arr-of-maps ─────────────
+    #       (not the old {columns, rows} shape that broke flatten)
+
+    map peek = core.ds.row(assigned, 0)
+    str peek_json = core.format.json(peek)
+    print "Row[0] assigned : " .. peek_json
+
+    # A map with "_checked" key means assign returned arr-of-maps ✓
+    # A map with "columns"/"rows" keys means the old broken shape ✗
+    if (core.generics.contains(peek_json, "\"_checked\"")) {
+        print "Shape check : PASS — arr-of-maps (ds.flatten compatible)"
+    } else if (core.generics.contains(peek_json, "\"columns\"")) {
+        print "Shape check : FAIL — got old {columns, rows} structure"
+        exit(1)
+    } else {
+        print "Shape check : WARN — unexpected shape, inspect above"
+    }
+
+    # ── 7. Pipe through ds.flatten ───────────────────────────────
+    #       This is the pipeline that was broken before the fix.
+
+    arr flat = core.ds.flatten(assigned)
+    num flat_len = core.generics.length(flat)
+    print "Flattened  : " .. flat_len .. " rows"
+    print assigned
+    print flat_len
+    print flat
+    print nrows
+    # ── 8. Spot-check first and last rows ───────────────────────
+    print "Row[0] flat : " .. core.format.json(core.ds.row(flat, 0))
+    print "Row[-1] flat: " .. core.format.json(core.ds.row(flat, flat_len - 1))
+
+    # ── 9. Test the XF-language fn path (was broken by g_fn_caller_syms) ──
+    #       Uses process.run with an XF fn — the other reported bug.
+
+    arr chunks  = core.process.split(dataset, 10)
+    num nchunks = core.generics.length(chunks)
+    print "Chunks     : " .. nchunks
+
+    arr fn process_chunk(arr chunk) {
+        return core.process.assign(chunk, fn(map row) {
+            row["_parallel"] = 1
+            return row
+        })
+    }
+
+    arr workers = []
+    for (chunk in chunks) {
+        push(workers, core.process.worker(process_chunk, chunk))
+    }
+
+    arr results  = core.process.run(workers)
+    arr combined = core.ds.flatten(results)
+    num combined_len = core.generics.length(combined)
+    # Check that XF fn didn't return NAV (the interp_init clobbering bug)
+    map par_row = core.ds.row(combined, 0)
+    if (core.generics.contains(core.format.json(par_row), "\"_parallel\"")) {
+        print "XF fn path  : PASS — g_fn_caller_syms not clobbered"
+    } else {
+        print "XF fn path  : FAIL — _parallel key missing, likely NAV return"
+        exit(1)
+    }
+
+    print "──────────────────────────────────"
+    print "All checks passed"
+}
