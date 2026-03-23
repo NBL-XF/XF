@@ -1,5 +1,3 @@
-FAIL  regex/split_n  got=1  expected=3
-FAIL  regex/split_0  got=module  expected=one
 FAIL  process/run_len  got=0  expected=5
-  FAIL: 4
+  FAIL: 2
 RESULT: FAILED

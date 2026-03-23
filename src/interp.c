@@ -2040,19 +2040,91 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
             args[i] = interp_eval_expr(it, e->as.call.args[i]);
 
         if (e->as.call.callee->kind == EXPR_MEMBER) {
-            xf_Value obj = interp_eval_expr(it, e->as.call.callee->as.member.obj);
-            const char *mname = e->as.call.callee->as.member.field->data;
+            Expr *member = e->as.call.callee;
+            xf_Value obj = interp_eval_expr(it, member->as.member.obj);
+            const char *mname = member->as.member.field->data;
 
+            /* IMPORTANT:
+             * For module-qualified calls like core.regex.split(...),
+             * do NOT route by bare member name through interp_call_builtin().
+             *
+             * The old path did:
+             *   interp_call_builtin("split", [core.regex, ...])
+             * which hit the builtin route table entry:
+             *   "split" -> core.generics.split
+             * instead of the actual resolved member function.
+             *
+             * That is why:
+             *   core.regex.split("one1two2three", /[0-9]/)
+             * returned [module].
+             */
+
+            if (obj.state == XF_STATE_OK &&
+                obj.type == XF_TYPE_MODULE &&
+                obj.data.mod) {
+                xf_Value callee = interp_eval_expr(it, e->as.call.callee);
+                if (callee.type == XF_TYPE_FN &&
+                    callee.state == XF_STATE_OK &&
+                    callee.data.fn) {
+                    xf_Fn *fn = callee.data.fn;
+
+                    if (!fn->is_native) {
+                        Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
+                        fn_sc->fn_ret_type = fn->return_type;
+
+                        for (size_t i = 0; i < fn->param_count; i++) {
+                            xf_Value av = i < argc ? args[i]
+                                                   : xf_val_undef(fn->params[i].type);
+                            Symbol *ps = sym_declare(it->syms, fn->params[i].name,
+                                                     SYM_PARAM, fn->params[i].type, e->loc);
+                            if (ps) {
+                                ps->value = av;
+                                ps->state = av.state;
+                                ps->is_defined = true;
+                            }
+                        }
+
+                        it->returning = false;
+                        interp_eval_stmt(it, (Stmt *)fn->body);
+                        xf_Value ret = it->returning ? it->return_val : xf_val_null();
+                        it->returning = false;
+
+                        scope_free(sym_pop(it->syms));
+
+                        if (fn->return_type != XF_TYPE_VOID &&
+                            ret.state == XF_STATE_NULL)
+                            ret = xf_val_nav(fn->return_type);
+
+                        return ret;
+                    }
+
+                    if (fn->is_native && fn->native_v)
+                        return fn->native_v(args, argc);
+                }
+
+                interp_error(it, e->loc, "unknown method '.%s'", mname);
+                return xf_val_nav(XF_TYPE_VOID);
+            }
+
+            /* Non-module member call:
+             * keep builtin-method sugar for things like bare .len/.split/etc
+             * if you still want that behavior.
+             */
             xf_Value margs[65];
             margs[0] = obj;
-            for (size_t i = 0; i < argc; i++) margs[i + 1] = args[i];
+            for (size_t i = 0; i < argc && i + 1 < 65; i++)
+                margs[i + 1] = args[i];
             size_t margc = argc + 1;
 
-            xf_Value mr = interp_call_builtin(it, mname, margs, margc < 65 ? margc : 64);
-            if (mr.state != XF_STATE_NAV) return mr;
+            xf_Value mr = interp_call_builtin(it, mname, margs,
+                                              margc < 65 ? margc : 64);
+            if (mr.state != XF_STATE_NAV)
+                return mr;
 
             xf_Value callee = interp_eval_expr(it, e->as.call.callee);
-            if (callee.type == XF_TYPE_FN && callee.state == XF_STATE_OK && callee.data.fn) {
+            if (callee.type == XF_TYPE_FN &&
+                callee.state == XF_STATE_OK &&
+                callee.data.fn) {
                 xf_Fn *fn = callee.data.fn;
 
                 if (!fn->is_native) {
@@ -2060,7 +2132,8 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
                     fn_sc->fn_ret_type = fn->return_type;
 
                     for (size_t i = 0; i < fn->param_count; i++) {
-                        xf_Value av = i < argc ? args[i] : xf_val_undef(fn->params[i].type);
+                        xf_Value av = i < argc ? args[i]
+                                               : xf_val_undef(fn->params[i].type);
                         Symbol *ps = sym_declare(it->syms, fn->params[i].name,
                                                  SYM_PARAM, fn->params[i].type, e->loc);
                         if (ps) {
@@ -2077,7 +2150,8 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
 
                     scope_free(sym_pop(it->syms));
 
-                    if (fn->return_type != XF_TYPE_VOID && ret.state == XF_STATE_NULL)
+                    if (fn->return_type != XF_TYPE_VOID &&
+                        ret.state == XF_STATE_NULL)
                         ret = xf_val_nav(fn->return_type);
 
                     return ret;
@@ -2091,54 +2165,53 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
             return xf_val_nav(XF_TYPE_VOID);
         }
 
+        xf_Value callee = interp_eval_expr(it, e->as.call.callee);
+
+        if (callee.type == XF_TYPE_FN && callee.state == XF_STATE_OK && callee.data.fn) {
+            xf_Fn *fn = callee.data.fn;
+
+            if (!fn->is_native) {
+                Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
+                fn_sc->fn_ret_type = fn->return_type;
+
+                for (size_t i = 0; i < fn->param_count; i++) {
+                    xf_Value av = i < argc ? args[i]
+                                           : xf_val_undef(fn->params[i].type);
+                    Symbol *ps = sym_declare(it->syms, fn->params[i].name,
+                                             SYM_PARAM, fn->params[i].type, e->loc);
+                    if (ps) {
+                        ps->value = av;
+                        ps->state = av.state;
+                        ps->is_defined = true;
+                    }
+                }
+
+                it->returning = false;
+                interp_eval_stmt(it, (Stmt *)fn->body);
+                xf_Value ret = it->returning ? it->return_val : xf_val_null();
+                it->returning = false;
+
+                scope_free(sym_pop(it->syms));
+
+                if (fn->return_type != XF_TYPE_VOID && ret.state == XF_STATE_NULL)
+                    ret = xf_val_nav(fn->return_type);
+
+                return ret;
+            }
+
+            if (fn->is_native && fn->native_v)
+                return fn->native_v(args, argc);
+        }
+
         if (e->as.call.callee->kind == EXPR_IDENT) {
             const char *name = e->as.call.callee->as.ident.name->data;
             xf_Value r = interp_call_builtin(it, name, args, argc);
             if (r.state != XF_STATE_NAV) return r;
         }
 
-        xf_Value callee = interp_eval_expr(it, e->as.call.callee);
-
-        if (callee.type == XF_TYPE_FN && callee.state == XF_STATE_OK &&
-            callee.data.fn && !callee.data.fn->is_native) {
-            xf_Fn *fn = callee.data.fn;
-
-            Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
-            fn_sc->fn_ret_type = fn->return_type;
-
-            for (size_t i = 0; i < fn->param_count; i++) {
-                xf_Value av = i < argc ? args[i] : xf_val_undef(fn->params[i].type);
-                Symbol *ps = sym_declare(it->syms, fn->params[i].name,
-                                         SYM_PARAM, fn->params[i].type, e->loc);
-                if (ps) {
-                    ps->value = av;
-                    ps->state = av.state;
-                    ps->is_defined = true;
-                }
-            }
-
-            it->returning = false;
-            interp_eval_stmt(it, (Stmt *)fn->body);
-            xf_Value ret = it->returning ? it->return_val : xf_val_null();
-            it->returning = false;
-
-            scope_free(sym_pop(it->syms));
-
-            if (fn->return_type != XF_TYPE_VOID && ret.state == XF_STATE_NULL)
-                ret = xf_val_nav(fn->return_type);
-
-            return ret;
-        }
-
-        if (callee.type == XF_TYPE_FN && callee.state == XF_STATE_OK &&
-            callee.data.fn && callee.data.fn->is_native && callee.data.fn->native_v) {
-            return callee.data.fn->native_v(args, argc);
-        }
-
-        interp_error(it, e->loc, "call to unresolved function");
+        interp_error(it, e->loc, "attempt to call non-function");
         return xf_val_nav(XF_TYPE_VOID);
     }
-
     case EXPR_STATE: {
         xf_Value v = interp_eval_expr(it, e->as.introspect.operand);
 
