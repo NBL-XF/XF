@@ -235,7 +235,6 @@ static xf_Value cd_filter(xf_Value *args, size_t argc) {
     }
     xf_Value v=xf_val_ok_arr(out); xf_arr_release(out); return v;
 }
-
 /* ── transpose / expand ───────────────────────────────────────── */
 
 static xf_Value cd_transpose(xf_Value *args, size_t argc) {

@@ -774,14 +774,31 @@ static xf_Value make_bool(bool b) {
     return b ? xf_val_true() : xf_val_false();
 }
 static int val_cmp(xf_Value a, xf_Value b) {
-    /* numeric path: coerce_num never allocates (no release needed) */
+    /* States must match for equality. Different states → not equal. */
+    if (a.state != b.state) return (int)a.state - (int)b.state;
+
+    /* Same state, not OK → equal to each other (NULL==NULL, NAV==NAV) */
+    if (a.state != XF_STATE_OK) return 0;
+
+    /* Both OK — cross-type: incompatible types are unordered (spaceship → 0) */
+    if (a.type != b.type) {
+        xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
+        if (na.state == XF_STATE_OK && nb.state == XF_STATE_OK) {
+            if (na.data.num < nb.data.num) return -1;
+            if (na.data.num > nb.data.num) return  1;
+            return 0;
+        }
+        return 0;  /* truly incompatible types: unordered */
+    }
+
+    /* numeric path */
     xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
     if (na.state == XF_STATE_OK && nb.state == XF_STATE_OK) {
         if (na.data.num < nb.data.num) return -1;
         if (na.data.num > nb.data.num) return  1;
         return 0;
     }
-    /* string path: coerce_str may allocate a new xf_Str — release after use */
+    /* string path */
     xf_Value sa = xf_coerce_str(a), sb = xf_coerce_str(b);
     int cmp = 0;
     if (sa.state == XF_STATE_OK && sb.state == XF_STATE_OK && sa.data.str && sb.data.str)
@@ -1468,16 +1485,37 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
     case EXPR_ARR_LIT: {
         xf_arr_t *a = xf_arr_new();
         for (size_t i = 0; i < e->as.arr_lit.count; i++) {
-            xf_Value v = interp_eval_expr(it, e->as.arr_lit.items[i]);
-            if (v.state != XF_STATE_OK) {
-                xf_arr_release(a);
-                return v;
+            Expr *item = e->as.arr_lit.items[i];
+            if (item->kind == EXPR_SPREAD) {
+                /* ..arr — expand each element into this array */
+                xf_Value sv = interp_eval_expr(it, item->as.spread.operand);
+                if (sv.state != XF_STATE_OK) {
+                    xf_arr_release(a);
+                    return sv;
+                }
+                if (sv.type == XF_TYPE_ARR && sv.data.arr) {
+                    xf_arr_t *src = sv.data.arr;
+                    for (size_t j = 0; j < src->len; j++)
+                        xf_arr_push(a, xf_value_retain(src->items[j]));
+                }
+                xf_value_release(sv);
+            } else {
+                xf_Value v = interp_eval_expr(it, item);
+                if (v.state != XF_STATE_OK) {
+                    xf_arr_release(a);
+                    return v;
+                }
+                xf_arr_push(a, v);
             }
-            xf_arr_push(a, v);
         }
         xf_Value out = xf_val_ok_arr(a);
         xf_arr_release(a);
         return out;
+    }
+
+    case EXPR_SPREAD: {
+        /* spread outside array literal — evaluate the operand directly */
+        return interp_eval_expr(it, e->as.spread.operand);
     }
 
     case EXPR_MAP_LIT: {
@@ -1998,13 +2036,24 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
 
     case EXPR_WALRUS: {
         xf_Value rhs = interp_eval_expr(it, e->as.walrus.value);
-        Symbol *s = sym_declare(it->syms, e->as.walrus.name,
-                                SYM_VAR, e->as.walrus.type, e->loc);
+        /* First try to update an existing symbol (the common case:
+         * num wv = 0; ... (wv := 7) + 1 ) */
+        Symbol *s = sym_lookup_str(it->syms, e->as.walrus.name);
         if (s) {
             xf_value_release(s->value);
-            s->value = rhs;
-            s->state = rhs.state;
+            s->value      = rhs;
+            s->state      = rhs.state;
             s->is_defined = true;
+        } else {
+            /* Not found — declare a new variable */
+            s = sym_declare(it->syms, e->as.walrus.name,
+                            SYM_VAR, e->as.walrus.type, e->loc);
+            if (s) {
+                xf_value_release(s->value);
+                s->value      = rhs;
+                s->state      = rhs.state;
+                s->is_defined = true;
+            }
         }
         return rhs;
     }

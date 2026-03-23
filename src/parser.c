@@ -471,7 +471,7 @@ if (t->kind == TK_LPAREN) {
     return first;
 }
     /* spread: ...x */
-    if (t->kind == TK_DOTDOTDOT) {
+    if (t->kind == TK_DOTDOTDOT || t->kind==TK_DOT_DOT) {
         advance(p);
         return ast_spread(parse_unary(p), loc);
     }

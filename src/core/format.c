@@ -257,19 +257,19 @@ static xf_Value cf_sci(xf_Value *args, size_t argc) {
 
 static xf_Value cf_hex(xf_Value *args, size_t argc) {
     NEED(1); double n; if (!arg_num(args, argc, 0, &n)) return propagate(args, argc);
-    char buf[32]; snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)(long long)n);
+    char buf[32]; snprintf(buf, sizeof(buf), "%llx", (unsigned long long)(long long)n);
     return make_str_val(buf, strlen(buf));
 }
 
 static xf_Value cf_bin(xf_Value *args, size_t argc) {
     NEED(1); double n; if (!arg_num(args, argc, 0, &n)) return propagate(args, argc);
     unsigned long long val = (unsigned long long)(long long)n;
-    if (val == 0) return make_str_val("0b0", 3);
+    if (val == 0) return make_str_val("0", 1);
     char bits[72]; int bi = 0;
     while (val) { bits[bi++] = '0' + (int)(val & 1); val >>= 1; }
-    char buf[72]; buf[0]='0'; buf[1]='b';
-    for (int i = 0; i < bi; i++) buf[2+i] = bits[bi-1-i]; buf[2+bi] = '\0';
-    return make_str_val(buf, (size_t)(2+bi));
+    char buf[70]; 
+    for (int i = 0; i < bi; i++) buf[i] = bits[bi-1-i]; buf[bi] = '\0';
+    return make_str_val(buf, (size_t)bi);
 }
 
 static xf_Value cf_percent(xf_Value *args, size_t argc) {

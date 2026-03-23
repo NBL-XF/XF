@@ -1,6 +1,6 @@
 #include "internal.h"
 
-/* ── shared helpers (used by str.c, generics.c, edit.c) ──────── */
+/* ── shared helpers (exported via internal.h) ─────────────────── */
 
 int cr_parse_flags(xf_Value *args, size_t argc, size_t flag_idx) {
     int cflags = REG_EXTENDED;
@@ -17,7 +17,34 @@ int cr_parse_flags(xf_Value *args, size_t argc, size_t flag_idx) {
 
 bool cr_compile(const char *pat, int cflags,
                 regex_t *out, char *errmsg, size_t errmsg_len) {
-    int rc = regcomp(out, pat, cflags);
+    /* Convert Perl-style shorthands to POSIX ERE equivalents.
+       \d → [0-9]   \D → [^0-9]
+       \w → [a-zA-Z0-9_]  \W → [^a-zA-Z0-9_]
+       \s → [[:space:]]   \S → [^[:space:]]       */
+    char expanded[4096]; size_t elen = 0;
+    for (const char *p = pat; *p && elen + 32 < sizeof(expanded); p++) {
+        if (*p == '\\' && *(p+1)) {
+            const char *sub = NULL;
+            switch (*(p+1)) {
+                case 'd': sub = "[0-9]";              break;
+                case 'D': sub = "[^0-9]";             break;
+                case 'w': sub = "[a-zA-Z0-9_]";       break;
+                case 'W': sub = "[^a-zA-Z0-9_]";      break;
+                case 's': sub = "[[:space:]]";         break;
+                case 'S': sub = "[^[:space:]]";        break;
+                default:  break;
+            }
+            if (sub) {
+                size_t slen = strlen(sub);
+                memcpy(expanded + elen, sub, slen); elen += slen; p++;
+                continue;
+            }
+        }
+        expanded[elen++] = *p;
+    }
+    expanded[elen] = '\0';
+
+    int rc = regcomp(out, expanded, cflags);
     if (rc != 0) {
         regerror(rc, out, errmsg, errmsg_len);
         regfree(out);
@@ -27,7 +54,7 @@ bool cr_compile(const char *pat, int cflags,
 }
 
 xf_Str *cr_apply_replacement(const char *subject, const regmatch_t *pm,
-                               size_t ngroups, const char *repl) {
+                              size_t ngroups, const char *repl) {
     char buf[8192];
     size_t out = 0;
     for (const char *r = repl; *r && out < sizeof(buf) - 1; r++) {
@@ -49,7 +76,21 @@ xf_Str *cr_apply_replacement(const char *subject, const regmatch_t *pm,
     return xf_str_new(buf, out);
 }
 
-/* ── internal result builder ─────────────────────────────────── */
+/* ── local helper: extract pattern + cflags from str or regex arg ─ */
+
+static bool cr_arg_pat(xf_Value *args, size_t argc,
+                        size_t pat_idx, size_t flags_idx,
+                        const char **pat_out, int *cflags_out) {
+    bool is_regex;
+    if (!cs_arg_pat(args, argc, pat_idx, pat_out, cflags_out, &is_regex))
+        return false;
+    /* For plain string patterns, honour explicit flags arg */
+    if (!is_regex)
+        *cflags_out = cr_parse_flags(args, argc, flags_idx);
+    return true;
+}
+
+/* ── cr_build_match_map ────────────────────────────────────────── */
 
 static xf_Value cr_build_match_map(const char *subject, regmatch_t *pm,
                                     size_t ngroups) {
@@ -59,8 +100,7 @@ static xf_Value cr_build_match_map(const char *subject, regmatch_t *pm,
     xf_Str *mval_s = xf_str_new(subject + pm[0].rm_so,
                                   (size_t)(pm[0].rm_eo - pm[0].rm_so));
     xf_map_set(m, mkey, xf_val_ok_str(mval_s));
-    xf_str_release(mkey);
-    xf_str_release(mval_s);
+    xf_str_release(mkey); xf_str_release(mval_s);
 
     xf_Str *ikey = xf_str_from_cstr("index");
     xf_map_set(m, ikey, xf_val_ok_num((double)pm[0].rm_so));
@@ -71,76 +111,66 @@ static xf_Value cr_build_match_map(const char *subject, regmatch_t *pm,
         if (pm[g].rm_so >= 0) {
             xf_Str *gs = xf_str_new(subject + pm[g].rm_so,
                                      (size_t)(pm[g].rm_eo - pm[g].rm_so));
-            xf_arr_push(grp_arr, xf_val_ok_str(gs));
-            xf_str_release(gs);
+            xf_arr_push(grp_arr, xf_val_ok_str(gs)); xf_str_release(gs);
         } else {
             xf_Str *empty = xf_str_from_cstr("");
-            xf_arr_push(grp_arr, xf_val_ok_str(empty));
-            xf_str_release(empty);
+            xf_arr_push(grp_arr, xf_val_ok_str(empty)); xf_str_release(empty);
         }
     }
     xf_Str *gkey = xf_str_from_cstr("groups");
     xf_map_set(m, gkey, xf_val_ok_arr(grp_arr));
-    xf_str_release(gkey);
-    xf_arr_release(grp_arr);
+    xf_str_release(gkey); xf_arr_release(grp_arr);
 
-    xf_Value tmp = xf_val_ok_map(m);
-    xf_map_release(m);
-    return tmp;
+    xf_Value tmp = xf_val_ok_map(m); xf_map_release(m); return tmp;
 }
 
-/* ── cr_match ────────────────────────────────────────────────── */
+/* ── cr_match ─────────────────────────────────────────────────── */
 
 static xf_Value cr_match(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value sv = xf_coerce_str(args[0]);
-    xf_Value pv = xf_coerce_str(args[1]);
-    if (sv.state != XF_STATE_OK || pv.state != XF_STATE_OK)
-        return xf_val_nav(XF_TYPE_MAP);
+    if (sv.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_MAP);
+    const char *pat; int cflags;
+    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) return xf_val_nav(XF_TYPE_MAP);
 
-    int cflags = cr_parse_flags(args, argc, 2);
     regex_t re; char errmsg[256];
-    if (!cr_compile(pv.data.str->data, cflags, &re, errmsg, sizeof(errmsg)))
+    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
         return xf_val_nav(XF_TYPE_MAP);
 
     size_t ngroups = re.re_nsub + 1;
     if (ngroups > CR_MAX_GROUPS) ngroups = CR_MAX_GROUPS;
     regmatch_t pm[CR_MAX_GROUPS];
-
     const char *subject = sv.data.str->data;
     int rc = regexec(&re, subject, ngroups, pm, 0);
     regfree(&re);
-
     if (rc != 0) return xf_val_nav(XF_TYPE_MAP);
     return cr_build_match_map(subject, pm, ngroups);
 }
 
-/* ── cr_search ───────────────────────────────────────────────── */
+/* ── cr_search ────────────────────────────────────────────────── */
 
 static xf_Value cr_search(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value sv = xf_coerce_str(args[0]);
-    xf_Value pv = xf_coerce_str(args[1]);
-    if (sv.state != XF_STATE_OK || pv.state != XF_STATE_OK)
-        return xf_val_nav(XF_TYPE_ARR);
+    if (sv.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_ARR);
+    const char *pat; int cflags;
+    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) return xf_val_nav(XF_TYPE_ARR);
 
-    int cflags = cr_parse_flags(args, argc, 2);
     regex_t re; char errmsg[256];
-    if (!cr_compile(pv.data.str->data, cflags, &re, errmsg, sizeof(errmsg)))
+    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
         return xf_val_nav(XF_TYPE_ARR);
 
     size_t ngroups = re.re_nsub + 1;
     if (ngroups > CR_MAX_GROUPS) ngroups = CR_MAX_GROUPS;
     regmatch_t pm[CR_MAX_GROUPS];
-
     xf_arr_t   *results     = xf_arr_new();
     const char *cursor      = sv.data.str->data;
     size_t      base_offset = 0;
 
     while (*cursor) {
-        int rc = regexec(&re, cursor, ngroups, pm, base_offset ? REG_NOTBOL : 0);
+        int rc = regexec(&re, cursor, ngroups, pm,
+                         base_offset ? REG_NOTBOL : 0);
         if (rc != 0) break;
-
         regmatch_t abs_pm[CR_MAX_GROUPS];
         for (size_t g = 0; g < ngroups; g++) {
             abs_pm[g] = pm[g];
@@ -149,91 +179,63 @@ static xf_Value cr_search(xf_Value *args, size_t argc) {
                 abs_pm[g].rm_eo += (regoff_t)base_offset;
             }
         }
-
         xf_Value mv = cr_build_match_map(sv.data.str->data, abs_pm, ngroups);
         xf_arr_push(results, mv);
-
         size_t adv = (pm[0].rm_eo > pm[0].rm_so) ? (size_t)pm[0].rm_eo : 1;
-        base_offset += adv;
-        cursor      += adv;
+        base_offset += adv; cursor += adv;
     }
-
     regfree(&re);
-    xf_Value rv = xf_val_ok_arr(results);
-    xf_arr_release(results);
-    return rv;
+    xf_Value rv = xf_val_ok_arr(results); xf_arr_release(results); return rv;
 }
 
-/* ── cr_replace_impl ─────────────────────────────────────────── */
+/* ── cr_replace_impl ──────────────────────────────────────────── */
 
 static xf_Value cr_replace_impl(xf_Value *args, size_t argc, bool global) {
     NEED(3);
     xf_Value sv   = xf_coerce_str(args[0]);
-    xf_Value pv   = xf_coerce_str(args[1]);
     xf_Value repv = xf_coerce_str(args[2]);
-    if (sv.state != XF_STATE_OK || pv.state != XF_STATE_OK || repv.state != XF_STATE_OK)
+    if (sv.state != XF_STATE_OK || repv.state != XF_STATE_OK)
         return xf_val_nav(XF_TYPE_STR);
+    const char *pat; int cflags;
+    if (!cr_arg_pat(args, argc, 1, 3, &pat, &cflags)) return xf_val_nav(XF_TYPE_STR);
 
-    int cflags = cr_parse_flags(args, argc, 3);
     regex_t re; char errmsg[256];
-    if (!cr_compile(pv.data.str->data, cflags, &re, errmsg, sizeof(errmsg)))
+    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
         return xf_val_nav(XF_TYPE_STR);
 
     size_t ngroups = re.re_nsub + 1;
     if (ngroups > CR_MAX_GROUPS) ngroups = CR_MAX_GROUPS;
     regmatch_t pm[CR_MAX_GROUPS];
-
     const char *subject = sv.data.str->data;
     const char *repl    = repv.data.str->data;
-
-    size_t cap = strlen(subject) * 2 + 256;
-    char  *out = malloc(cap);
-    size_t used = 0;
+    size_t cap  = strlen(subject) * 2 + 256;
+    char  *out  = malloc(cap); size_t used = 0;
 
 #define ENSURE(n) \
-    do { if (used + (n) + 1 >= cap) { cap = cap*2+(n)+1; out = realloc(out, cap); } } while(0)
+    do { if (used+(n)+1>=cap){cap=cap*2+(n)+1;out=realloc(out,cap);} } while(0)
 
-    const char *cursor = subject;
-    int eflags = 0;
+    const char *cursor = subject; int eflags = 0;
     while (*cursor) {
         int rc = regexec(&re, cursor, ngroups, pm, eflags);
         if (rc != 0) break;
-
         size_t pre = (size_t)pm[0].rm_so;
-        ENSURE(pre);
-        memcpy(out + used, cursor, pre);
-        used += pre;
-
-        xf_Str *rep_str = cr_apply_replacement(cursor, pm, ngroups, repl);
-        ENSURE(rep_str->len);
-        memcpy(out + used, rep_str->data, rep_str->len);
-        used += rep_str->len;
-        xf_str_release(rep_str);
-
+        ENSURE(pre); memcpy(out+used, cursor, pre); used += pre;
+        xf_Str *rs = cr_apply_replacement(cursor, pm, ngroups, repl);
+        ENSURE(rs->len); memcpy(out+used, rs->data, rs->len); used += rs->len;
+        xf_str_release(rs);
         size_t adv = (pm[0].rm_eo > pm[0].rm_so) ? (size_t)pm[0].rm_eo : 1;
-        if (adv == 0) {
-            ENSURE(1);
-            out[used++] = *cursor;
-            adv = 1;
-        }
-        cursor += adv;
-        eflags  = REG_NOTBOL;
+        if (adv == 0) { ENSURE(1); out[used++] = *cursor; adv = 1; }
+        cursor += adv; eflags = REG_NOTBOL;
         if (!global) break;
     }
 #undef ENSURE
 
     size_t tail = strlen(cursor);
-    if (used + tail + 1 >= cap) { cap = used + tail + 2; out = realloc(out, cap); }
-    memcpy(out + used, cursor, tail);
-    used += tail;
-    out[used] = '\0';
-
+    if (used+tail+1>=cap){cap=used+tail+2;out=realloc(out,cap);}
+    memcpy(out+used, cursor, tail); used += tail; out[used] = '\0';
     regfree(&re);
-    xf_Str *result = xf_str_new(out, used);
-    free(out);
-    xf_Value rv = xf_val_ok_str(result);
-    xf_str_release(result);
-    return rv;
+    xf_Str *result = xf_str_new(out, used); free(out);
+    xf_Value rv = xf_val_ok_str(result); xf_str_release(result); return rv;
 }
 
 static xf_Value cr_replace(xf_Value *args, size_t argc) {
@@ -243,24 +245,22 @@ static xf_Value cr_replace_all(xf_Value *args, size_t argc) {
     return cr_replace_impl(args, argc, true);
 }
 
-/* ── cr_groups ───────────────────────────────────────────────── */
+/* ── cr_groups ────────────────────────────────────────────────── */
 
 static xf_Value cr_groups(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value sv = xf_coerce_str(args[0]);
-    xf_Value pv = xf_coerce_str(args[1]);
-    if (sv.state != XF_STATE_OK || pv.state != XF_STATE_OK)
-        return xf_val_nav(XF_TYPE_ARR);
+    if (sv.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_ARR);
+    const char *pat; int cflags;
+    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) return xf_val_nav(XF_TYPE_ARR);
 
-    int cflags = cr_parse_flags(args, argc, 2);
     regex_t re; char errmsg[256];
-    if (!cr_compile(pv.data.str->data, cflags, &re, errmsg, sizeof(errmsg)))
+    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
         return xf_val_nav(XF_TYPE_ARR);
 
     size_t ngroups = re.re_nsub + 1;
     if (ngroups > CR_MAX_GROUPS) ngroups = CR_MAX_GROUPS;
     regmatch_t pm[CR_MAX_GROUPS];
-
     const char *subject = sv.data.str->data;
     int rc = regexec(&re, subject, ngroups, pm, 0);
     regfree(&re);
@@ -271,76 +271,66 @@ static xf_Value cr_groups(xf_Value *args, size_t argc) {
         if (pm[g].rm_so >= 0) {
             xf_Str *gs = xf_str_new(subject + pm[g].rm_so,
                                      (size_t)(pm[g].rm_eo - pm[g].rm_so));
-            xf_arr_push(arr, xf_val_ok_str(gs));
-            xf_str_release(gs);
+            xf_arr_push(arr, xf_val_ok_str(gs)); xf_str_release(gs);
         } else {
             xf_Str *empty = xf_str_from_cstr("");
-            xf_arr_push(arr, xf_val_ok_str(empty));
-            xf_str_release(empty);
+            xf_arr_push(arr, xf_val_ok_str(empty)); xf_str_release(empty);
         }
     }
-    xf_Value rv = xf_val_ok_arr(arr);
-    xf_arr_release(arr);
-    return rv;
+    xf_Value rv = xf_val_ok_arr(arr); xf_arr_release(arr); return rv;
 }
 
-/* ── cr_test ─────────────────────────────────────────────────── */
+/* ── cr_test ──────────────────────────────────────────────────── */
 
 static xf_Value cr_test(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value sv = xf_coerce_str(args[0]);
-    xf_Value pv = xf_coerce_str(args[1]);
-    if (sv.state != XF_STATE_OK || pv.state != XF_STATE_OK)
-        return xf_val_ok_num(0);
+    if (sv.state != XF_STATE_OK) return xf_val_ok_num(0);
+    const char *pat; int cflags;
+    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) return xf_val_ok_num(0);
 
-    int cflags = cr_parse_flags(args, argc, 2);
     regex_t re; char errmsg[256];
-    if (!cr_compile(pv.data.str->data, cflags, &re, errmsg, sizeof(errmsg)))
+    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
         return xf_val_ok_num(0);
-
     int rc = regexec(&re, sv.data.str->data, 0, NULL, 0);
     regfree(&re);
     return xf_val_ok_num(rc == 0 ? 1.0 : 0.0);
 }
 
-/* ── cr_split ────────────────────────────────────────────────── */
+/* ── cr_split ─────────────────────────────────────────────────── */
 
 static xf_Value cr_split(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value sv = xf_coerce_str(args[0]);
-    xf_Value pv = xf_coerce_str(args[1]);
-    if (sv.state != XF_STATE_OK || pv.state != XF_STATE_OK)
-        return xf_val_nav(XF_TYPE_ARR);
+    if (sv.state != XF_STATE_OK || !sv.data.str) return xf_val_nav(XF_TYPE_ARR);
+    const char *s    = sv.data.str->data;
+    size_t      slen = sv.data.str->len;
+    const char *pat; int cflags;
+    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) return xf_val_nav(XF_TYPE_ARR);
 
-    int cflags = cr_parse_flags(args, argc, 2);
     regex_t re; char errmsg[256];
-    if (!cr_compile(pv.data.str->data, cflags, &re, errmsg, sizeof(errmsg)))
+    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
         return xf_val_nav(XF_TYPE_ARR);
 
-    regmatch_t  pm[1];
-    xf_arr_t   *arr    = xf_arr_new();
-    const char *cursor = sv.data.str->data;
+    xf_arr_t   *arr = xf_arr_new();
+    const char *cur = s, *end = s + slen;
 
-    while (*cursor) {
-        int rc = regexec(&re, cursor, 1, pm, 0);
-        if (rc != 0) break;
-        xf_Str *seg = xf_str_new(cursor, (size_t)pm[0].rm_so);
-        xf_arr_push(arr, xf_val_ok_str(seg));
-        xf_str_release(seg);
-        size_t adv = (pm[0].rm_eo > pm[0].rm_so) ? (size_t)pm[0].rm_eo : 1;
-        cursor += adv;
+    while (cur <= end) {
+        regmatch_t pm[1];
+        int rc = regexec(&re, cur, 1, pm, cur > s ? REG_NOTBOL : 0);
+        if (rc != 0 || pm[0].rm_so == pm[0].rm_eo) {
+            xf_arr_push(arr, make_str_val(cur, (size_t)(end - cur)));
+            break;
+        }
+        xf_arr_push(arr, make_str_val(cur, (size_t)pm[0].rm_so));
+        cur += pm[0].rm_eo;
     }
-    xf_Str *tail = xf_str_from_cstr(cursor);
-    xf_arr_push(arr, xf_val_ok_str(tail));
-    xf_str_release(tail);
 
     regfree(&re);
-    xf_Value rv = xf_val_ok_arr(arr);
-    xf_arr_release(arr);
-    return rv;
+    xf_Value rv = xf_val_ok_arr(arr); xf_arr_release(arr); return rv;
 }
 
-/* ── build ───────────────────────────────────────────────────── */
+/* ── build_regex ──────────────────────────────────────────────── */
 
 xf_module_t *build_regex(void) {
     xf_module_t *m = xf_module_new("core.regex");

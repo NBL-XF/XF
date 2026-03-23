@@ -62,10 +62,10 @@ static xf_Value cp_assign(xf_Value *args, size_t argc) {
     if (args[0].state != XF_STATE_OK || args[0].type != XF_TYPE_ARR || !args[0].data.arr)
         return xf_val_nav(XF_TYPE_ARR);
     xf_arr_t *in = args[0].data.arr;
-    xf_fn_t *fn = NULL; bool fn_is_xf = false;
+    xf_fn_t *fn = NULL;
     if (argc >= 2 && args[1].state == XF_STATE_OK &&
         args[1].type == XF_TYPE_FN && args[1].data.fn) {
-        fn = args[1].data.fn; fn_is_xf = !fn->is_native;
+        fn = args[1].data.fn;
     }
     xf_arr_t *out = xf_arr_new();
     for (size_t r = 0; r < in->len; r++) {
@@ -74,9 +74,10 @@ static xf_Value cp_assign(xf_Value *args, size_t argc) {
             xf_Value xformed = xf_val_nav(XF_TYPE_VOID);
             if (fn->is_native && fn->native_v) {
                 xformed = fn->native_v(&row, 1);
-            } else if (fn_is_xf) {
+            } else {
                 xf_fn_caller_t caller = core_get_fn_caller();
-                void *vm = core_get_fn_caller_vm(), *sy = core_get_fn_caller_syms();
+                void *vm = core_get_fn_caller_vm();
+                void *sy = core_get_fn_caller_syms();
                 if (caller && vm) xformed = caller(vm, sy, fn, &row, 1);
             }
             if (xformed.state == XF_STATE_OK && xformed.type == XF_TYPE_MAP) {
@@ -97,10 +98,10 @@ static xf_Value cp_index(xf_Value *args, size_t argc) {
     if (args[0].state != XF_STATE_OK || args[0].type != XF_TYPE_ARR || !args[0].data.arr)
         return xf_val_nav(XF_TYPE_MAP);
     xf_arr_t *chunk = args[0].data.arr;
-    xf_fn_t *fn = NULL; bool fn_is_xf = false;
+    xf_fn_t *fn = NULL;
     if (argc >= 2 && args[1].state == XF_STATE_OK &&
         args[1].type == XF_TYPE_FN && args[1].data.fn) {
-        fn = args[1].data.fn; fn_is_xf = !fn->is_native;
+        fn = args[1].data.fn;
     }
     double doffset = 0.0;
     if (argc >= 3) arg_num(args, argc, 2, &doffset);
@@ -117,8 +118,9 @@ static xf_Value cp_index(xf_Value *args, size_t argc) {
                 fn_out = fn->native_v(&row_in, 1);
             } else {
                 xf_fn_caller_t caller = core_get_fn_caller();
-                void *vm = core_get_fn_caller_vm(), *sy = core_get_fn_caller_syms();
-                if (fn_is_xf && caller && vm)
+                void *vm = core_get_fn_caller_vm();
+                void *sy = core_get_fn_caller_syms();
+                if (caller && vm)
                     fn_out = caller(vm, sy, fn, &row_in, 1);
             }
             if (fn_out.state == XF_STATE_OK && fn_out.type == XF_TYPE_MAP)
@@ -199,10 +201,11 @@ static xf_Value cp_run(xf_Value *args, size_t argc) {
         }
         if (!fn->is_native) {
             xf_fn_caller_t caller = core_get_fn_caller();
-            void *vm = core_get_fn_caller_vm(), *sy = core_get_fn_caller_syms();
+            void *vm = core_get_fn_caller_vm();
+            void *sy = core_get_root_syms();
             xf_Value cv = xf_val_ok_arr(ctxs[i].chunk);
             ctxs[i].result = (caller && vm) ? caller(vm, sy, fn, &cv, 1)
-                                            : xf_val_nav(XF_TYPE_FN);
+                                                  : xf_val_nav(XF_TYPE_FN);
             xf_value_release(cv); ctxs[i].done = true; continue;
         }
         pthread_attr_t attr; pthread_attr_init(&attr);

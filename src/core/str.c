@@ -337,16 +337,86 @@ static xf_Value cs_sprintf(xf_Value *args, size_t argc) {
     NEED(1);
     const char *fmt; size_t fmtlen;
     if (!arg_str(args, argc, 0, &fmt, &fmtlen)) return propagate(args, argc);
+
     char buf[4096];
-    if (argc >= 2) {
-        xf_Value v2 = xf_coerce_str(args[1]);
-        if (v2.state == XF_STATE_OK && v2.data.str)
-            snprintf(buf, sizeof(buf), fmt, v2.data.str->data);
-        else
-            snprintf(buf, sizeof(buf), "%s", fmt);
-    } else {
+    if (argc < 2) {
         snprintf(buf, sizeof(buf), "%s", fmt);
+        return make_str_val(buf, strlen(buf));
     }
+
+    /* Scan fmt for the first conversion specifier and dispatch on its type */
+    const char *p = fmt;
+    while (*p && *p != '%') p++;
+
+    if (!*p) {
+        /* No specifier — just return the format string */
+        snprintf(buf, sizeof(buf), "%s", fmt);
+        return make_str_val(buf, strlen(buf));
+    }
+
+    /* Collect the specifier: %[flags][width][.prec]type */
+    char spec[64]; size_t si = 0;
+    spec[si++] = '%';
+    p++; /* skip % */
+    /* flags */
+    while (*p && strchr("-+ #0", *p)) spec[si++] = *p++;
+    /* width */
+    while (*p && *p >= '0' && *p <= '9') spec[si++] = *p++;
+    /* precision */
+    if (*p == '.') { spec[si++] = *p++; while (*p && *p >= '0' && *p <= '9') spec[si++] = *p++; }
+    /* type char */
+    char conv = *p ? *p++ : 's';
+    spec[si++] = conv; spec[si] = '\0';
+
+    /* Build suffix (text after the specifier) into a second buffer */
+    char suffix[2048];
+    snprintf(suffix, sizeof(suffix), "%s", p);
+
+    char part1[2048];
+    switch (conv) {
+        case 'd': case 'i': {
+            double n = 0; arg_num(args, argc, 1, &n);
+            /* Replace conv with lld for safety */
+            spec[si-1] = '\0'; /* remove conv */
+            char fmtbuf[72]; snprintf(fmtbuf, sizeof(fmtbuf), "%slld", spec);
+            snprintf(part1, sizeof(part1), fmtbuf, (long long)n);
+            break;
+        }
+        case 'u': {
+            double n = 0; arg_num(args, argc, 1, &n);
+            spec[si-1] = '\0';
+            char fmtbuf[72]; snprintf(fmtbuf, sizeof(fmtbuf), "%sllu", spec);
+            snprintf(part1, sizeof(part1), fmtbuf, (unsigned long long)(long long)n);
+            break;
+        }
+        case 'x': case 'X': {
+            double n = 0; arg_num(args, argc, 1, &n);
+            spec[si-1] = '\0';
+            char fmtbuf[72]; snprintf(fmtbuf, sizeof(fmtbuf), "%sll%c", spec, conv);
+            snprintf(part1, sizeof(part1), fmtbuf, (unsigned long long)(long long)n);
+            break;
+        }
+        case 'o': {
+            double n = 0; arg_num(args, argc, 1, &n);
+            spec[si-1] = '\0';
+            char fmtbuf[72]; snprintf(fmtbuf, sizeof(fmtbuf), "%sllo", spec);
+            snprintf(part1, sizeof(part1), fmtbuf, (unsigned long long)(long long)n);
+            break;
+        }
+        case 'f': case 'e': case 'E': case 'g': case 'G': {
+            double n = 0; arg_num(args, argc, 1, &n);
+            snprintf(part1, sizeof(part1), spec, n);
+            break;
+        }
+        case 's': default: {
+            xf_Value sv = xf_coerce_str(args[1]);
+            const char *s = (sv.state == XF_STATE_OK && sv.data.str) ? sv.data.str->data : "";
+            snprintf(part1, sizeof(part1), spec, s);
+            break;
+        }
+    }
+
+    snprintf(buf, sizeof(buf), "%s%s", part1, suffix);
     return make_str_val(buf, strlen(buf));
 }
 
