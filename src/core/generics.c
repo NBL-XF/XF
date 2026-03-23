@@ -194,7 +194,9 @@ static xf_Value cg_strip(xf_Value *args, size_t argc) {
         xf_arr_t *in = v.data.arr, *out = xf_arr_new();
         for (size_t i = 0; i < in->len; i++) {
             xf_Value e = in->items[i];
-            if (e.state == XF_STATE_OK && e.type == XF_TYPE_STR && e.data.str) {
+            /* Filter out non-OK values (NAV, NULL, UNDEF) */
+            if (e.state != XF_STATE_OK) continue;
+            if (e.type == XF_TYPE_STR && e.data.str) {
                 const char *s = e.data.str->data;
                 size_t lo = 0, hi = e.data.str->len;
                 while (lo < hi && STRIP_CHAR(s[lo]))    lo++;
@@ -246,7 +248,7 @@ static xf_Value cg_contains(xf_Value *args, size_t argc) {
     if (coll.type == XF_TYPE_STR && coll.data.str) {
         xf_Value ns = xf_coerce_str(needle);
         if (ns.state != XF_STATE_OK || !ns.data.str) return xf_val_ok_num(0.0);
-        return xf_val_ok_num(strstr(coll.data.str->data, ns.data.str->data) ? 1.0 : 0.0);
+        return strstr(coll.data.str->data, ns.data.str->data) ? xf_val_true() : xf_val_false();
     }
     if (coll.type == XF_TYPE_ARR && coll.data.arr) {
         xf_Value ns = xf_coerce_str(needle);
@@ -264,9 +266,9 @@ static xf_Value cg_contains(xf_Value *args, size_t argc) {
         xf_Value ks = xf_coerce_str(needle);
         if (ks.state != XF_STATE_OK || !ks.data.str) return xf_val_ok_num(0.0);
         xf_Value got = xf_map_get(coll.data.map, ks.data.str);
-        return xf_val_ok_num(got.state == XF_STATE_OK ? 1.0 : 0.0);
+        return got.state == XF_STATE_OK ? xf_val_true() : xf_val_false();
     }
-    return xf_val_ok_num(0.0);
+    return xf_val_false();
 }
 
 static xf_Value cg_length(xf_Value *args, size_t argc) {

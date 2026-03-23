@@ -213,6 +213,37 @@ static xf_Value cd_values(xf_Value *args, size_t argc) {
 static xf_Value cd_filter(xf_Value *args, size_t argc) {
     NEED(2);
     xf_arr_t *ds; if (!ds_arg_arr(args,argc,0,&ds)) return propagate(args,argc);
+
+    /* Function predicate: filter(ds, fn(row) -> bool) */
+    if (args[1].state == XF_STATE_OK && args[1].type == XF_TYPE_FN && args[1].data.fn) {
+        xf_fn_t *fn = args[1].data.fn;
+        xf_fn_caller_t caller = core_get_fn_caller();
+        void *vm = core_get_fn_caller_vm();
+        void *sy = core_get_fn_caller_syms();
+        xf_arr_t *out = xf_arr_new();
+        for (size_t i = 0; i < ds->len; i++) {
+            xf_Value row = ds->items[i];
+            xf_Value res = xf_val_ok_num(0.0);
+            if (fn->is_native && fn->native_v) {
+                res = fn->native_v(&row, 1);
+            } else if (caller && vm) {
+                res = caller(vm, sy, fn, &row, 1);
+            }
+            bool keep = false;
+            if (res.state == XF_STATE_OK) {
+                keep = (res.data.num != 0.0);
+            } else if (res.state == XF_STATE_TRUE) {
+                keep = true;
+            } else if (res.state == XF_STATE_FALSE) {
+                keep = false;
+            }
+            if (keep) xf_arr_push(out, xf_value_retain(row));
+            xf_value_release(res);
+        }
+        xf_Value v = xf_val_ok_arr(out); xf_arr_release(out); return v;
+    }
+
+    /* Column/value filter: filter(ds, col) or filter(ds, col, val) */
     const char *col; size_t clen; if (!arg_str(args,argc,1,&col,&clen)) return propagate(args,argc);
     bool has_val=(argc>=3&&args[2].state==XF_STATE_OK);
     xf_Value match_vs=has_val?xf_coerce_str(args[2]):xf_val_nav(XF_TYPE_VOID);

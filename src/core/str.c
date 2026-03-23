@@ -186,13 +186,13 @@ static xf_Value cs_contains(xf_Value *args, size_t argc) {
     const char *pat; int cflags; bool is_regex;
     if (!cs_arg_pat(args, argc, 1, &pat, &cflags, &is_regex))
         return propagate(args, argc);
-    if (!is_regex) return xf_val_ok_num(strstr(s, pat) ? 1.0 : 0.0);
+    if (!is_regex) return strstr(s, pat) ? xf_val_true() : xf_val_false();
     regex_t re; char errbuf[128];
     if (!cr_compile(pat, cflags, &re, errbuf, sizeof(errbuf)))
         return xf_val_ok_num(0);
     int rc = regexec(&re, s, 0, NULL, 0);
     regfree(&re);
-    return xf_val_ok_num(rc == 0 ? 1.0 : 0.0);
+    return rc == 0 ? xf_val_true() : xf_val_false();
 }
 
 static xf_Value cs_starts_with(xf_Value *args, size_t argc) {
@@ -201,7 +201,7 @@ static xf_Value cs_starts_with(xf_Value *args, size_t argc) {
     if (!arg_str(args, argc, 0, &s,   &slen))   return propagate(args, argc);
     if (!arg_str(args, argc, 1, &pre, &prelen)) return propagate(args, argc);
     if (prelen > slen) return xf_val_ok_num(0);
-    return xf_val_ok_num(memcmp(s, pre, prelen) == 0 ? 1.0 : 0.0);
+    return memcmp(s, pre, prelen) == 0 ? xf_val_true() : xf_val_false();
 }
 
 static xf_Value cs_ends_with(xf_Value *args, size_t argc) {
@@ -210,7 +210,7 @@ static xf_Value cs_ends_with(xf_Value *args, size_t argc) {
     if (!arg_str(args, argc, 0, &s,   &slen))   return propagate(args, argc);
     if (!arg_str(args, argc, 1, &suf, &suflen)) return propagate(args, argc);
     if (suflen > slen) return xf_val_ok_num(0);
-    return xf_val_ok_num(memcmp(s + slen - suflen, suf, suflen) == 0 ? 1.0 : 0.0);
+    return memcmp(s + slen - suflen, suf, suflen) == 0 ? xf_val_true() : xf_val_false();
 }
 
 static xf_Value cs_replace(xf_Value *args, size_t argc) {

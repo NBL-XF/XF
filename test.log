@@ -1,26 +1,5 @@
-FAIL  cmp/ship_cross  got=-6  expected=0
-FAIL  map/has_t  got=1  expected=true
-FAIL  map/has_f  got=0  expected=false
-FAIL  map/remove_gone  got=0  expected=false
-FAIL  set/has_t  got=1  expected=true
-FAIL  set/has_f  got=0  expected=false
-FAIL  str/starts_t  got=1  expected=true
-FAIL  str/starts_f  got=0  expected=false
-FAIL  str/ends_t  got=1  expected=true
-FAIL  str/ends_f  got=0  expected=false
-FAIL  str/cont_t  got=1  expected=true
-FAIL  str/cont_f  got=0  expected=false
 FAIL  regex/split_n  got=1  expected=3
 FAIL  regex/split_0  got=module  expected=one
-FAIL  fmt/json_k  got=1  expected=true
-FAIL  gen/cont_arr_t  got=1  expected=true
-FAIL  gen/cont_arr_f  got=0  expected=false
-FAIL  gen/cont_str_t  got=1  expected=true
-FAIL  ds/filter  got=0  expected=3
-FAIL  ds/agg_eng  got=1  expected=true
-FAIL  ds/agg_hr  got=1  expected=true
 FAIL  process/run_len  got=0  expected=5
-FAIL  delete/map_gone  got=0  expected=false
-FAIL  json/has_nested  got=0  expected=true
-  FAIL: 31
+  FAIL: 4
 RESULT: FAILED

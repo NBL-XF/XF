@@ -623,14 +623,8 @@ void interp_error(Interp *it, Loc loc, const char *fmt, ...) {
     fprintf(stdout, "──────────────────────────────────────────\n");
 }
 static void xf_print_value(FILE *out, xf_Value v) {
-if (v.state == XF_STATE_TRUE) {
-        fputc('1', out);
-        return;
-    }
-    if (v.state == XF_STATE_FALSE) {
-        fputc('0', out);
-        return;
-    }
+    if (v.state == XF_STATE_TRUE)  { fputs("true",  out); return; }
+    if (v.state == XF_STATE_FALSE) { fputs("false", out); return; }
         switch (v.state) {
         case XF_STATE_OK:
             break;
@@ -774,23 +768,11 @@ static xf_Value make_bool(bool b) {
     return b ? xf_val_true() : xf_val_false();
 }
 static int val_cmp(xf_Value a, xf_Value b) {
-    /* States must match for equality. Different states → not equal. */
-    if (a.state != b.state) return (int)a.state - (int)b.state;
-
-    /* Same state, not OK → equal to each other (NULL==NULL, NAV==NAV) */
-    if (a.state != XF_STATE_OK) return 0;
-
-    /* Both OK — cross-type: incompatible types are unordered (spaceship → 0) */
-    if (a.type != b.type) {
-        xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
-        if (na.state == XF_STATE_OK && nb.state == XF_STATE_OK) {
-            if (na.data.num < nb.data.num) return -1;
-            if (na.data.num > nb.data.num) return  1;
-            return 0;
-        }
-        return 0;  /* truly incompatible types: unordered */
+    /* Both non-OK: compare states directly (NULL != NAV, TRUE != FALSE).
+     * If only one is non-OK, fall through to coercion so num(1) == TRUE works. */
+    if (a.state != XF_STATE_OK && b.state != XF_STATE_OK) {
+        return (int)a.state - (int)b.state;
     }
-
     /* numeric path */
     xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
     if (na.state == XF_STATE_OK && nb.state == XF_STATE_OK) {
@@ -1302,15 +1284,15 @@ if (strcmp(name, "join") == 0 && argc == 2) {
     }
     if (strcmp(name,"has")==0 && argc==2) {
         xf_Value coll=args[0];
-        if (coll.state!=XF_STATE_OK||!coll.data.map) return xf_val_ok_num(0);
+        if (coll.state!=XF_STATE_OK||!coll.data.map) return xf_val_false();
         if (coll.type==XF_TYPE_MAP||coll.type==XF_TYPE_SET) {
             xf_Value ks=xf_coerce_str(args[1]);
-            if (ks.state!=XF_STATE_OK||!ks.data.str) { xf_value_release(ks); return xf_val_ok_num(0); }
-            double _has = xf_map_get(coll.data.map,ks.data.str).state!=XF_STATE_NAV ? 1.0 : 0.0;
+            if (ks.state!=XF_STATE_OK||!ks.data.str) { xf_value_release(ks); return xf_val_false(); }
+            bool _has = xf_map_get(coll.data.map,ks.data.str).state!=XF_STATE_NAV;
             xf_value_release(ks);
-            return xf_val_ok_num(_has);
+            return _has ? xf_val_true() : xf_val_false();
         }
-        return xf_val_ok_num(0);
+        return xf_val_false();
     }
     if (strcmp(name,"keys")==0 && argc==1) {
         xf_Value coll=args[0];
@@ -1489,23 +1471,15 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
             if (item->kind == EXPR_SPREAD) {
                 /* ..arr — expand each element into this array */
                 xf_Value sv = interp_eval_expr(it, item->as.spread.operand);
-                if (sv.state != XF_STATE_OK) {
-                    xf_arr_release(a);
-                    return sv;
-                }
-                if (sv.type == XF_TYPE_ARR && sv.data.arr) {
+                if (sv.state == XF_STATE_OK && sv.type == XF_TYPE_ARR && sv.data.arr) {
                     xf_arr_t *src = sv.data.arr;
                     for (size_t j = 0; j < src->len; j++)
                         xf_arr_push(a, xf_value_retain(src->items[j]));
                 }
                 xf_value_release(sv);
             } else {
-                xf_Value v = interp_eval_expr(it, item);
-                if (v.state != XF_STATE_OK) {
-                    xf_arr_release(a);
-                    return v;
-                }
-                xf_arr_push(a, v);
+                /* Include all values (OK, NAV, NULL, etc.) — don't propagate errors */
+                xf_arr_push(a, interp_eval_expr(it, item));
             }
         }
         xf_Value out = xf_val_ok_arr(a);
@@ -1527,11 +1501,8 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
                 return kv;
             }
 
+            /* Allow non-OK values (NULL, NAV) as map values */
             xf_Value vv = interp_eval_expr(it, e->as.map_lit.vals[i]);
-            if (vv.state != XF_STATE_OK) {
-                xf_map_release(m);
-                return vv;
-            }
 
             xf_Value ks = xf_coerce_str(kv);
             if (ks.state != XF_STATE_OK) {
@@ -1907,7 +1878,10 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
             case BINOP_GT:        return make_bool(val_cmp(a, b) > 0);
             case BINOP_LTE:       return make_bool(val_cmp(a, b) <= 0);
             case BINOP_GTE:       return make_bool(val_cmp(a, b) >= 0);
-            case BINOP_SPACESHIP: return xf_val_ok_num((double)val_cmp(a, b));
+            case BINOP_SPACESHIP:
+                /* Cross-type or mixed-state → unordered → 0 */
+                if (a.state != b.state) return xf_val_ok_num(0.0);
+                return xf_val_ok_num((double)val_cmp(a, b));
 
             case BINOP_MATCH:
             case BINOP_NMATCH: {
