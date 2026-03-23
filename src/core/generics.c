@@ -1,93 +1,163 @@
 #include "internal.h"
 
+
 static xf_Value cg_join(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value coll = args[0];
     if (coll.state != XF_STATE_OK) return coll;
-    const char *sep; size_t seplen;
+
+    const char *sep;
+    size_t seplen;
     if (!arg_str(args, argc, 1, &sep, &seplen)) return propagate(args, argc);
 
     if (coll.type == XF_TYPE_NUM) {
         if (argc < 3) return xf_val_nav(XF_TYPE_VOID);
+
         xf_Value as = xf_coerce_str(coll);
         xf_Value bs = xf_coerce_str(args[2]);
-        if (as.state != XF_STATE_OK || bs.state != XF_STATE_OK)
+        if (as.state != XF_STATE_OK || bs.state != XF_STATE_OK) {
+            if (as.state == XF_STATE_OK) xf_value_release(as);
+            if (bs.state == XF_STATE_OK) xf_value_release(bs);
             return propagate(args, argc);
-        size_t alen = as.data.str->len, blen = bs.data.str->len;
+        }
+
+        size_t alen = as.data.str->len;
+        size_t blen = bs.data.str->len;
         size_t total = alen + seplen + blen;
+
         char *buf = malloc(total + 1);
         memcpy(buf,                 as.data.str->data, alen);
         memcpy(buf + alen,          sep,               seplen);
         memcpy(buf + alen + seplen, bs.data.str->data, blen);
         buf[total] = '\0';
-        xf_Value joined = make_str_val(buf, total); free(buf);
-        xf_str_release(as.data.str); xf_str_release(bs.data.str);
+
+        xf_Value joined = make_str_val(buf, total);
+        free(buf);
+
+        xf_value_release(as);
+        xf_value_release(bs);
+
         xf_Value num_try = xf_coerce_num(joined);
-        if (num_try.state == XF_STATE_OK) return num_try;
+        if (num_try.state == XF_STATE_OK) {
+            xf_value_release(joined);
+            return num_try;
+        }
+
         fprintf(stderr, "xf warning: join of num values produced non-numeric result\n");
         return joined;
     }
 
     if (coll.type == XF_TYPE_STR && coll.data.str) {
         if (argc < 3) return coll;
-        const char *a = coll.data.str->data; size_t alen = coll.data.str->len;
-        const char *b; size_t blen;
+
+        const char *a = coll.data.str->data;
+        size_t alen = coll.data.str->len;
+
+        const char *b;
+        size_t blen;
         if (!arg_str(args, argc, 2, &b, &blen)) return propagate(args, argc);
+
         size_t total = alen + seplen + blen;
         char *buf = malloc(total + 1);
-        memcpy(buf, a, alen); memcpy(buf+alen, sep, seplen); memcpy(buf+alen+seplen, b, blen);
+        memcpy(buf, a, alen);
+        memcpy(buf + alen, sep, seplen);
+        memcpy(buf + alen + seplen, b, blen);
         buf[total] = '\0';
-        xf_Value v = make_str_val(buf, total); free(buf); return v;
+
+        xf_Value v = make_str_val(buf, total);
+        free(buf);
+        return v;
     }
 
     if (coll.type == XF_TYPE_ARR && coll.data.arr) {
-        xf_arr_t *a = coll.data.arr; size_t total = 0;
+        xf_arr_t *a = coll.data.arr;
+        size_t total = 0;
+
         for (size_t i = 0; i < a->len; i++) {
             xf_Value sv = xf_coerce_str(a->items[i]);
-            if (sv.state == XF_STATE_OK && sv.data.str) total += sv.data.str->len;
-            if (i + 1 < a->len) total += seplen;
+            if (sv.state == XF_STATE_OK && sv.data.str)
+                total += sv.data.str->len;
+            if (i + 1 < a->len)
+                total += seplen;
+            xf_value_release(sv);
         }
-        char *buf = malloc(total + 1); size_t pos = 0;
+
+        char *buf = malloc(total + 1);
+        size_t pos = 0;
+
         for (size_t i = 0; i < a->len; i++) {
             xf_Value sv = xf_coerce_str(a->items[i]);
             if (sv.state == XF_STATE_OK && sv.data.str) {
-                memcpy(buf+pos, sv.data.str->data, sv.data.str->len);
+                memcpy(buf + pos, sv.data.str->data, sv.data.str->len);
                 pos += sv.data.str->len;
             }
-            if (i + 1 < a->len) { memcpy(buf+pos, sep, seplen); pos += seplen; }
+            if (i + 1 < a->len) {
+                memcpy(buf + pos, sep, seplen);
+                pos += seplen;
+            }
+            xf_value_release(sv);
         }
+
         buf[pos] = '\0';
-        xf_Value v = make_str_val(buf, pos); free(buf); return v;
+        xf_Value v = make_str_val(buf, pos);
+        free(buf);
+        return v;
     }
 
     if ((coll.type == XF_TYPE_MAP || coll.type == XF_TYPE_SET) && coll.data.map) {
         xf_map_t *m = coll.data.map;
         bool is_set = (coll.type == XF_TYPE_SET);
         size_t total = 0;
+
         for (size_t i = 0; i < m->order_len; i++) {
             xf_Value sv;
-            if (is_set) sv = xf_val_ok_str(m->order[i]);
-            else { xf_Value val = xf_map_get(m, m->order[i]); sv = xf_coerce_str(val); }
-            if (sv.state == XF_STATE_OK && sv.data.str) total += sv.data.str->len;
-            if (i + 1 < m->order_len) total += seplen;
+            if (is_set) {
+                sv = xf_val_ok_str(m->order[i]);
+            } else {
+                xf_Value val = xf_map_get(m, m->order[i]);
+                sv = xf_coerce_str(val);
+            }
+
+            if (sv.state == XF_STATE_OK && sv.data.str)
+                total += sv.data.str->len;
+            if (i + 1 < m->order_len)
+                total += seplen;
+
+            xf_value_release(sv);
         }
-        char *buf = malloc(total + 1); size_t pos = 0;
+
+        char *buf = malloc(total + 1);
+        size_t pos = 0;
+
         for (size_t i = 0; i < m->order_len; i++) {
             xf_Value sv;
-            if (is_set) sv = xf_val_ok_str(m->order[i]);
-            else { xf_Value val = xf_map_get(m, m->order[i]); sv = xf_coerce_str(val); }
+            if (is_set) {
+                sv = xf_val_ok_str(m->order[i]);
+            } else {
+                xf_Value val = xf_map_get(m, m->order[i]);
+                sv = xf_coerce_str(val);
+            }
+
             if (sv.state == XF_STATE_OK && sv.data.str) {
-                memcpy(buf+pos, sv.data.str->data, sv.data.str->len);
+                memcpy(buf + pos, sv.data.str->data, sv.data.str->len);
                 pos += sv.data.str->len;
             }
-            if (i + 1 < m->order_len) { memcpy(buf+pos, sep, seplen); pos += seplen; }
+            if (i + 1 < m->order_len) {
+                memcpy(buf + pos, sep, seplen);
+                pos += seplen;
+            }
+
+            xf_value_release(sv);
         }
+
         buf[pos] = '\0';
-        xf_Value v = make_str_val(buf, pos); free(buf); return v;
+        xf_Value v = make_str_val(buf, pos);
+        free(buf);
+        return v;
     }
+
     return xf_val_nav(XF_TYPE_STR);
 }
-
 static xf_Value cg_split(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value src = args[0];
@@ -102,8 +172,9 @@ static xf_Value cg_split(xf_Value *args, size_t argc) {
         for (size_t i = 0; i < n; i++) {
             size_t from = i * per, to = from + per < sz ? from + per : sz;
             xf_arr_t *chunk = xf_arr_new();
-            for (size_t j = from; j < to; j++) xf_arr_push(chunk, in->items[j]);
-            xf_Value cv = xf_val_ok_arr(chunk); xf_arr_release(chunk);
+for (size_t j = from; j < to; j++)
+    xf_arr_push(chunk, xf_value_retain(in->items[j]));
+                xf_Value cv = xf_val_ok_arr(chunk); xf_arr_release(chunk);
             xf_arr_push(out, cv);
             if (to >= sz) break;
         }
@@ -119,8 +190,11 @@ static xf_Value cg_split(xf_Value *args, size_t argc) {
             xf_map_t *chunk = xf_map_new();
             for (size_t j = from; j < to; j++) {
                 xf_Str *key = in->order[j];
-                xf_map_set(chunk, key, xf_map_get(in, key));
-            }
+for (size_t j = from; j < to; j++) {
+    xf_Str *key = in->order[j];
+    xf_map_set(chunk, key, xf_value_retain(xf_map_get(in, key)));
+}
+                        }
             xf_Value cv = xf_val_ok_map(chunk); xf_map_release(chunk);
             xf_arr_push(out, cv);
             if (to >= sz) break;
@@ -247,30 +321,54 @@ static xf_Value cg_contains(xf_Value *args, size_t argc) {
 
     if (coll.type == XF_TYPE_STR && coll.data.str) {
         xf_Value ns = xf_coerce_str(needle);
-        if (ns.state != XF_STATE_OK || !ns.data.str) return xf_val_ok_num(0.0);
-        return strstr(coll.data.str->data, ns.data.str->data) ? xf_val_true() : xf_val_false();
+        if (ns.state != XF_STATE_OK || !ns.data.str) {
+            if (ns.state == XF_STATE_OK) xf_value_release(ns);
+            return xf_val_ok_num(0.0);
+        }
+
+        bool found = strstr(coll.data.str->data, ns.data.str->data) != NULL;
+        xf_value_release(ns);
+        return found ? xf_val_true() : xf_val_false();
     }
+
     if (coll.type == XF_TYPE_ARR && coll.data.arr) {
         xf_Value ns = xf_coerce_str(needle);
-        if (ns.state != XF_STATE_OK || !ns.data.str) return xf_val_ok_num(0.0);
+        if (ns.state != XF_STATE_OK || !ns.data.str) {
+            if (ns.state == XF_STATE_OK) xf_value_release(ns);
+            return xf_val_ok_num(0.0);
+        }
+
         xf_arr_t *a = coll.data.arr;
         for (size_t i = 0; i < a->len; i++) {
             xf_Value es = xf_coerce_str(a->items[i]);
-            if (es.state == XF_STATE_OK && es.data.str &&
-                strcmp(es.data.str->data, ns.data.str->data) == 0)
+            bool match = (es.state == XF_STATE_OK &&
+                          es.data.str &&
+                          strcmp(es.data.str->data, ns.data.str->data) == 0);
+            xf_value_release(es);
+            if (match) {
+                xf_value_release(ns);
                 return xf_val_ok_num(1.0);
+            }
         }
+
+        xf_value_release(ns);
         return xf_val_ok_num(0.0);
     }
+
     if ((coll.type == XF_TYPE_MAP || coll.type == XF_TYPE_SET) && coll.data.map) {
         xf_Value ks = xf_coerce_str(needle);
-        if (ks.state != XF_STATE_OK || !ks.data.str) return xf_val_ok_num(0.0);
+        if (ks.state != XF_STATE_OK || !ks.data.str) {
+            if (ks.state == XF_STATE_OK) xf_value_release(ks);
+            return xf_val_ok_num(0.0);
+        }
+
         xf_Value got = xf_map_get(coll.data.map, ks.data.str);
+        xf_value_release(ks);
         return got.state == XF_STATE_OK ? xf_val_true() : xf_val_false();
     }
+
     return xf_val_false();
 }
-
 static xf_Value cg_length(xf_Value *args, size_t argc) {
     NEED(1);
     xf_Value v = args[0];

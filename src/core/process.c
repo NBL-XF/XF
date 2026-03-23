@@ -203,12 +203,18 @@ static xf_Value cp_run(xf_Value *args, size_t argc) {
             xf_fn_caller_t caller = core_get_fn_caller();
             void *vm = core_get_fn_caller_vm();
             void *sy = core_get_root_syms();
+
             xf_Value cv = xf_val_ok_arr(ctxs[i].chunk);
-            ctxs[i].result = (caller && vm) ? caller(vm, sy, fn, &cv, 1)
-                                                  : xf_val_nav(XF_TYPE_FN);
-            xf_value_release(cv); ctxs[i].done = true; continue;
+            ctxs[i].result = (caller && vm)
+                ? caller(vm, sy, fn, &cv, 1)
+                : xf_val_nav(XF_TYPE_FN);
+
+            xf_value_release(cv);
+            ctxs[i].done = true;
+            continue;
         }
-        pthread_attr_t attr; pthread_attr_init(&attr);
+        
+                        pthread_attr_t attr; pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
         if (pthread_create(&tids[i], &attr, cp_thread_fn, &ctxs[i]) != 0) {
             tids[i] = 0; ctxs[i].result = xf_val_null(); ctxs[i].done = true;
@@ -220,7 +226,6 @@ static xf_Value cp_run(xf_Value *args, size_t argc) {
     for (size_t i = 0; i < nw; i++) {
         if (tids[i]) pthread_join(tids[i], NULL);
         xf_arr_push(out, ctxs[i].result);
-        xf_value_release(ctxs[i].result);
         if (ctxs[i].chunk) xf_arr_release(ctxs[i].chunk);
     }
     xf_str_release(k_fn); xf_str_release(k_data);
