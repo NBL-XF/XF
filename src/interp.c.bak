@@ -155,7 +155,6 @@ static void *spawn_thread_fn(void *arg) {
                                          fn->params[i].type,
                                          (Loc){.source="<spawn>", .line=0, .col=0});
                 if (ps) {
-                    xf_value_release(ps->value);
                     ps->value = xf_value_retain(av);
                     ps->state = av.state;
                     ps->is_defined = true;
@@ -164,15 +163,22 @@ static void *spawn_thread_fn(void *arg) {
 
             it.returning = false;
             interp_eval_stmt(&it, (Stmt *)fn->body);
-xf_Value ret0 = it.returning ? it.return_val : xf_val_null();
-ctx->result = xf_value_retain(ret0);
-it.returning = false;
+            ctx->result = it.returning ? it.return_val : xf_val_null();
+            it.returning = false;
 
-scope_free(sym_pop(&syms));
-                } else if (fn->native_v) {
+            scope_free(sym_pop(&syms));
+        } else if (fn->native_v) {
             ctx->result = fn->native_v(ctx->args, ctx->argc);
         }
-}
+    }
+
+    /* IMPORTANT: ctx owns fn_val/args for the lifetime of the spawn slot.
+     * Do NOT release them here.
+     *
+     * The join/free path releases the slot after pthread_join(). Releasing
+     * here as well causes a double-release/use-after-free when the slot is
+     * later reclaimed, which showed up as a bus error under fan-out tests.
+     */
     interp_free(&it);
     vm_rec_snapshot_free(&it.rec_snap);
     sym_free(&syms);
@@ -201,13 +207,12 @@ static void copy_globals_from(SymTable *dst, SymTable *src) {
         Symbol *s = &sg->entries[i];
         if (!s->name) continue;   /* empty slot */
         Symbol *ds = sym_declare(dst, s->name, s->kind, s->type, s->decl_loc);
-if (ds) {
-    xf_value_release(ds->value);
-    ds->value      = xf_value_retain(s->value);
-    ds->state      = s->state;
-    ds->is_const   = s->is_const;
-    ds->is_defined = s->is_defined;
-}
+        if (ds) {
+            ds->value      = xf_value_retain(s->value);
+            ds->state      = s->state;
+            ds->is_const   = s->is_const;
+            ds->is_defined = s->is_defined;
+        }
     }
 }
 
@@ -257,21 +262,15 @@ static xf_Value interp_exec_xf_fn(void *vm_ptr, void *syms_ptr,
         Symbol *ps = sym_declare(&syms, fn->params[i].name,
                                   SYM_PARAM, fn->params[i].type,
                                   (Loc){.source="<worker>",.line=0,.col=0});
-                                  if (ps) {
-    xf_value_release(ps->value);
-    ps->value      = xf_value_retain(av);
-    ps->state      = av.state;
-    ps->is_defined = true;
-}
+        if (ps) { ps->value = xf_value_retain(av); ps->state = av.state; ps->is_defined = true; }
     }
 
     it.returning = false;
     interp_eval_stmt(&it, (Stmt *)fn->body);
-    xf_Value ret0 = it.returning ? it.return_val : xf_val_null();
-xf_Value result = xf_value_retain(ret0);
-it.returning = false;
+    xf_Value result = it.returning ? it.return_val : xf_val_null();
+    it.returning = false;
 
-scope_free(sym_pop(&syms));
+    scope_free(sym_pop(&syms));
     interp_free(&it);
     vm_rec_snapshot_free(&it.rec_snap);
     sym_free(&syms);
@@ -454,7 +453,7 @@ static bool bind_loop_value(Interp *it, LoopBind *bind, xf_Value v, Loc loc) {
                                       SYM_VAR, XF_TYPE_VOID, loc);
             if (!sym) {
                 interp_error(it, loc, "failed to bind loop variable '%s'",
-                             ((bind->as.name && bind->as.name->data) ? bind->as.name->data : "<null>"));
+                             bind->as.name ? bind->as.name->data : "<null>");
                 return false;
             }
 
@@ -599,7 +598,6 @@ void interp_error(Interp *it, Loc loc, const char *fmt, ...) {
 
     char msg[1024];
     va_list ap;
-    fmt = fmt ? fmt : "<null fmt>";
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt ? fmt : "<error>", ap);
     va_end(ap);
@@ -947,7 +945,7 @@ static bool lvalue_store(Interp *it, Expr *target, xf_Value val) {
             } else {
                 elem = xf_value_retain(val);   /* broadcast scalar */
             }
-            bool ok = lvalue_store(it, target->as.tuple_lit.items[i], xf_value_retain(elem));
+            bool ok = lvalue_store(it, target->as.tuple_lit.items[i], elem);
             xf_value_release(elem);
             if (!ok) return false;
         }
@@ -962,7 +960,7 @@ static xf_Value lvalue_load(Interp *it, Expr *target) {
         Symbol *s = sym_lookup_str(it->syms, target->as.ident.name);
         if (!s) {
             interp_error(it, target->loc, "undefined variable '%s'",
-                         ((target->as.ident.name && target->as.ident.name->data) ? target->as.ident.name->data : "<null-ident>"));
+                         target->as.ident.name->data);
             return xf_val_nav(XF_TYPE_VOID);
         }
         return xf_value_retain(s->value);
@@ -1141,13 +1139,13 @@ static const CoreRoute k_core_routes[] = {
     { "match",   "regex",    "match"  },
     { "rand",    "math", "rand"        },
     { "sin",     "math", "sin"         },
-    { "split",   "generics", "split"  },
+    { "split",   "generics", "split"  }, 
     { "sprintf", "str",  "sprintf"     },
     { "sqrt",    "math", "sqrt"        },
     { "srand",   "math", "srand"       },
     { "sub",     "str",  "replace"     },
     { "substr",  "str",  "substr"      },
-    { "time",    "os",       "time"   },
+    { "time",    "os",       "time"   }, 
     { "tolower", "str",  "lower"       },
     { "toupper", "str",  "upper"       },
     { "trim",    "str",  "trim"        },
@@ -1560,7 +1558,7 @@ case EXPR_SET_LIT: {
         Symbol *s = sym_lookup_str(it->syms, e->as.ident.name);
         if (!s) {
             interp_error(it, e->loc, "undefined variable '%s'",
-                         ((e->as.ident.name && e->as.ident.name->data) ? e->as.ident.name->data : "<null-ident>"));
+                         e->as.ident.name->data);
             return xf_val_nav(XF_TYPE_VOID);
         }
         return xf_value_retain(s->value);
@@ -2001,7 +1999,7 @@ case EXPR_SET_LIT: {
                 return v;
         }
     }
-
+    
     case EXPR_ASSIGN: {
     xf_Value rhs = interp_eval_expr(it, e->as.assign.value);
 
@@ -2042,40 +2040,27 @@ case EXPR_WALRUS: {
 
     return xf_value_retain(rhs);
 }
-case EXPR_CALL: {
+    case EXPR_CALL: {
     xf_Value args[64];
     size_t argc = e->as.call.argc < 64 ? e->as.call.argc : 64;
 
     for (size_t i = 0; i < argc; i++)
         args[i] = interp_eval_expr(it, e->as.call.args[i]);
 
-    /* -----------------------------
-     * MEMBER CALL: obj.method(...)
-     * ----------------------------- */
     if (e->as.call.callee->kind == EXPR_MEMBER) {
         Expr *member = e->as.call.callee;
-
         xf_Value obj = interp_eval_expr(it, member->as.member.obj);
+        const char *mname = member->as.member.field->data;
 
-        const char *mname =
-            (member->as.member.field && member->as.member.field->data)
-            ? member->as.member.field->data
-            : "<null-member>";
-
-        /* -------- MODULE CALL -------- */
         if (obj.state == XF_STATE_OK &&
             obj.type == XF_TYPE_MODULE &&
             obj.data.mod) {
-
-            xf_Value callee = xf_module_get(obj.data.mod, mname);
-
-            if (callee.state == XF_STATE_OK &&
-                callee.type == XF_TYPE_FN &&
+            xf_Value callee = interp_eval_expr(it, e->as.call.callee);
+            if (callee.type == XF_TYPE_FN &&
+                callee.state == XF_STATE_OK &&
                 callee.data.fn) {
-
                 xf_Fn *fn = callee.data.fn;
 
-                /* ---- XF function ---- */
                 if (!fn->is_native) {
                     Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
                     fn_sc->fn_ret_type = fn->return_type;
@@ -2083,27 +2068,24 @@ case EXPR_CALL: {
                     for (size_t i = 0; i < fn->param_count; i++) {
                         xf_Value av = i < argc ? args[i]
                                                : xf_val_undef(fn->params[i].type);
-
-                        Symbol *ps = sym_declare(it->syms,
-                                                 fn->params[i].name,
-                                                 SYM_PARAM,
-                                                 fn->params[i].type,
-                                                 e->loc);
+                        Symbol *ps = sym_declare(it->syms, fn->params[i].name,
+                                                 SYM_PARAM, fn->params[i].type, e->loc);
                         if (ps) {
-                            xf_value_release(ps->value);
-                            ps->value = xf_value_retain(av);
-                            ps->state = av.state;
-                            ps->is_defined = true;
+                        xf_value_release(ps->value);
+ps->value = xf_value_retain(av);
+ps->state = av.state;
+ps->is_defined = true;
                         }
                     }
 
-                    it->returning = false;
-                    interp_eval_stmt(it, (Stmt *)fn->body);
+it->returning = false;
+xf_Value bodyv = interp_eval_stmt(it, (Stmt *)fn->body);
 
-                    xf_Value ret0 = it->returning ? it->return_val : xf_val_null();
-                    xf_Value ret  = xf_value_retain(ret0);
-                    it->returning = false;
+xf_Value ret = it->returning ? it->return_val : xf_val_null();
+it->returning = false;
 
+/* STMT_RETURN still aliases it->return_val, so do not release bodyv here yet. */
+(void)bodyv;
                     scope_free(sym_pop(it->syms));
 
                     if (fn->return_type != XF_TYPE_VOID &&
@@ -2118,68 +2100,112 @@ case EXPR_CALL: {
                     return ret;
                 }
 
-                /* ---- native fn ---- */
-                if (fn->native_v) {
-                    xf_Value ret0 = fn->native_v(args, argc);
-                    xf_Value ret  = xf_value_retain(ret0);
-
+                if (fn->is_native && fn->native_v) {
+                xf_Value ret0 = fn->native_v(args, argc);
+xf_Value ret = xf_value_retain(ret0);
                     xf_value_release(callee);
                     xf_value_release(obj);
                     for (size_t i = 0; i < argc; i++)
                         xf_value_release(args[i]);
-
                     return ret;
                 }
             }
-
-            const char *modname =
-                (obj.data.mod && obj.data.mod->name)
-                ? obj.data.mod->name
-                : "<module>";
 
             xf_value_release(callee);
             xf_value_release(obj);
             for (size_t i = 0; i < argc; i++)
                 xf_value_release(args[i]);
 
-            interp_error(it, e->loc, "'%s' has no member '%s'", modname, mname);
+            interp_error(it, e->loc, "unknown method '.%s'", mname);
             return xf_val_nav(XF_TYPE_VOID);
         }
 
-        /* -------- NON-MODULE MEMBER -------- */
+        /* Non-module member call */
         xf_Value margs[65];
         margs[0] = obj;
         for (size_t i = 0; i < argc && i + 1 < 65; i++)
             margs[i + 1] = args[i];
+        size_t margc = argc + 1;
 
-        xf_Value mr = interp_call_builtin(it, mname, margs, argc + 1);
+xf_Value mr = interp_call_builtin(it, mname, margs,
+                                  margc < 65 ? margc : 64);
+if (mr.state != XF_STATE_NAV) {
+    xf_Value ret = xf_value_retain(mr);
+    xf_value_release(obj);
+    for (size_t i = 0; i < argc; i++)
+        xf_value_release(args[i]);
+    return ret;
+}
+        xf_Value callee = interp_eval_expr(it, e->as.call.callee);
+        if (callee.type == XF_TYPE_FN &&
+            callee.state == XF_STATE_OK &&
+            callee.data.fn) {
+            xf_Fn *fn = callee.data.fn;
 
-        if (mr.state != XF_STATE_NAV) {
-            xf_Value ret = xf_value_retain(mr);
+            if (!fn->is_native) {
+                Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
+                fn_sc->fn_ret_type = fn->return_type;
 
-            xf_value_release(obj);
-            for (size_t i = 0; i < argc; i++)
-                xf_value_release(args[i]);
+                for (size_t i = 0; i < fn->param_count; i++) {
+                    xf_Value av = i < argc ? args[i]
+                                           : xf_val_undef(fn->params[i].type);
+                    Symbol *ps = sym_declare(it->syms, fn->params[i].name,
+                                             SYM_PARAM, fn->params[i].type, e->loc);
+                    if (ps) {
+xf_value_release(ps->value);
+ps->value = xf_value_retain(av);
+ps->state = av.state;
+ps->is_defined = true;
+                                        }
+                }
 
-            return ret;
+it->returning = false;
+xf_Value bodyv = interp_eval_stmt(it, (Stmt *)fn->body);
+
+xf_Value ret = it->returning ? it->return_val : xf_val_null();
+it->returning = false;
+
+/* STMT_RETURN still aliases it->return_val, so do not release bodyv here yet. */
+(void)bodyv;
+                scope_free(sym_pop(it->syms));
+
+                if (fn->return_type != XF_TYPE_VOID &&
+                    ret.state == XF_STATE_NULL)
+                    ret = xf_val_nav(fn->return_type);
+
+                xf_value_release(callee);
+                xf_value_release(obj);
+                for (size_t i = 0; i < argc; i++)
+                    xf_value_release(args[i]);
+
+                return ret;
+            }
+
+            if (fn->is_native && fn->native_v) {
+            xf_Value ret0 = fn->native_v(args, argc);
+xf_Value ret = xf_value_retain(ret0);
+                xf_value_release(callee);
+                xf_value_release(obj);
+                for (size_t i = 0; i < argc; i++)
+                    xf_value_release(args[i]);
+                return ret;
+            }
         }
 
+        xf_value_release(callee);
         xf_value_release(obj);
-    }
+        for (size_t i = 0; i < argc; i++)
+            xf_value_release(args[i]);
 
-    /* -----------------------------
-     * NORMAL CALL: f(...)
-     * ----------------------------- */
+        interp_error(it, e->loc, "unknown method '.%s'", mname);
+        return xf_val_nav(XF_TYPE_VOID);
+    }
 
     xf_Value callee = interp_eval_expr(it, e->as.call.callee);
 
-    if (callee.state == XF_STATE_OK &&
-        callee.type == XF_TYPE_FN &&
-        callee.data.fn) {
-
+    if (callee.type == XF_TYPE_FN && callee.state == XF_STATE_OK && callee.data.fn) {
         xf_Fn *fn = callee.data.fn;
 
-        /* ---- XF function ---- */
         if (!fn->is_native) {
             Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
             fn_sc->fn_ret_type = fn->return_type;
@@ -2187,31 +2213,26 @@ case EXPR_CALL: {
             for (size_t i = 0; i < fn->param_count; i++) {
                 xf_Value av = i < argc ? args[i]
                                        : xf_val_undef(fn->params[i].type);
-
-                Symbol *ps = sym_declare(it->syms,
-                                         fn->params[i].name,
-                                         SYM_PARAM,
-                                         fn->params[i].type,
-                                         e->loc);
+                Symbol *ps = sym_declare(it->syms, fn->params[i].name,
+                                         SYM_PARAM, fn->params[i].type, e->loc);
                 if (ps) {
-                    xf_value_release(ps->value);
-                    ps->value = xf_value_retain(av);
-                    ps->state = av.state;
-                    ps->is_defined = true;
-                }
+xf_value_release(ps->value);
+ps->value = xf_value_retain(av);
+ps->state = av.state;
+ps->is_defined = true;
+                                }
             }
+it->returning = false;
+xf_Value bodyv = interp_eval_stmt(it, (Stmt *)fn->body);
 
-            it->returning = false;
-            interp_eval_stmt(it, (Stmt *)fn->body);
+xf_Value ret = it->returning ? it->return_val : xf_val_null();
+it->returning = false;
 
-            xf_Value ret0 = it->returning ? it->return_val : xf_val_null();
-            xf_Value ret  = xf_value_retain(ret0);
-            it->returning = false;
-
+/* STMT_RETURN still aliases it->return_val, so do not release bodyv here yet. */
+(void)bodyv;
             scope_free(sym_pop(it->syms));
 
-            if (fn->return_type != XF_TYPE_VOID &&
-                ret.state == XF_STATE_NULL)
+            if (fn->return_type != XF_TYPE_VOID && ret.state == XF_STATE_NULL)
                 ret = xf_val_nav(fn->return_type);
 
             xf_value_release(callee);
@@ -2221,38 +2242,26 @@ case EXPR_CALL: {
             return ret;
         }
 
-        /* ---- native ---- */
-        if (fn->native_v) {
-            xf_Value ret0 = fn->native_v(args, argc);
-            xf_Value ret  = xf_value_retain(ret0);
-
+        if (fn->is_native && fn->native_v) {
+xf_Value ret0 = fn->native_v(args, argc);
+xf_Value ret = xf_value_retain(ret0);        
             xf_value_release(callee);
             for (size_t i = 0; i < argc; i++)
                 xf_value_release(args[i]);
-
             return ret;
         }
     }
 
-    /* ---- builtin fallback ---- */
     if (e->as.call.callee->kind == EXPR_IDENT) {
-        const char *name =
-            (e->as.call.callee->as.ident.name &&
-             e->as.call.callee->as.ident.name->data)
-            ? e->as.call.callee->as.ident.name->data
-            : "<null-ident>";
-
+        const char *name = e->as.call.callee->as.ident.name->data;
         xf_Value r = interp_call_builtin(it, name, args, argc);
-
-        if (r.state != XF_STATE_NAV) {
-            xf_Value ret = xf_value_retain(r);
-
-            xf_value_release(callee);
-            for (size_t i = 0; i < argc; i++)
-                xf_value_release(args[i]);
-
-            return ret;
-        }
+if (r.state != XF_STATE_NAV) {
+    xf_Value ret = xf_value_retain(r);
+    xf_value_release(callee);
+    for (size_t i = 0; i < argc; i++)
+        xf_value_release(args[i]);
+    return ret;
+}
     }
 
     xf_value_release(callee);
@@ -2339,7 +2348,7 @@ case EXPR_CALL: {
 
     case EXPR_MEMBER: {
         xf_Value obj = interp_eval_expr(it, e->as.member.obj);
-        const char *field = (e->as.member.field && e->as.member.field->data) ? e->as.member.field->data : "<null-field>";
+        const char *field = e->as.member.field->data;
 
         if (obj.state == XF_STATE_OK &&
             obj.type == XF_TYPE_MODULE && obj.data.mod) {
@@ -2794,7 +2803,7 @@ case STMT_PRINT: {
         if (!s->as.import.path)
             return xf_val_null();
 
-        const char *imp_path = (s->as.import.path && s->as.import.path->data) ? s->as.import.path->data : "<null-import-path>";
+        const char *imp_path = s->as.import.path->data;
         FILE *imp_fp = fopen(imp_path, "r");
         if (!imp_fp) {
             interp_error(it, s->loc, "import: cannot open '%s'", imp_path);
@@ -2997,7 +3006,7 @@ case TOP_RULE:
         xf_value_release(pat);
         if (!truth) return xf_val_null();
     }
-    return interp_eval_stmt(it, top->as.rule.body);
+    return interp_eval_stmt(it, top->as.rule.body);            
         case TOP_FN: {
             xf_Fn *fn = build_fn(top->as.fn.name, top->as.fn.return_type,
                                   top->as.fn.params, top->as.fn.param_count,

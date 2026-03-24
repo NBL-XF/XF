@@ -13,7 +13,7 @@ BEGIN {
 
     # ── 2. Parse the header row ─────────────────────────────────
     arr headers = core.generics.split(lines[0], ",")
-    num ncols   = core.generics.length(headers)
+    num ncols   = headers.len
     print "Columns    : " .. ncols .. "  →  " .. core.generics.join(headers, ", ")
 
     # ── 3. Build arr-of-maps dataset ────────────────────────────

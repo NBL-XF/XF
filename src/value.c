@@ -66,14 +66,19 @@ int xf_str_cmp(const xf_str_t *a, const xf_str_t *b) {
  * ============================================================ */
 
 xf_err_t *xf_err_new(const char *msg, const char *src,
-                      uint32_t line, uint32_t col) {
+                     uint32_t line, uint32_t col) {
     xf_err_t *e = calloc(1, sizeof(xf_err_t));
     if (!e) return NULL;
+
     atomic_store(&e->refcount, 1);
     e->message = xf_str_from_cstr(msg ? msg : "unknown error");
     e->source  = xf_str_from_cstr(src ? src : "<unknown>");
     e->line    = line;
     e->col     = col;
+    e->cause   = NULL;
+    e->siblings = NULL;
+    e->sibling_count = 0;
+
     return e;
 }
 
@@ -85,28 +90,47 @@ xf_err_t *xf_err_retain(xf_err_t *e) {
 void xf_err_release(xf_err_t *e) {
     if (!e) return;
     if (atomic_fetch_sub(&e->refcount, 1) != 1) return;
+
     xf_str_release(e->message);
     xf_str_release(e->source);
     xf_err_release(e->cause);
-    for (size_t i = 0; i < e->sibling_count; i++)
-        free(e->siblings[i]);
+
+    /* siblings is a shallow copied pointer list; do NOT free siblings[i] */
     free(e->siblings);
+
     free(e);
 }
 
 xf_err_t *xf_err_chain(xf_err_t *parent, xf_err_t *cause,
-                        xf_value_t **siblings, size_t sibling_count) {
+                       xf_value_t **siblings, size_t sibling_count) {
     if (!parent) return cause;
-    parent->cause         = xf_err_retain(cause);
-    parent->sibling_count = sibling_count;
+
+    /* replace existing cause safely */
+    if (parent->cause) {
+        xf_err_release(parent->cause);
+        parent->cause = NULL;
+    }
+
+    parent->cause = xf_err_retain(cause);
+
+    /* replace existing sibling pointer list safely */
+    free(parent->siblings);
+    parent->siblings = NULL;
+    parent->sibling_count = 0;
+
     if (sibling_count && siblings) {
         parent->siblings = malloc(sizeof(xf_value_t *) * sibling_count);
-        if (parent->siblings)
+        if (parent->siblings) {
             memcpy(parent->siblings, siblings,
                    sizeof(xf_value_t *) * sibling_count);
+            parent->sibling_count = sibling_count;
+        }
     }
+
     return parent;
 }
+
+
 
 
 /* ============================================================
@@ -995,28 +1019,28 @@ void xf_module_release(xf_module_t *m) {
 }
 
 void xf_module_set(xf_module_t *m, const char *name, xf_value_t val) {
-    /* overwrite if already exists */
     for (size_t i = 0; i < m->count; i++) {
         if (strcmp(m->entries[i].name, name) == 0) {
+            xf_value_release(m->entries[i].val);
             m->entries[i].val = val;
             return;
         }
     }
-    /* grow if needed */
+
     if (m->count >= m->cap) {
-        m->cap    *= 2;
+        m->cap *= 2;
         m->entries = realloc(m->entries, m->cap * sizeof(xf_module_entry_t));
     }
-    m->entries[m->count].name = name;   /* static string */
+
+    m->entries[m->count].name = name;
     m->entries[m->count].val  = val;
     m->count++;
 }
-
 xf_value_t xf_module_get(const xf_module_t *m, const char *name) {
     if (!m) return xf_val_nav(XF_TYPE_VOID);
     for (size_t i = 0; i < m->count; i++) {
         if (strcmp(m->entries[i].name, name) == 0)
-            return m->entries[i].val;
+            return xf_value_retain(m->entries[i].val);
     }
     return xf_val_nav(XF_TYPE_VOID);
 }

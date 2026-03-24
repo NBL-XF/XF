@@ -862,8 +862,7 @@ Stmt *parse_block(Parser *p) {
         stmts[count++] = s;
         if (p->had_error && p->panic_mode) synchronize(p);
     }
-
-    sym_pop(p->syms);
+scope_free(sym_pop(p->syms));
     expect(p, TK_RBRACE, "expected '}'");
     return ast_block(stmts, count, loc);
 }
@@ -914,8 +913,8 @@ Stmt *parse_while(Parser *p) {
     expect(p, TK_RPAREN, "expected ')' after condition");
     sym_push(p->syms, SCOPE_LOOP);
     Stmt *body = parse_block(p);
-    sym_pop(p->syms);
-    return ast_while(cond, body, loc);
+scope_free(sym_pop(p->syms));
+        return ast_while(cond, body, loc);
 }
 
 /* for (iter in collection) { body } */
@@ -1094,8 +1093,7 @@ Stmt *parse_fn_decl(Parser *p) {
         sym_declare(p->syms, params[i].name, SYM_PARAM, params[i].type, params[i].loc);
 
     Stmt *body = parse_block(p);
-    sym_pop(p->syms);
-
+scope_free(sym_pop(p->syms));
     Stmt *s = ast_fn_decl(ret, name, params, pc, body, loc);
     xf_str_release(name);
     return s;
@@ -1299,8 +1297,7 @@ TopLevel *parse_fn_decl_top(Parser *p) {
         sym_declare(p->syms, params[i].name, SYM_PARAM, params[i].type, params[i].loc);
 
     Stmt *body = parse_block(p);
-    sym_pop(p->syms);
-
+scope_free(sym_pop(p->syms));
     TopLevel *t = ast_top_fn(ret, name, params, pc, body, loc);
     xf_str_release(name);
     return t;
@@ -1314,8 +1311,8 @@ TopLevel *parse_rule(Parser *p) {
     if (check(p, TK_LBRACE)) {
         sym_push(p->syms, SCOPE_PATTERN);
         Stmt *body = parse_block(p);
-        sym_pop(p->syms);
-        return ast_top_rule(NULL, body, loc);
+scope_free(sym_pop(p->syms));
+                return ast_top_rule(NULL, body, loc);
     }
 
     /* statement-starting keywords that can never be a pattern expression —
@@ -1384,8 +1381,8 @@ if (looks_like_shorthand_for(p)) {
     if (check(p, TK_LBRACE)) {
         sym_push(p->syms, SCOPE_PATTERN);
         Stmt *body = parse_block(p);
-        sym_pop(p->syms);
-        return ast_top_rule(pattern, body, loc);
+scope_free(sym_pop(p->syms));
+                return ast_top_rule(pattern, body, loc);
     }
 
     /* expr <> body — shorthand while */
