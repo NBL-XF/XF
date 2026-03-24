@@ -7,11 +7,16 @@ bool arg_num(xf_Value *args, size_t argc, size_t i, double *out) {
     xf_Value v = args[i];
     if (v.state != XF_STATE_OK) return false;
     if (v.type == XF_TYPE_NUM) { *out = v.data.num; return true; }
+
     xf_Value c = xf_coerce_num(v);
-    if (c.state == XF_STATE_OK) { *out = c.data.num; return true; }
+    if (c.state == XF_STATE_OK) {
+        *out = c.data.num;
+        xf_value_release(c);
+        return true;
+    }
+    xf_value_release(c);
     return false;
 }
-
 bool arg_str(xf_Value *args, size_t argc, size_t i,
              const char **out, size_t *outlen) {
     enum { ARG_STR_SLOTS = 16 };

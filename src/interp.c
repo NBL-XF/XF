@@ -4,6 +4,7 @@
 #include "../include/interp.h"
 #include "../include/parser.h"
 #include "../include/core.h"
+#include "../include/gc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -57,7 +58,68 @@ static xf_Value interp_exec_xf_fn(void *vm_ptr, void *syms_ptr,
 static xf_Value mat_mul(xf_Value a, xf_Value b);
 static xf_Value arr_broadcast(xf_Value a, xf_Value b, int op);
 static xf_Value val_concat(xf_Value a, xf_Value b);
+static xf_Value eval_in(xf_Value needle, xf_Value haystack) {
+    if (needle.state != XF_STATE_OK)   return xf_value_retain(needle);
+    if (haystack.state != XF_STATE_OK) return xf_value_retain(haystack);
 
+    /* substring in string */
+    if (haystack.type == XF_TYPE_STR && haystack.data.str) {
+        xf_Value ns = xf_coerce_str(needle);
+        if (ns.state != XF_STATE_OK || !ns.data.str) {
+            if (ns.state == XF_STATE_OK) xf_value_release(ns);
+            return xf_val_false();
+        }
+
+        bool found = strstr(haystack.data.str->data, ns.data.str->data) != NULL;
+        xf_value_release(ns);
+        return found ? xf_val_true() : xf_val_false();
+    }
+
+    /* element in array (stringified comparison for now) */
+    if (haystack.type == XF_TYPE_ARR && haystack.data.arr) {
+        xf_Value ns = xf_coerce_str(needle);
+        if (ns.state != XF_STATE_OK || !ns.data.str) {
+            if (ns.state == XF_STATE_OK) xf_value_release(ns);
+            return xf_val_false();
+        }
+
+        xf_arr_t *a = haystack.data.arr;
+        for (size_t i = 0; i < a->len; i++) {
+            xf_Value es = xf_coerce_str(a->items[i]);
+            bool match = (es.state == XF_STATE_OK &&
+                          es.data.str &&
+                          strcmp(es.data.str->data, ns.data.str->data) == 0);
+            xf_value_release(es);
+
+            if (match) {
+                xf_value_release(ns);
+                return xf_val_true();
+            }
+        }
+
+        xf_value_release(ns);
+        return xf_val_false();
+    }
+
+    /* key in map/set */
+    if ((haystack.type == XF_TYPE_MAP || haystack.type == XF_TYPE_SET) && haystack.data.map) {
+        xf_Value ks = xf_coerce_str(needle);
+        if (ks.state != XF_STATE_OK || !ks.data.str) {
+            if (ks.state == XF_STATE_OK) xf_value_release(ks);
+            return xf_val_false();
+        }
+
+        xf_Value got = xf_map_get(haystack.data.map, ks.data.str);
+        xf_value_release(ks);
+        return (got.state == XF_STATE_OK) ? xf_val_true() : xf_val_false();
+    }
+
+    return xf_val_false();
+}
+static inline void maybe_auto_gc(Interp *it) {
+    if (!it) return;
+    xf_gc_maybe_collect(it->vm, it->syms, it);
+}
 static SpawnCtx *find_spawn_ctx_by_id(uint32_t hid) {
     if (hid == 0) return NULL;
     for (size_t i = 0; i < XF_SPAWN_MAX; i++) {
@@ -165,7 +227,7 @@ static void *spawn_thread_fn(void *arg) {
             it.returning = false;
             interp_eval_stmt(&it, (Stmt *)fn->body);
 xf_Value ret0 = it.returning ? it.return_val : xf_val_null();
-ctx->result = xf_value_retain(ret0);
+ctx->result = ret0;
 it.returning = false;
 
 scope_free(sym_pop(&syms));
@@ -267,8 +329,7 @@ static xf_Value interp_exec_xf_fn(void *vm_ptr, void *syms_ptr,
 
     it.returning = false;
     interp_eval_stmt(&it, (Stmt *)fn->body);
-    xf_Value ret0 = it.returning ? it.return_val : xf_val_null();
-xf_Value result = xf_value_retain(ret0);
+    xf_Value result = it.returning ? it.return_val : xf_val_null();
 it.returning = false;
 
 scope_free(sym_pop(&syms));
@@ -293,53 +354,66 @@ static xf_complex_t to_complex(xf_Value v) {
     }
     return z;
 }
+
 static xf_Value apply_binary_op(BinOp op, xf_Value a, xf_Value b, Loc loc) {
- if (is_complex_like(a) && is_complex_like(b) &&
-    (a.type == XF_TYPE_COMPLEX || b.type == XF_TYPE_COMPLEX)) {
-    xf_complex_t x = to_complex(a);
-    xf_complex_t y = to_complex(b);
+    if (is_complex_like(a) && is_complex_like(b) &&
+        (a.type == XF_TYPE_COMPLEX || b.type == XF_TYPE_COMPLEX)) {
+        xf_complex_t x = to_complex(a);
+        xf_complex_t y = to_complex(b);
 
-    switch (op) {
-        case BINOP_ADD:
-            return xf_val_ok_complex(x.re + y.re, x.im + y.im);
+        switch (op) {
+            case BINOP_ADD:
+                return xf_val_ok_complex(x.re + y.re, x.im + y.im);
 
-        case BINOP_SUB:
-            return xf_val_ok_complex(x.re - y.re, x.im - y.im);
+            case BINOP_SUB:
+                return xf_val_ok_complex(x.re - y.re, x.im - y.im);
 
-        case BINOP_MUL:
-            return xf_val_ok_complex(
-                x.re * y.re - x.im * y.im,
-                x.re * y.im + x.im * y.re
-            );
+            case BINOP_MUL:
+                return xf_val_ok_complex(
+                    x.re * y.re - x.im * y.im,
+                    x.re * y.im + x.im * y.re
+                );
 
-        case BINOP_DIV: {
-            double d = y.re * y.re + y.im * y.im;
-            if (d == 0.0) {
-                return xf_val_err(
-                    xf_err_new("complex division by zero", loc.source, loc.line, loc.col),
-                    XF_TYPE_COMPLEX
+            case BINOP_DIV: {
+                double d = y.re * y.re + y.im * y.im;
+                if (d == 0.0) {
+                    return xf_val_err(
+                        xf_err_new("complex division by zero",
+                                   loc.source ? loc.source : "<unknown>",
+                                   loc.line, loc.col),
+                        XF_TYPE_COMPLEX
+                    );
+                }
+                return xf_val_ok_complex(
+                    (x.re * y.re + x.im * y.im) / d,
+                    (x.im * y.re - x.re * y.im) / d
                 );
             }
-            return xf_val_ok_complex(
-                (x.re * y.re + x.im * y.im) / d,
-                (x.im * y.re - x.re * y.im) / d
-            );
-        }
 
-        default:
-            break;
+            default:
+                break;
+        }
     }
-}
-       switch (op) {
+
+    switch (op) {
         case BINOP_ADD:
             if ((a.state == XF_STATE_OK && a.type == XF_TYPE_ARR) ||
                 (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR))
                 return arr_broadcast(a, b, 0);
             {
-                xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
+                xf_Value na = xf_coerce_num(a);
                 if (na.state != XF_STATE_OK) return na;
-                if (nb.state != XF_STATE_OK) return nb;
-                return xf_val_ok_num(na.data.num + nb.data.num);
+
+                xf_Value nb = xf_coerce_num(b);
+                if (nb.state != XF_STATE_OK) {
+                    xf_value_release(na);
+                    return nb;
+                }
+
+                xf_Value out = xf_val_ok_num(na.data.num + nb.data.num);
+                xf_value_release(na);
+                xf_value_release(nb);
+                return out;
             }
 
         case BINOP_SUB:
@@ -347,10 +421,19 @@ static xf_Value apply_binary_op(BinOp op, xf_Value a, xf_Value b, Loc loc) {
                 (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR))
                 return arr_broadcast(a, b, 1);
             {
-                xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
+                xf_Value na = xf_coerce_num(a);
                 if (na.state != XF_STATE_OK) return na;
-                if (nb.state != XF_STATE_OK) return nb;
-                return xf_val_ok_num(na.data.num - nb.data.num);
+
+                xf_Value nb = xf_coerce_num(b);
+                if (nb.state != XF_STATE_OK) {
+                    xf_value_release(na);
+                    return nb;
+                }
+
+                xf_Value out = xf_val_ok_num(na.data.num - nb.data.num);
+                xf_value_release(na);
+                xf_value_release(nb);
+                return out;
             }
 
         case BINOP_MUL:
@@ -358,10 +441,19 @@ static xf_Value apply_binary_op(BinOp op, xf_Value a, xf_Value b, Loc loc) {
                 (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR))
                 return arr_broadcast(a, b, 2);
             {
-                xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
+                xf_Value na = xf_coerce_num(a);
                 if (na.state != XF_STATE_OK) return na;
-                if (nb.state != XF_STATE_OK) return nb;
-                return xf_val_ok_num(na.data.num * nb.data.num);
+
+                xf_Value nb = xf_coerce_num(b);
+                if (nb.state != XF_STATE_OK) {
+                    xf_value_release(na);
+                    return nb;
+                }
+
+                xf_Value out = xf_val_ok_num(na.data.num * nb.data.num);
+                xf_value_release(na);
+                xf_value_release(nb);
+                return out;
             }
 
         case BINOP_DIV:
@@ -369,15 +461,30 @@ static xf_Value apply_binary_op(BinOp op, xf_Value a, xf_Value b, Loc loc) {
                 (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR))
                 return arr_broadcast(a, b, 3);
             {
-                xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
+                xf_Value na = xf_coerce_num(a);
                 if (na.state != XF_STATE_OK) return na;
-                if (nb.state != XF_STATE_OK) return nb;
-                if (nb.data.num == 0.0)
+
+                xf_Value nb = xf_coerce_num(b);
+                if (nb.state != XF_STATE_OK) {
+                    xf_value_release(na);
+                    return nb;
+                }
+
+                if (nb.data.num == 0.0) {
+                    xf_value_release(na);
+                    xf_value_release(nb);
                     return xf_val_err(
-                        xf_err_new("division by zero", loc.source, loc.line, loc.col),
+                        xf_err_new("division by zero",
+                                   loc.source ? loc.source : "<unknown>",
+                                   loc.line, loc.col),
                         XF_TYPE_NUM
                     );
-                return xf_val_ok_num(na.data.num / nb.data.num);
+                }
+
+                xf_Value out = xf_val_ok_num(na.data.num / nb.data.num);
+                xf_value_release(na);
+                xf_value_release(nb);
+                return out;
             }
 
         case BINOP_MOD:
@@ -385,15 +492,30 @@ static xf_Value apply_binary_op(BinOp op, xf_Value a, xf_Value b, Loc loc) {
                 (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR))
                 return arr_broadcast(a, b, 4);
             {
-                xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
+                xf_Value na = xf_coerce_num(a);
                 if (na.state != XF_STATE_OK) return na;
-                if (nb.state != XF_STATE_OK) return nb;
-                if (nb.data.num == 0.0)
+
+                xf_Value nb = xf_coerce_num(b);
+                if (nb.state != XF_STATE_OK) {
+                    xf_value_release(na);
+                    return nb;
+                }
+
+                if (nb.data.num == 0.0) {
+                    xf_value_release(na);
+                    xf_value_release(nb);
                     return xf_val_err(
-                        xf_err_new("modulo by zero", loc.source, loc.line, loc.col),
+                        xf_err_new("modulo by zero",
+                                   loc.source ? loc.source : "<unknown>",
+                                   loc.line, loc.col),
                         XF_TYPE_NUM
                     );
-                return xf_val_ok_num(fmod(na.data.num, nb.data.num));
+                }
+
+                xf_Value out = xf_val_ok_num(fmod(na.data.num, nb.data.num));
+                xf_value_release(na);
+                xf_value_release(nb);
+                return out;
             }
 
         case BINOP_CONCAT:
@@ -415,6 +537,7 @@ static xf_Value apply_binary_op(BinOp op, xf_Value a, xf_Value b, Loc loc) {
             return xf_val_nav(XF_TYPE_VOID);
     }
 }
+
 static bool bind_loop_tuple(Interp *it, LoopBind *bind, xf_Value v, Loc loc) {
     if (!bind) return true;
     if (bind->kind != LOOP_BIND_TUPLE) {
@@ -513,27 +636,36 @@ void interp_free(Interp *it) {
  * function not found, or not a native callable).
  * ────────────────────────────────────────────────────────────────────── */
 static xf_Value interp_call_core(Interp *it,
-                                   const char *module, const char *fn_name,
-                                   xf_Value *args, size_t argc) {
-    /* look up `core` in the symbol table */
+                                 const char *module, const char *fn_name,
+                                 xf_Value *args, size_t argc) {
     Symbol *core_sym = sym_lookup(it->syms, "core", 4);
     if (!core_sym || core_sym->value.type != XF_TYPE_MODULE ||
         !core_sym->value.data.mod) return xf_val_nav(XF_TYPE_VOID);
 
-    /* traverse to sub-module */
     xf_Value sub = xf_module_get(core_sym->value.data.mod, module);
-    if (sub.state != XF_STATE_OK || sub.type != XF_TYPE_MODULE || !sub.data.mod)
+    if (sub.state != XF_STATE_OK || sub.type != XF_TYPE_MODULE || !sub.data.mod) {
+        xf_value_release(sub);
         return xf_val_nav(XF_TYPE_VOID);
+    }
 
-    /* look up function */
     xf_Value fv = xf_module_get(sub.data.mod, fn_name);
-    if (fv.state != XF_STATE_OK || fv.type != XF_TYPE_FN || !fv.data.fn)
+    if (fv.state != XF_STATE_OK || fv.type != XF_TYPE_FN || !fv.data.fn) {
+        xf_value_release(fv);
+        xf_value_release(sub);
         return xf_val_nav(XF_TYPE_VOID);
+    }
 
     xf_Fn *fn = fv.data.fn;
-    if (!fn->is_native || !fn->native_v) return xf_val_nav(XF_TYPE_VOID);
+    if (!fn->is_native || !fn->native_v) {
+        xf_value_release(fv);
+        xf_value_release(sub);
+        return xf_val_nav(XF_TYPE_VOID);
+    }
 
-    return fn->native_v(args, argc);
+    xf_Value ret = fn->native_v(args, argc);
+    xf_value_release(fv);
+    xf_value_release(sub);
+    return ret;
 }
 #include <stdio.h>
 #include <stdlib.h>
@@ -880,55 +1012,90 @@ static bool lvalue_store(Interp *it, Expr *target, xf_Value val) {
         if (_ivar_matched) return true;
     }
     if (target->kind == EXPR_SUBSCRIPT) {
-        Expr *obj_expr = target->as.subscript.obj;
-        xf_Value key   = interp_eval_expr(it, target->as.subscript.key);
-        if (key.state != XF_STATE_OK) {
-            interp_error(it, target->loc, "subscript key is not OK");
-            return false;
-        }
-        xf_Value container = lvalue_load(it, obj_expr);
-        if (container.state == XF_STATE_OK && container.type == XF_TYPE_TUPLE) {
-    interp_error(it, target->loc, "cannot assign to tuple element");
-    return false;
-}
-        if (container.state != XF_STATE_OK ||
-            (container.type != XF_TYPE_ARR && container.type != XF_TYPE_MAP)) {
-            xf_Value num_key = xf_coerce_num(key);
-            if (num_key.state == XF_STATE_OK) {
-                xf_arr_t *a = xf_arr_new();
-                container   = xf_val_ok_arr(a);
-                xf_arr_release(a);
-            } else {
-                xf_map_t *m = xf_map_new();
-                container   = xf_val_ok_map(m);
-                xf_map_release(m);
-            }
-            lvalue_store(it, obj_expr, container);
-        }
-        if (container.type == XF_TYPE_ARR && container.data.arr) {
-            xf_Value ni = xf_coerce_num(key);
-            if (ni.state != XF_STATE_OK) {
-                interp_error(it, target->loc, "array index must be numeric");
-                return false;
-            }
-            xf_arr_set(container.data.arr, (size_t)ni.data.num, val);
-            return true;
-        }
-        if (container.type == XF_TYPE_MAP && container.data.map) {
-            xf_Value sk = xf_coerce_str(key);
-            if (sk.state != XF_STATE_OK || !sk.data.str) {
-                xf_value_release(sk);
-                interp_error(it, target->loc, "map key must be a string");
-                return false;
-            }
-            xf_map_set(container.data.map, sk.data.str, val);
-            xf_value_release(sk);
-            return true;
-        }
-        interp_error(it, target->loc, "cannot index into type '%s'",
-                     XF_TYPE_NAMES[container.type]);
+    Expr *obj_expr = target->as.subscript.obj;
+    xf_Value key   = interp_eval_expr(it, target->as.subscript.key);
+    if (key.state != XF_STATE_OK) {
+        interp_error(it, target->loc, "subscript key is not OK");
+        xf_value_release(key);
         return false;
     }
+
+    xf_Value container = lvalue_load(it, obj_expr);
+
+    if (container.state == XF_STATE_OK && container.type == XF_TYPE_TUPLE) {
+        interp_error(it, target->loc, "cannot assign to tuple element");
+        xf_value_release(key);
+        xf_value_release(container);
+        return false;
+    }
+
+    if (container.state != XF_STATE_OK ||
+        (container.type != XF_TYPE_ARR && container.type != XF_TYPE_MAP)) {
+        xf_Value num_key = xf_coerce_num(key);
+
+        if (num_key.state == XF_STATE_OK) {
+            xf_arr_t *a = xf_arr_new();
+            xf_value_release(container);
+            container = xf_val_ok_arr(a);
+            xf_arr_release(a);
+        } else {
+            xf_map_t *m = xf_map_new();
+            xf_value_release(container);
+            container = xf_val_ok_map(m);
+            xf_map_release(m);
+        }
+
+        xf_value_release(num_key);
+
+        if (!lvalue_store(it, obj_expr, xf_value_retain(container))) {
+            xf_value_release(key);
+            xf_value_release(container);
+            return false;
+        }
+    }
+
+    if (container.type == XF_TYPE_ARR && container.data.arr) {
+        xf_Value ni = xf_coerce_num(key);
+        if (ni.state != XF_STATE_OK) {
+            interp_error(it, target->loc, "array index must be numeric");
+            xf_value_release(ni);
+            xf_value_release(key);
+            xf_value_release(container);
+            return false;
+        }
+
+        xf_arr_set(container.data.arr, (size_t)ni.data.num, xf_value_retain(val));
+
+        xf_value_release(ni);
+        xf_value_release(key);
+        xf_value_release(container);
+        return true;
+    }
+
+    if (container.type == XF_TYPE_MAP && container.data.map) {
+        xf_Value sk = xf_coerce_str(key);
+        if (sk.state != XF_STATE_OK || !sk.data.str) {
+            xf_value_release(sk);
+            xf_value_release(key);
+            xf_value_release(container);
+            interp_error(it, target->loc, "map key must be a string");
+            return false;
+        }
+
+        xf_map_set(container.data.map, sk.data.str, xf_value_retain(val));
+
+        xf_value_release(sk);
+        xf_value_release(key);
+        xf_value_release(container);
+        return true;
+    }
+
+    xf_value_release(key);
+    xf_value_release(container);
+    interp_error(it, target->loc, "cannot index into type '%s'",
+                 XF_TYPE_NAMES[container.type]);
+    return false;
+}
     /* ── tuple destructuring: (a, b) = expr ──────────────────────────
      * RHS is a tuple  → unpack element-by-element.
      * RHS is a scalar → broadcast the same value to every target.   */
@@ -1164,252 +1331,220 @@ static const CoreRoute *find_core_route(const char *name) {
     return (const CoreRoute *)bsearch(name, k_core_routes, CORE_ROUTE_COUNT,
                                       sizeof(CoreRoute), core_route_cmp);
 }
+xf_Value interp_call_builtin(Interp *it, const char *name, xf_Value *args, size_t argc) {
+    (void)it;
 
-xf_Value interp_call_builtin(Interp *it, const char *name,
-                              xf_Value *args, size_t argc) {
-    /* ── core module delegation (math + string) ──────────────── */
-    const CoreRoute *rt = find_core_route(name);
-    if (rt) return interp_call_core(it, rt->mod, rt->fn, args, argc);
-    if (strcmp(name,"system")==0 && argc==1) {
-        xf_Value s = xf_coerce_str(args[0]);
-        if (s.state != XF_STATE_OK) return s;
-        int rc = system(s.data.str->data);
-        xf_value_release(s);
-        return xf_val_ok_num((double)rc);
-    }
-    if (strcmp(name,"exit")==0) {
-        int code = (argc>0) ? (int)xf_coerce_num(args[0]).data.num : 0;
-        exit(code);
-    }
-if (strcmp(name, "join") == 0 && argc == 1) {
-    xf_Value handle = args[0];
-    xf_Value join_result = xf_val_null();
-
-    if (handle.state == XF_STATE_OK && handle.type == XF_TYPE_NUM) {
-        uint32_t hid = (uint32_t)handle.data.num;
-
-        /* Phase 1: find the entry and copy tid by value while holding the
-         * lock.  We must NOT keep a pointer into g_spawn[] across the lock
-         * release — another concurrent join could swap-remove that slot,
-         * leaving us with a dangling pointer and a stale tid.              */
-        pthread_t tid = (pthread_t)0;
-        bool need_join = false;
-
-        pthread_mutex_lock(&g_spawn_mu);
-        SpawnCtx *slot = find_spawn_ctx_by_id(hid);
-        if (slot) {
-            /* Lazily start the thread if spawn was deferred. */
-            if (!slot->started)
-                start_spawn_ctx(slot);
-            tid = slot->tid;          /* copy by value — safe after unlock */
-            need_join = slot->started;
-        }
-        pthread_mutex_unlock(&g_spawn_mu);
-
-        /* Phase 2: block until the thread exits (tid is a plain value, not
-         * a pointer into g_spawn[], so the array can be mutated freely).   */
-        if (need_join) {
-            pthread_join(tid, NULL);
-
-            /* Phase 3: re-acquire, copy result, then swap-remove the entry.
-             * Copy result BEFORE the swap so the self-assign case
-             * (i == g_spawn_count-1) doesn't clobber it.                   */
-            pthread_mutex_lock(&g_spawn_mu);
-            SpawnCtx *slot = find_spawn_ctx_by_id(hid);
-            if (slot) {
-                join_result = xf_value_retain(slot->result);
-                free_spawn_ctx_slot(slot);
-            }
-            pthread_mutex_unlock(&g_spawn_mu);
-        }
-    }
-
-    return join_result;
-}
-if (strcmp(name, "join") == 0 && argc == 2) {
-    return interp_call_core(it, "generics", "join", args, argc);
-}
-    if (strcmp(name,"pop")==0 && argc==1) {
-        if (args[0].state==XF_STATE_OK&&args[0].type==XF_TYPE_ARR&&args[0].data.arr)
-            return xf_arr_pop(args[0].data.arr);
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-    if (strcmp(name,"shift")==0 && argc==1) {
-        if (args[0].state==XF_STATE_OK&&args[0].type==XF_TYPE_ARR&&args[0].data.arr)
-            return xf_arr_shift(args[0].data.arr);
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-    if (strcmp(name,"push")==0 && argc==2) {
-    if (args[0].state==XF_STATE_OK && args[0].type==XF_TYPE_ARR && args[0].data.arr)
-        xf_arr_push(args[0].data.arr, xf_value_retain(args[1]));
-    else if (args[0].state==XF_STATE_OK && args[0].type==XF_TYPE_SET && args[0].data.map) {
-        xf_Value ks = xf_coerce_str(args[1]);
-        if (ks.state==XF_STATE_OK && ks.data.str)
-            xf_map_set(args[0].data.map, ks.data.str, xf_val_ok_num(1.0));
-        xf_value_release(ks);
-    }
-    return args[0];
-}
-
-if (strcmp(name,"unshift")==0 && argc==2) {
-    if (args[0].state==XF_STATE_OK && args[0].type==XF_TYPE_ARR && args[0].data.arr)
-        xf_arr_unshift(args[0].data.arr, xf_value_retain(args[1]));
-    return args[0];
-}
-    if (strcmp(name,"remove")==0 && argc==2) {
-        xf_Value coll=args[0];
-        if (coll.state!=XF_STATE_OK) return xf_val_nav(XF_TYPE_VOID);
-        if (coll.type==XF_TYPE_ARR&&coll.data.arr) {
-            xf_Value ni=xf_coerce_num(args[1]);
-            if (ni.state==XF_STATE_OK) xf_arr_delete(coll.data.arr,(size_t)ni.data.num);
-            return coll;
-        }
-        if ((coll.type==XF_TYPE_MAP||coll.type==XF_TYPE_SET)&&coll.data.map) {
-            xf_Value ks=xf_coerce_str(args[1]);
-            if (ks.state==XF_STATE_OK&&ks.data.str) xf_map_delete(coll.data.map,ks.data.str);
-            xf_value_release(ks);
-            return coll;
-        }
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-    if (strcmp(name,"has")==0 && argc==2) {
-        xf_Value coll=args[0];
-        if (coll.state!=XF_STATE_OK||!coll.data.map) return xf_val_false();
-        if (coll.type==XF_TYPE_MAP||coll.type==XF_TYPE_SET) {
-            xf_Value ks=xf_coerce_str(args[1]);
-            if (ks.state!=XF_STATE_OK||!ks.data.str) { xf_value_release(ks); return xf_val_false(); }
-            bool _has = xf_map_get(coll.data.map,ks.data.str).state!=XF_STATE_NAV;
-            xf_value_release(ks);
-            return _has ? xf_val_true() : xf_val_false();
-        }
-        return xf_val_false();
-    }
-    if (strcmp(name,"keys")==0 && argc==1) {
-        xf_Value coll=args[0];
-        if (coll.state!=XF_STATE_OK||!coll.data.map) return xf_val_nav(XF_TYPE_ARR);
-        xf_arr_t *a=xf_arr_new();
-        xf_map_t *m=coll.data.map;
-        for (size_t i=0;i<m->order_len;i++) xf_arr_push(a,xf_val_ok_str(m->order[i]));
-        xf_Value r=xf_val_ok_arr(a); xf_arr_release(a); return r;
-    }
-    if (strcmp(name,"values")==0 && argc==1) {
-    xf_Value coll = args[0];
-    if (coll.state != XF_STATE_OK || !coll.data.map)
-        return xf_val_nav(XF_TYPE_ARR);
-
-    xf_arr_t *a = xf_arr_new();
-    xf_map_t *m = coll.data.map;
-    for (size_t i = 0; i < m->order_len; i++) {
-        xf_Value v = xf_map_get(m, m->order[i]);
-        xf_arr_push(a, xf_value_retain(v));
-    }
-    xf_Value r = xf_val_ok_arr(a);
-    xf_arr_release(a);
-    return r;
-}
-    if (strcmp(name,"read")==0 && argc==1) {
-        xf_Value sv = xf_coerce_str(args[0]);
-        if (sv.state != XF_STATE_OK || !sv.data.str) { xf_value_release(sv); return xf_val_nav(XF_TYPE_STR); }
-        bool is_pipe = true;
-        FILE *fp = popen(sv.data.str->data, "r");
-        if (!fp) { is_pipe = false; fp = fopen(sv.data.str->data, "r"); }
-        if (!fp) { xf_value_release(sv); return xf_val_nav(XF_TYPE_STR); }
-        char buf[65536];
-        size_t n = 0;
-        int c;
-        while (n < sizeof(buf) - 1 && (c = fgetc(fp)) != EOF) {
-            buf[n++] = (char)c;
-        }
-        buf[n] = '\0';
-        if (is_pipe) pclose(fp); else fclose(fp);
-        while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
-        xf_Str *r = xf_str_from_cstr(buf);
-        xf_Value rv = xf_val_ok_str(r); xf_str_release(r);
-        xf_value_release(sv);
-        return rv;
-    }
-    if (strcmp(name,"lines")==0 && argc==1) {
-        xf_Value sv = xf_coerce_str(args[0]);
-        if (sv.state != XF_STATE_OK || !sv.data.str) { xf_value_release(sv); return xf_val_nav(XF_TYPE_ARR); }
-        bool is_pipe = true;
-        FILE *fp = popen(sv.data.str->data, "r");
-        if (!fp) { is_pipe = false; fp = fopen(sv.data.str->data, "r"); }
-        if (!fp) { xf_value_release(sv); return xf_val_nav(XF_TYPE_ARR); }
-        xf_arr_t *a = xf_arr_new();
-        char line[4096];
-        while (fgets(line, sizeof(line), fp)) {
-            size_t ln = strlen(line);
-            while (ln > 0 && (line[ln - 1] == '\n' || line[ln - 1] == '\r')) {
-                line[--ln] = '\0';
-            }
-            xf_Str *ls = xf_str_new(line, ln);
-            xf_Value lv = xf_val_ok_str(ls);
-            xf_str_release(ls);
-            xf_arr_push(a, lv);
-        }
-        if (is_pipe) pclose(fp);
-        else fclose(fp);
-        xf_Value r = xf_val_ok_arr(a);
-        xf_arr_release(a);
-        return r;
-    }
-    if (strcmp(name,"write")==0 && argc==2) {
-        xf_Value fv=xf_coerce_str(args[0]),sv=xf_coerce_str(args[1]);
-        if (fv.state!=XF_STATE_OK||sv.state!=XF_STATE_OK) { xf_value_release(fv); xf_value_release(sv); return xf_val_ok_num(0); }
-        FILE *fp=fopen(fv.data.str->data,"w");
-        if(!fp) { xf_value_release(fv); xf_value_release(sv); return xf_val_ok_num(0); }
-        fwrite(sv.data.str->data,1,sv.data.str->len,fp); fclose(fp);
-        xf_value_release(fv); xf_value_release(sv);
-        return xf_val_ok_num(1);
-    }
-    if (strcmp(name,"append")==0 && argc==2) {
-        xf_Value fv=xf_coerce_str(args[0]),sv=xf_coerce_str(args[1]);
-        if (fv.state!=XF_STATE_OK||sv.state!=XF_STATE_OK) { xf_value_release(fv); xf_value_release(sv); return xf_val_ok_num(0); }
-        FILE *fp=fopen(fv.data.str->data,"a");
-        if(!fp) { xf_value_release(fv); xf_value_release(sv); return xf_val_ok_num(0); }
-        fwrite(sv.data.str->data,1,sv.data.str->len,fp); fclose(fp);
-        xf_value_release(fv); xf_value_release(sv);
-        return xf_val_ok_num(1);
-    }
-    /* close(path) — flush and evict one handle from the redirect cache */
-    if (strcmp(name,"close")==0 && argc==1) {
-        xf_Value sv = xf_coerce_str(args[0]);
-        if (sv.state==XF_STATE_OK && sv.data.str && it) {
-            VM *_vm = it->vm;
-            for (size_t _i=0; _i<_vm->redir_count; _i++) {
-                if (strcmp(_vm->redir[_i].path, sv.data.str->data)==0) {
-                    if (_vm->redir[_i].fp) {
-                        fflush(_vm->redir[_i].fp);
-                        if (_vm->redir[_i].is_pipe) pclose(_vm->redir[_i].fp);
-                        else                         fclose(_vm->redir[_i].fp);
-                        _vm->redir[_i].fp = NULL;
-                    }
-                    /* compact the array */
-                    _vm->redir[_i] = _vm->redir[--_vm->redir_count];
-                    break;
-                }
-            }
-        }
-        xf_value_release(sv);
-        return xf_val_ok_num(0);
-    }
-    /* flush([path]) — fflush one handle or all */
-    if (strcmp(name,"flush")==0) {
-        if (argc==0 || (argc==1 && args[0].state!=XF_STATE_OK)) {
-            fflush(stdout);
-            if (it) { VM *_vm=it->vm; for(size_t _i=0;_i<_vm->redir_count;_i++) if(_vm->redir[_i].fp) fflush(_vm->redir[_i].fp); }
-        } else if (argc==1) {
-            xf_Value sv=xf_coerce_str(args[0]);
-            if (sv.state==XF_STATE_OK && sv.data.str && it) {
-                VM *_vm=it->vm;
-                for(size_t _i=0;_i<_vm->redir_count;_i++)
-                    if(strcmp(_vm->redir[_i].path, sv.data.str->data)==0 && _vm->redir[_i].fp)
-                        { fflush(_vm->redir[_i].fp); break; }
+    if (strcmp(name, "print") == 0) {
+        for (size_t i = 0; i < argc; i++) {
+            xf_Value sv = xf_coerce_str(args[i]);
+            if (sv.state == XF_STATE_OK && sv.data.str) {
+                fputs(sv.data.str->data, stdout);
+            } else {
+                fputs(XF_STATE_NAMES[args[i].state], stdout);
             }
             xf_value_release(sv);
+            if (i + 1 < argc) fputc(' ', stdout);
         }
-        return xf_val_ok_num(0);
+        fputc('\n', stdout);
+        return xf_val_null();
     }
+
+    if (strcmp(name, "len") == 0 && argc == 1) {
+        xf_Value v = args[0];
+        if (v.state != XF_STATE_OK) return xf_value_retain(v);
+
+        switch (v.type) {
+            case XF_TYPE_STR:
+                return xf_val_ok_num(v.data.str ? (double)v.data.str->len : 0.0);
+            case XF_TYPE_ARR:
+                return xf_val_ok_num(v.data.arr ? (double)v.data.arr->len : 0.0);
+            case XF_TYPE_TUPLE:
+                return xf_val_ok_num(v.data.tuple ? (double)xf_tuple_len(v.data.tuple) : 0.0);
+            case XF_TYPE_MAP:
+            case XF_TYPE_SET:
+                return xf_val_ok_num(v.data.map ? (double)v.data.map->order_len : 0.0);
+            default:
+                return xf_val_nav(XF_TYPE_NUM);
+        }
+    }
+
+    if (strcmp(name, "push") == 0 && argc == 2) {
+        if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_ARR && args[0].data.arr) {
+            xf_arr_push(args[0].data.arr, xf_value_retain(args[1]));
+        } else if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_SET && args[0].data.map) {
+            xf_Value ks = xf_coerce_str(args[1]);
+            if (ks.state == XF_STATE_OK && ks.data.str) {
+                xf_map_set(args[0].data.map, ks.data.str, xf_val_ok_num(1.0));
+            }
+            xf_value_release(ks);
+        }
+        return xf_value_retain(args[0]);
+    }
+
+    if (strcmp(name, "pop") == 0 && argc == 1) {
+        if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_ARR && args[0].data.arr) {
+            return xf_arr_pop(args[0].data.arr);
+        }
+        return xf_val_nav(XF_TYPE_VOID);
+    }
+
+    if (strcmp(name, "unshift") == 0 && argc == 2) {
+        if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_ARR && args[0].data.arr) {
+            xf_arr_unshift(args[0].data.arr, xf_value_retain(args[1]));
+        }
+        return xf_value_retain(args[0]);
+    }
+
+    if (strcmp(name, "shift") == 0 && argc == 1) {
+        if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_ARR && args[0].data.arr) {
+            return xf_arr_shift(args[0].data.arr);
+        }
+        return xf_val_nav(XF_TYPE_VOID);
+    }
+
+    if (strcmp(name, "remove") == 0 && argc == 2) {
+        xf_Value coll = args[0];
+        if (coll.state != XF_STATE_OK) return xf_value_retain(coll);
+
+        if (coll.type == XF_TYPE_ARR && coll.data.arr) {
+            xf_Value ni = xf_coerce_num(args[1]);
+            if (ni.state == XF_STATE_OK) {
+                xf_arr_delete(coll.data.arr, (size_t)ni.data.num);
+            }
+            xf_value_release(ni);
+            return xf_value_retain(coll);
+        }
+
+        if ((coll.type == XF_TYPE_MAP || coll.type == XF_TYPE_SET) && coll.data.map) {
+            xf_Value ks = xf_coerce_str(args[1]);
+            if (ks.state == XF_STATE_OK && ks.data.str) {
+                xf_map_delete(coll.data.map, ks.data.str);
+            }
+            xf_value_release(ks);
+            return xf_value_retain(coll);
+        }
+
+        return xf_val_nav(XF_TYPE_VOID);
+    }
+
+    if (strcmp(name, "keys") == 0 && argc == 1) {
+        if (args[0].state == XF_STATE_OK &&
+            (args[0].type == XF_TYPE_MAP || args[0].type == XF_TYPE_SET) &&
+            args[0].data.map) {
+            xf_arr_t *out = xf_arr_new();
+            if (!out) return xf_val_nav(XF_TYPE_ARR);
+
+            xf_map_t *m = args[0].data.map;
+            for (size_t i = 0; i < m->order_len; i++) {
+                xf_arr_push(out, xf_val_ok_str(m->order[i]));
+            }
+
+            xf_Value v = xf_val_ok_arr(out);
+            xf_arr_release(out);
+            return v;
+        }
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    if (strcmp(name, "values") == 0 && argc == 1) {
+        if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_MAP && args[0].data.map) {
+            xf_arr_t *out = xf_arr_new();
+            if (!out) return xf_val_nav(XF_TYPE_ARR);
+
+            xf_map_t *m = args[0].data.map;
+            for (size_t i = 0; i < m->order_len; i++) {
+                xf_Value v = xf_map_get(m, m->order[i]);
+                xf_arr_push(out, xf_value_retain(v));
+            }
+
+            xf_Value rv = xf_val_ok_arr(out);
+            xf_arr_release(out);
+            return rv;
+        }
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    if (strcmp(name, "has") == 0 && argc == 2) {
+        xf_Value coll = args[0], needle = args[1];
+        if (coll.state != XF_STATE_OK) return xf_value_retain(coll);
+        if (needle.state != XF_STATE_OK) return xf_value_retain(needle);
+
+        if (coll.type == XF_TYPE_STR && coll.data.str) {
+            xf_Value ns = xf_coerce_str(needle);
+            if (ns.state != XF_STATE_OK || !ns.data.str) {
+                if (ns.state == XF_STATE_OK) xf_value_release(ns);
+                return xf_val_false();
+            }
+
+            bool found = strstr(coll.data.str->data, ns.data.str->data) != NULL;
+            xf_value_release(ns);
+            return found ? xf_val_true() : xf_val_false();
+        }
+
+        if (coll.type == XF_TYPE_ARR && coll.data.arr) {
+            xf_Value ns = xf_coerce_str(needle);
+            if (ns.state != XF_STATE_OK || !ns.data.str) {
+                if (ns.state == XF_STATE_OK) xf_value_release(ns);
+                return xf_val_false();
+            }
+
+            xf_arr_t *a = coll.data.arr;
+            for (size_t i = 0; i < a->len; i++) {
+                xf_Value es = xf_coerce_str(a->items[i]);
+                bool match = (es.state == XF_STATE_OK &&
+                              es.data.str &&
+                              strcmp(es.data.str->data, ns.data.str->data) == 0);
+                xf_value_release(es);
+                if (match) {
+                    xf_value_release(ns);
+                    return xf_val_true();
+                }
+            }
+
+            xf_value_release(ns);
+            return xf_val_false();
+        }
+
+        if ((coll.type == XF_TYPE_MAP || coll.type == XF_TYPE_SET) && coll.data.map) {
+            xf_Value ks = xf_coerce_str(needle);
+            if (ks.state != XF_STATE_OK || !ks.data.str) {
+                if (ks.state == XF_STATE_OK) xf_value_release(ks);
+                return xf_val_false();
+            }
+
+            xf_Value got = xf_map_get(coll.data.map, ks.data.str);
+            xf_value_release(ks);
+            return got.state == XF_STATE_OK ? xf_val_true() : xf_val_false();
+        }
+
+        return xf_val_false();
+    }
+
+    if (strcmp(name, "type") == 0 && argc == 1) {
+        xf_Value v = args[0];
+        uint8_t t = XF_STATE_IS_BOOL(v.state) ? XF_TYPE_BOOL : v.type;
+        if (t >= XF_TYPE_COUNT) t = XF_TYPE_VOID;
+
+        xf_Str *s = xf_str_from_cstr(XF_TYPE_NAMES[t]);
+        if (!s) return xf_val_nav(XF_TYPE_STR);
+
+        xf_Value out = xf_val_ok_str(s);
+        xf_str_release(s);
+        return out;
+    }
+
+    if (strcmp(name, "state") == 0 && argc == 1) {
+        xf_Value v = args[0];
+        uint8_t st = (v.state < XF_STATE_COUNT) ? v.state : XF_STATE_OK;
+
+        xf_Str *s = xf_str_from_cstr(XF_STATE_NAMES[st]);
+        if (!s) return xf_val_nav(XF_TYPE_STR);
+
+        xf_Value out = xf_val_ok_str(s);
+        xf_str_release(s);
+        return out;
+    }
+
     return xf_val_nav(XF_TYPE_VOID);
 }
 xf_Value interp_eval_expr(Interp *it, Expr *e) {
@@ -1760,224 +1895,295 @@ case EXPR_SET_LIT: {
     }
 
     case EXPR_BINARY: {
-        if (e->as.binary.op == BINOP_AND) {
-            xf_Value a = interp_eval_expr(it, e->as.binary.left);
-            bool _ta = is_truthy(a);
-            xf_value_release(a);
-            if (!_ta) return make_bool(false);
-            xf_Value b = interp_eval_expr(it, e->as.binary.right);
-            bool _tb = is_truthy(b);
-            xf_value_release(b);
-            return make_bool(_tb);
-        }
-
-        if (e->as.binary.op == BINOP_OR) {
-            xf_Value a = interp_eval_expr(it, e->as.binary.left);
-            bool _ta = is_truthy(a);
-            xf_value_release(a);
-            if (_ta) return make_bool(true);
-            xf_Value b = interp_eval_expr(it, e->as.binary.right);
-            bool _tb = is_truthy(b);
-            xf_value_release(b);
-            return make_bool(_tb);
-        }
-
+    if (e->as.binary.op == BINOP_AND) {
         xf_Value a = interp_eval_expr(it, e->as.binary.left);
+        bool ta = is_truthy(a);
+        xf_value_release(a);
+        if (!ta) return make_bool(false);
+
         xf_Value b = interp_eval_expr(it, e->as.binary.right);
-
-        switch (e->as.binary.op) {
-            case BINOP_ADD:
-            case BINOP_SUB:
-            case BINOP_MUL:
-            case BINOP_DIV:
-            case BINOP_MOD:
-            case BINOP_CONCAT:
-            case BINOP_MADD:
-            case BINOP_MSUB:
-            case BINOP_MMUL:
-            case BINOP_MDIV:
-                return apply_binary_op(e->as.binary.op, a, b, e->loc);
-
-            case BINOP_POW: {
-                if ((a.state == XF_STATE_OK && a.type == XF_TYPE_ARR) ||
-                    (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR))
-                    return arr_broadcast(a, b, 5);
-
-                xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
-                if (na.state != XF_STATE_OK) return na;
-                if (nb.state != XF_STATE_OK) return nb;
-                return xf_val_ok_num(pow(na.data.num, nb.data.num));
-            }
-
-            case BINOP_PIPE_CMD: {
-                xf_Value cmd = xf_coerce_str(b);
-                if (cmd.state != XF_STATE_OK || !cmd.data.str) {
-                    xf_value_release(cmd);
-                    return xf_val_nav(XF_TYPE_STR);
-                }
-
-                xf_Value sv = xf_coerce_str(a);
-                if (sv.state != XF_STATE_OK || !sv.data.str) {
-                    xf_value_release(cmd);
-                    xf_value_release(sv);
-                    return xf_val_nav(XF_TYPE_STR);
-                }
-
-                char tmpname[] = "/tmp/xf_pipe_XXXXXX";
-                int fd = mkstemp(tmpname);
-                if (fd < 0) {
-                    xf_value_release(cmd);
-                    xf_value_release(sv);
-                    return xf_val_nav(XF_TYPE_STR);
-                }
-
-                FILE *tf = fdopen(fd, "w");
-                if (!tf) {
-                    close(fd);
-                    unlink(tmpname);
-                    xf_value_release(cmd);
-                    xf_value_release(sv);
-                    return xf_val_nav(XF_TYPE_STR);
-                }
-
-                fwrite(sv.data.str->data, 1, sv.data.str->len, tf);
-                fclose(tf);
-
-                char shellcmd[8192];
-                snprintf(shellcmd, sizeof(shellcmd), "%s < '%s'", cmd.data.str->data, tmpname);
-
-                FILE *fp = popen(shellcmd, "r");
-                if (!fp) {
-                    unlink(tmpname);
-                    xf_value_release(cmd);
-                    xf_value_release(sv);
-                    return xf_val_nav(XF_TYPE_STR);
-                }
-
-                char buf[65536];
-                size_t n = 0;
-                int c;
-                while (n < sizeof(buf) - 1 && (c = fgetc(fp)) != EOF)
-                    buf[n++] = (char)c;
-                buf[n] = '\0';
-
-                pclose(fp);
-                unlink(tmpname);
-
-                while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
-                    buf[--n] = '\0';
-
-                xf_Str *r = xf_str_from_cstr(buf);
-                xf_Value rv = xf_val_ok_str(r);
-                xf_str_release(r);
-
-                xf_value_release(cmd);
-                xf_value_release(sv);
-                return rv;
-            }
-
-            case BINOP_EQ:        return make_bool(val_cmp(a, b) == 0);
-            case BINOP_NEQ:       return make_bool(val_cmp(a, b) != 0);
-            case BINOP_LT:        return make_bool(val_cmp(a, b) < 0);
-            case BINOP_GT:        return make_bool(val_cmp(a, b) > 0);
-            case BINOP_LTE:       return make_bool(val_cmp(a, b) <= 0);
-            case BINOP_GTE:       return make_bool(val_cmp(a, b) >= 0);
-            case BINOP_SPACESHIP:
-                /* Cross-type or mixed-state → unordered → 0 */
-                if (a.state != b.state) return xf_val_ok_num(0.0);
-                return xf_val_ok_num((double)val_cmp(a, b));
-
-            case BINOP_MATCH:
-            case BINOP_NMATCH: {
-                bool _is_nmatch = (e->as.binary.op == BINOP_NMATCH);
-
-                xf_Value sa = xf_coerce_str(a);
-                if (sa.state != XF_STATE_OK || !sa.data.str) {
-                    xf_value_release(sa);
-                    return make_bool(_is_nmatch);
-                }
-
-                const char *subject = sa.data.str->data;
-                const char *pattern = NULL;
-                int cflags = REG_EXTENDED;
-
-                xf_Value sb_coerced = xf_val_null();
-                bool sb_allocated = false;
-                regex_t *_precompiled = NULL;
-
-                if (b.state == XF_STATE_OK && b.type == XF_TYPE_REGEX && b.data.re) {
-                    if (b.data.re->compiled) {
-                        _precompiled = (regex_t *)b.data.re->compiled;
-                    } else {
-                        pattern = b.data.re->pattern ? b.data.re->pattern->data : "";
-                        if (b.data.re->flags & XF_RE_ICASE) cflags |= REG_ICASE;
-                        if (b.data.re->flags & XF_RE_MULTILINE) cflags |= REG_NEWLINE;
-                    }
-                } else {
-                    sb_coerced = xf_coerce_str(b);
-                    sb_allocated = true;
-                    if (sb_coerced.state != XF_STATE_OK || !sb_coerced.data.str) {
-                        xf_value_release(sa);
-                        xf_value_release(sb_coerced);
-                        return make_bool(_is_nmatch);
-                    }
-                    pattern = sb_coerced.data.str->data;
-                }
-
-                regex_t re_local;
-                char errbuf[128];
-                bool matched;
-                regmatch_t _pm[33] = {0};
-                int _ngroups = 33;
-
-                if (_precompiled) {
-                    matched = (regexec(_precompiled, subject, _ngroups, _pm, 0) == 0);
-                } else {
-                    int rcc = regcomp(&re_local, pattern ? pattern : "", cflags);
-                    if (rcc != 0) {
-                        regerror(rcc, &re_local, errbuf, sizeof(errbuf));
-                        interp_error(it, e->loc, "invalid regex '%s': %s",
-                                     pattern ? pattern : "", errbuf);
-                        matched = false;
-                    } else {
-                        matched = (regexec(&re_local, subject, _ngroups, _pm, 0) == 0);
-                        regfree(&re_local);
-                    }
-                }
-
-                if (matched) {
-                    regoff_t _ms = _pm[0].rm_so, _me = _pm[0].rm_eo;
-                    if (_ms >= 0) {
-                        xf_Str *_ms_str = xf_str_new(subject + _ms, (size_t)(_me - _ms));
-                        xf_value_release(IT_REC(it)->last_match);
-                        IT_REC(it)->last_match = xf_val_ok_str(_ms_str);
-                        xf_str_release(_ms_str);
-                    }
-
-                    xf_arr_t *_caps = xf_arr_new();
-                    for (int _gi = 1; _gi < _ngroups && _pm[_gi].rm_so >= 0; _gi++) {
-                        regoff_t _gs = _pm[_gi].rm_so, _ge = _pm[_gi].rm_eo;
-                        xf_Str *_gs_str = xf_str_new(subject + _gs, (size_t)(_ge - _gs));
-                        xf_Value _gv = xf_val_ok_str(_gs_str);
-                        xf_str_release(_gs_str);
-                        xf_arr_push(_caps, _gv);
-                    }
-
-                    xf_value_release(IT_REC(it)->last_captures);
-                    IT_REC(it)->last_captures = xf_val_ok_arr(_caps);
-                    xf_arr_release(_caps);
-                }
-
-                xf_value_release(sa);
-                if (sb_allocated) xf_value_release(sb_coerced);
-                return make_bool(_is_nmatch ? !matched : matched);
-            }
-
-            default:
-                return xf_val_nav(XF_TYPE_VOID);
-        }
+        bool tb = is_truthy(b);
+        xf_value_release(b);
+        return make_bool(tb);
     }
 
+    if (e->as.binary.op == BINOP_OR) {
+        xf_Value a = interp_eval_expr(it, e->as.binary.left);
+        bool ta = is_truthy(a);
+        xf_value_release(a);
+        if (ta) return make_bool(true);
+
+        xf_Value b = interp_eval_expr(it, e->as.binary.right);
+        bool tb = is_truthy(b);
+        xf_value_release(b);
+        return make_bool(tb);
+    }
+
+    xf_Value a = interp_eval_expr(it, e->as.binary.left);
+    xf_Value b = interp_eval_expr(it, e->as.binary.right);
+
+    switch (e->as.binary.op) {
+        case BINOP_ADD:
+        case BINOP_SUB:
+        case BINOP_MUL:
+        case BINOP_DIV:
+        case BINOP_MOD:
+        case BINOP_CONCAT:
+        case BINOP_MADD:
+        case BINOP_MSUB:
+        case BINOP_MMUL:
+        case BINOP_MDIV: {
+            xf_Value ret = apply_binary_op(e->as.binary.op, a, b, e->loc);
+            xf_value_release(a);
+            xf_value_release(b);
+            return ret;
+        }
+
+        case BINOP_POW: {
+            if ((a.state == XF_STATE_OK && a.type == XF_TYPE_ARR) ||
+                (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR)) {
+                xf_Value ret = arr_broadcast(a, b, 5);
+                xf_value_release(a);
+                xf_value_release(b);
+                return ret;
+            }
+
+            xf_Value na = xf_coerce_num(a);
+            xf_Value nb = xf_coerce_num(b);
+            xf_value_release(a);
+            xf_value_release(b);
+
+            if (na.state != XF_STATE_OK) return na;
+            if (nb.state != XF_STATE_OK) {
+                xf_value_release(na);
+                return nb;
+            }
+
+            xf_Value ret = xf_val_ok_num(pow(na.data.num, nb.data.num));
+            xf_value_release(na);
+            xf_value_release(nb);
+            return ret;
+        }
+
+        case BINOP_PIPE_CMD: {
+            xf_Value cmd = xf_coerce_str(b);
+            xf_value_release(b);
+            if (cmd.state != XF_STATE_OK || !cmd.data.str) {
+                xf_value_release(cmd);
+                xf_value_release(a);
+                return xf_val_nav(XF_TYPE_STR);
+            }
+
+            xf_Value sv = xf_coerce_str(a);
+            xf_value_release(a);
+            if (sv.state != XF_STATE_OK || !sv.data.str) {
+                xf_value_release(cmd);
+                xf_value_release(sv);
+                return xf_val_nav(XF_TYPE_STR);
+            }
+
+            char tmpname[] = "/tmp/xf_pipe_XXXXXX";
+            int fd = mkstemp(tmpname);
+            if (fd < 0) {
+                xf_value_release(cmd);
+                xf_value_release(sv);
+                return xf_val_nav(XF_TYPE_STR);
+            }
+
+            FILE *tf = fdopen(fd, "w");
+            if (!tf) {
+                close(fd);
+                unlink(tmpname);
+                xf_value_release(cmd);
+                xf_value_release(sv);
+                return xf_val_nav(XF_TYPE_STR);
+            }
+
+            fwrite(sv.data.str->data, 1, sv.data.str->len, tf);
+            fclose(tf);
+
+            char shellcmd[8192];
+            snprintf(shellcmd, sizeof(shellcmd), "%s < '%s'", cmd.data.str->data, tmpname);
+
+            FILE *fp = popen(shellcmd, "r");
+            if (!fp) {
+                unlink(tmpname);
+                xf_value_release(cmd);
+                xf_value_release(sv);
+                return xf_val_nav(XF_TYPE_STR);
+            }
+
+            char buf[65536];
+            size_t n = 0;
+            int c;
+            while (n < sizeof(buf) - 1 && (c = fgetc(fp)) != EOF)
+                buf[n++] = (char)c;
+            buf[n] = '\0';
+
+            pclose(fp);
+            unlink(tmpname);
+
+            while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+                buf[--n] = '\0';
+
+            xf_Str *r = xf_str_from_cstr(buf);
+            xf_Value rv = xf_val_ok_str(r);
+            xf_str_release(r);
+
+            xf_value_release(cmd);
+            xf_value_release(sv);
+            return rv;
+        }
+
+        case BINOP_EQ: {
+            bool ok = (val_cmp(a, b) == 0);
+            xf_value_release(a);
+            xf_value_release(b);
+            return make_bool(ok);
+        }
+
+        case BINOP_NEQ: {
+            bool ok = (val_cmp(a, b) != 0);
+            xf_value_release(a);
+            xf_value_release(b);
+            return make_bool(ok);
+        }
+
+        case BINOP_LT: {
+            bool ok = (val_cmp(a, b) < 0);
+            xf_value_release(a);
+            xf_value_release(b);
+            return make_bool(ok);
+        }
+
+        case BINOP_GT: {
+            bool ok = (val_cmp(a, b) > 0);
+            xf_value_release(a);
+            xf_value_release(b);
+            return make_bool(ok);
+        }
+
+        case BINOP_LTE: {
+            bool ok = (val_cmp(a, b) <= 0);
+            xf_value_release(a);
+            xf_value_release(b);
+            return make_bool(ok);
+        }
+
+        case BINOP_GTE: {
+            bool ok = (val_cmp(a, b) >= 0);
+            xf_value_release(a);
+            xf_value_release(b);
+            return make_bool(ok);
+        }
+
+        case BINOP_SPACESHIP: {
+            xf_Value ret;
+            if (a.state != b.state) ret = xf_val_ok_num(0.0);
+            else ret = xf_val_ok_num((double)val_cmp(a, b));
+            xf_value_release(a);
+            xf_value_release(b);
+            return ret;
+        }
+        case BINOP_IN:
+            return eval_in(a,b);
+
+        case BINOP_MATCH:
+        case BINOP_NMATCH: {
+            bool is_nmatch = (e->as.binary.op == BINOP_NMATCH);
+
+            xf_Value sa = xf_coerce_str(a);
+            xf_value_release(a);
+            if (sa.state != XF_STATE_OK || !sa.data.str) {
+                xf_value_release(sa);
+                xf_value_release(b);
+                return make_bool(is_nmatch);
+            }
+
+            const char *subject = sa.data.str->data;
+            const char *pattern = NULL;
+            int cflags = REG_EXTENDED;
+
+            xf_Value sb_coerced = xf_val_null();
+            bool sb_allocated = false;
+            regex_t *precompiled = NULL;
+
+            if (b.state == XF_STATE_OK && b.type == XF_TYPE_REGEX && b.data.re) {
+                if (b.data.re->compiled) {
+                    precompiled = (regex_t *)b.data.re->compiled;
+                } else {
+                    pattern = b.data.re->pattern ? b.data.re->pattern->data : "";
+                    if (b.data.re->flags & XF_RE_ICASE) cflags |= REG_ICASE;
+                    if (b.data.re->flags & XF_RE_MULTILINE) cflags |= REG_NEWLINE;
+                }
+            } else {
+                sb_coerced = xf_coerce_str(b);
+                sb_allocated = true;
+                if (sb_coerced.state != XF_STATE_OK || !sb_coerced.data.str) {
+                    xf_value_release(sa);
+                    xf_value_release(sb_coerced);
+                    xf_value_release(b);
+                    return make_bool(is_nmatch);
+                }
+                pattern = sb_coerced.data.str->data;
+            }
+
+            regex_t re_local;
+            char errbuf[128];
+            bool matched;
+            regmatch_t pm[33] = {0};
+            int ngroups = 33;
+
+            if (precompiled) {
+                matched = (regexec(precompiled, subject, ngroups, pm, 0) == 0);
+            } else {
+                int rcc = regcomp(&re_local, pattern ? pattern : "", cflags);
+                if (rcc != 0) {
+                    regerror(rcc, &re_local, errbuf, sizeof(errbuf));
+                    interp_error(it, e->loc, "invalid regex '%s': %s",
+                                 pattern ? pattern : "", errbuf);
+                    matched = false;
+                } else {
+                    matched = (regexec(&re_local, subject, ngroups, pm, 0) == 0);
+                    regfree(&re_local);
+                }
+            }
+
+            if (matched) {
+                regoff_t ms = pm[0].rm_so, me = pm[0].rm_eo;
+                if (ms >= 0) {
+                    xf_Str *ms_str = xf_str_new(subject + ms, (size_t)(me - ms));
+                    xf_value_release(IT_REC(it)->last_match);
+                    IT_REC(it)->last_match = xf_val_ok_str(ms_str);
+                    xf_str_release(ms_str);
+                }
+
+                xf_arr_t *caps = xf_arr_new();
+                for (int gi = 1; gi < ngroups && pm[gi].rm_so >= 0; gi++) {
+                    regoff_t gs = pm[gi].rm_so, ge = pm[gi].rm_eo;
+                    xf_Str *gs_str = xf_str_new(subject + gs, (size_t)(ge - gs));
+                    xf_Value gv = xf_val_ok_str(gs_str);
+                    xf_str_release(gs_str);
+                    xf_arr_push(caps, gv);
+                }
+
+                xf_value_release(IT_REC(it)->last_captures);
+                IT_REC(it)->last_captures = xf_val_ok_arr(caps);
+                xf_arr_release(caps);
+            }
+
+            xf_value_release(sa);
+            if (sb_allocated) xf_value_release(sb_coerced);
+            xf_value_release(b);
+            return make_bool(is_nmatch ? !matched : matched);
+        }
+
+        default:
+            xf_value_release(a);
+            xf_value_release(b);
+            return xf_val_nav(XF_TYPE_VOID);
+    }
+}
     case EXPR_TERNARY: {
         xf_Value cond = interp_eval_expr(it, e->as.ternary.cond);
         bool _cond_truthy = is_truthy(cond);
@@ -2385,35 +2591,69 @@ case EXPR_CALL: {
         interp_error(it, e->loc, "unknown member '.%s'", field);
         return xf_val_nav(XF_TYPE_VOID);
     }
-case EXPR_PIPE_FN: {
+    
+    case EXPR_PIPE_FN: {
     xf_Value left = interp_eval_expr(it, e->as.pipe_fn.left);
     Expr *rhs = e->as.pipe_fn.right;
 
     if (rhs->kind == EXPR_IDENT) {
-        xf_Value r = interp_call_builtin(it, rhs->as.ident.name->data, &left, 1);
-        if (r.state != XF_STATE_NAV) return r;
+        const char *name =
+            (rhs->as.ident.name && rhs->as.ident.name->data)
+            ? rhs->as.ident.name->data
+            : "<null-ident>";
+
+        xf_Value r = interp_call_builtin(it, name, &left, 1);
+        if (r.state != XF_STATE_NAV) {
+            xf_Value ret = xf_value_retain(r);
+            xf_value_release(left);
+            return ret;
+        }
     }
 
     if (rhs->kind == EXPR_MEMBER) {
-        xf_Value obj   = interp_eval_expr(it, rhs->as.member.obj);
-        const char *mn = rhs->as.member.field->data;
+        xf_Value obj = interp_eval_expr(it, rhs->as.member.obj);
+        const char *mn =
+            (rhs->as.member.field && rhs->as.member.field->data)
+            ? rhs->as.member.field->data
+            : "<null-member>";
+
         xf_Value margs[2] = { obj, left };
         xf_Value mr = interp_call_builtin(it, mn, margs, 2);
-        if (mr.state != XF_STATE_NAV) { xf_value_release(obj); return mr; }
+        if (mr.state != XF_STATE_NAV) {
+            xf_Value ret = xf_value_retain(mr);
+            xf_value_release(obj);
+            xf_value_release(left);
+            return ret;
+        }
         xf_value_release(obj);
     }
 
     xf_Value callee = interp_eval_expr(it, rhs);
-    if (callee.state == XF_STATE_OK && callee.type == XF_TYPE_FN && callee.data.fn) {
+    if (callee.state == XF_STATE_OK &&
+        callee.type == XF_TYPE_FN &&
+        callee.data.fn) {
         xf_Fn *fn = callee.data.fn;
-        if (fn->is_native && fn->native_v)
-            return fn->native_v(&left, 1);
-        return interp_exec_xf_fn(it->vm, it->syms, fn, &left, 1);
+
+        if (fn->is_native && fn->native_v) {
+            xf_Value ret0 = fn->native_v(&left, 1);
+            xf_Value ret  = xf_value_retain(ret0);
+            xf_value_release(callee);
+            xf_value_release(left);
+            return ret;
+        }
+
+        xf_Value ret = interp_exec_xf_fn(it->vm, it->syms, fn, &left, 1);
+        xf_value_release(callee);
+        xf_value_release(left);
+        return ret;
     }
 
+    xf_value_release(callee);
+    xf_value_release(left);
     interp_error(it, e->loc, "pipe target is not callable");
     return xf_val_nav(XF_TYPE_VOID);
 }
+    
     case EXPR_FN: {
         xf_Fn *fn = build_fn(NULL, e->as.fn.return_type,
                              e->as.fn.params, e->as.fn.param_count,
@@ -3034,7 +3274,7 @@ int interp_run_program(Interp *it, Program *prog) {
 
         xf_Value tv = interp_eval_top(it, prog->items[i]);
         xf_value_release(tv);
-
+        xf_gc_maybe_collect(it->vm, it->syms, it);
         if (it->had_error) return 1;
         if (it->exiting) break;
     }
@@ -3049,7 +3289,7 @@ void interp_run_end(Interp *it, Program *prog) {
 
         xf_Value tv = interp_eval_top(it, prog->items[i]);
         xf_value_release(tv);
-
+        xf_gc_maybe_collect(it->vm, it->syms, it);
         if (it->had_error) return;
     }
     vm_redir_flush(it->vm);

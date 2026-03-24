@@ -112,6 +112,7 @@ typedef enum {
     BINOP_PIPE_IN,   /* "shell cmd" | expr  (read from cmd) */
     BINOP_EQ, BINOP_NEQ, BINOP_LT, BINOP_GT, BINOP_LTE, BINOP_GTE,
     BINOP_SPACESHIP,   /* <=>                                   */
+    BINOP_IN,
     BINOP_AND, BINOP_OR,
     BINOP_MATCH,       /* ~   regex match                       */
     BINOP_NMATCH,      /* !~  regex no-match                    */

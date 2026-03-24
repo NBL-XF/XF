@@ -30,6 +30,7 @@ CORE_SRCS = \
 RUNTIME_SRCS = \
 	src/ast.c \
 	src/interp.c \
+ src/gc.c \
 	src/lexer.c \
 	src/parser.c \
 	src/symTable.c \

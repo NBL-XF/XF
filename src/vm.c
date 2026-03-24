@@ -552,79 +552,183 @@ static bool is_truthy(xf_Value v) {
 static xf_Value val_num(double n) { return xf_val_ok_num(n); }
 
 static xf_Value val_add(xf_Value a, xf_Value b) {
-    a = xf_coerce_num(a); b = xf_coerce_num(b);
-    if (a.state != XF_STATE_OK) return a;
-    if (b.state != XF_STATE_OK) return b;
-    return val_num(a.data.num + b.data.num);
+    xf_Value na = xf_coerce_num(a);
+    if (na.state != XF_STATE_OK) return na;
+
+    xf_Value nb = xf_coerce_num(b);
+    if (nb.state != XF_STATE_OK) {
+        xf_value_release(na);
+        return nb;
+    }
+
+    xf_Value out = val_num(na.data.num + nb.data.num);
+    xf_value_release(na);
+    xf_value_release(nb);
+    return out;
 }
+
 static xf_Value val_sub(xf_Value a, xf_Value b) {
-    a = xf_coerce_num(a); b = xf_coerce_num(b);
-    if (a.state != XF_STATE_OK) return a;
-    if (b.state != XF_STATE_OK) return b;
-    return val_num(a.data.num - b.data.num);
+    xf_Value na = xf_coerce_num(a);
+    if (na.state != XF_STATE_OK) return na;
+
+    xf_Value nb = xf_coerce_num(b);
+    if (nb.state != XF_STATE_OK) {
+        xf_value_release(na);
+        return nb;
+    }
+
+    xf_Value out = val_num(na.data.num - nb.data.num);
+    xf_value_release(na);
+    xf_value_release(nb);
+    return out;
 }
+
 static xf_Value val_mul(xf_Value a, xf_Value b) {
-    a = xf_coerce_num(a); b = xf_coerce_num(b);
-    if (a.state != XF_STATE_OK) return a;
-    if (b.state != XF_STATE_OK) return b;
-    return val_num(a.data.num * b.data.num);
+    xf_Value na = xf_coerce_num(a);
+    if (na.state != XF_STATE_OK) return na;
+
+    xf_Value nb = xf_coerce_num(b);
+    if (nb.state != XF_STATE_OK) {
+        xf_value_release(na);
+        return nb;
+    }
+
+    xf_Value out = val_num(na.data.num * nb.data.num);
+    xf_value_release(na);
+    xf_value_release(nb);
+    return out;
 }
+
 static xf_Value val_div(VM *vm, xf_Value a, xf_Value b) {
-    a = xf_coerce_num(a); b = xf_coerce_num(b);
-    if (b.state == XF_STATE_OK && b.data.num == 0.0) {
+    xf_Value na = xf_coerce_num(a);
+    if (na.state != XF_STATE_OK) return na;
+
+    xf_Value nb = xf_coerce_num(b);
+    if (nb.state != XF_STATE_OK) {
+        xf_value_release(na);
+        return nb;
+    }
+
+    if (nb.data.num == 0.0) {
+        xf_value_release(na);
+        xf_value_release(nb);
         vm_error(vm, "division by zero");
         return xf_val_err(xf_err_new("division by zero", "<vm>", 0, 0), XF_TYPE_NUM);
     }
-    if (a.state != XF_STATE_OK) return a;
-    if (b.state != XF_STATE_OK) return b;
-    return val_num(a.data.num / b.data.num);
+
+    xf_Value out = val_num(na.data.num / nb.data.num);
+    xf_value_release(na);
+    xf_value_release(nb);
+    return out;
 }
+
 static xf_Value val_mod(VM *vm, xf_Value a, xf_Value b) {
-    a = xf_coerce_num(a); b = xf_coerce_num(b);
-    if (b.state == XF_STATE_OK && b.data.num == 0.0) {
+    xf_Value na = xf_coerce_num(a);
+    if (na.state != XF_STATE_OK) return na;
+
+    xf_Value nb = xf_coerce_num(b);
+    if (nb.state != XF_STATE_OK) {
+        xf_value_release(na);
+        return nb;
+    }
+
+    if (nb.data.num == 0.0) {
+        xf_value_release(na);
+        xf_value_release(nb);
         vm_error(vm, "modulo by zero");
         return xf_val_err(xf_err_new("modulo by zero", "<vm>", 0, 0), XF_TYPE_NUM);
     }
-    if (a.state != XF_STATE_OK) return a;
-    if (b.state != XF_STATE_OK) return b;
-    return val_num(fmod(a.data.num, b.data.num));
-}
-static xf_Value val_pow(xf_Value a, xf_Value b) {
-    a = xf_coerce_num(a); b = xf_coerce_num(b);
-    if (a.state != XF_STATE_OK) return a;
-    if (b.state != XF_STATE_OK) return b;
-    return val_num(pow(a.data.num, b.data.num));
-}
-static xf_Value val_concat(xf_Value a, xf_Value b) {
-    xf_Value sa = xf_coerce_str(a);
-    xf_Value sb = xf_coerce_str(b);
-    if (sa.state != XF_STATE_OK) return sa;
-    if (sb.state != XF_STATE_OK) return sb;
-    size_t la = sa.data.str->len, lb = sb.data.str->len;
-    char *buf = malloc(la + lb + 1);
-    memcpy(buf, sa.data.str->data, la);
-    memcpy(buf + la, sb.data.str->data, lb);
-    buf[la+lb] = '\0';
-    xf_Str *s = xf_str_new(buf, la+lb);
-    free(buf);
-    xf_Value r = xf_val_ok_str(s);
-    xf_str_release(s);
-    return r;
-}
-static int val_cmp(xf_Value a, xf_Value b) {
-    /* numeric if both coerce cleanly, else string */
-    xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
-    if (na.state == XF_STATE_OK && nb.state == XF_STATE_OK) {
-        if (na.data.num < nb.data.num) return -1;
-        if (na.data.num > nb.data.num) return  1;
-        return 0;
-    }
-    xf_Value sa = xf_coerce_str(a), sb = xf_coerce_str(b);
-    if (sa.state == XF_STATE_OK && sb.state == XF_STATE_OK)
-        return strcmp(sa.data.str->data, sb.data.str->data);
-    return 0;
+
+    xf_Value out = val_num(fmod(na.data.num, nb.data.num));
+    xf_value_release(na);
+    xf_value_release(nb);
+    return out;
 }
 
+static xf_Value val_pow(xf_Value a, xf_Value b) {
+    xf_Value na = xf_coerce_num(a);
+    if (na.state != XF_STATE_OK) return na;
+
+    xf_Value nb = xf_coerce_num(b);
+    if (nb.state != XF_STATE_OK) {
+        xf_value_release(na);
+        return nb;
+    }
+
+    xf_Value out = val_num(pow(na.data.num, nb.data.num));
+    xf_value_release(na);
+    xf_value_release(nb);
+    return out;
+}
+
+static xf_Value val_concat(xf_Value a, xf_Value b) {
+    xf_Value sa = xf_coerce_str(a);
+    if (sa.state != XF_STATE_OK) return sa;
+
+    xf_Value sb = xf_coerce_str(b);
+    if (sb.state != XF_STATE_OK) {
+        xf_value_release(sa);
+        return sb;
+    }
+
+    size_t la = sa.data.str->len, lb = sb.data.str->len;
+    char *buf = malloc(la + lb + 1);
+    if (!buf) {
+        xf_value_release(sa);
+        xf_value_release(sb);
+        return xf_val_nav(XF_TYPE_STR);
+    }
+
+    memcpy(buf, sa.data.str->data, la);
+    memcpy(buf + la, sb.data.str->data, lb);
+    buf[la + lb] = '\0';
+
+    xf_Str *s = xf_str_new(buf, la + lb);
+    free(buf);
+
+    if (!s) {
+        xf_value_release(sa);
+        xf_value_release(sb);
+        return xf_val_nav(XF_TYPE_STR);
+    }
+
+    xf_Value r = xf_val_ok_str(s);
+    xf_str_release(s);
+    xf_value_release(sa);
+    xf_value_release(sb);
+    return r;
+}
+
+static int val_cmp(xf_Value a, xf_Value b) {
+    xf_Value na = xf_coerce_num(a);
+    xf_Value nb = xf_coerce_num(b);
+
+    if (na.state == XF_STATE_OK && nb.state == XF_STATE_OK) {
+        int out = 0;
+        if (na.data.num < nb.data.num) out = -1;
+        else if (na.data.num > nb.data.num) out = 1;
+        xf_value_release(na);
+        xf_value_release(nb);
+        return out;
+    }
+
+    xf_value_release(na);
+    xf_value_release(nb);
+
+    xf_Value sa = xf_coerce_str(a);
+    xf_Value sb = xf_coerce_str(b);
+
+    if (sa.state == XF_STATE_OK && sb.state == XF_STATE_OK) {
+        int out = strcmp(sa.data.str->data, sb.data.str->data);
+        xf_value_release(sa);
+        xf_value_release(sb);
+        return out;
+    }
+
+    xf_value_release(sa);
+    xf_value_release(sb);
+    return 0;
+}
 
 /* ============================================================
  * Core execution loop
@@ -767,43 +871,53 @@ VMResult vm_run_chunk(VM *vm, Chunk *chunk) {
 
         case OP_CONCAT: b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_concat(a,b)); break;
 
-        case OP_MATCH:
-        case OP_NMATCH: {
-            /* simple substring match for now — full regex in interp */
-            b = vm_pop(vm); a = vm_pop(vm);
-            xf_Value sa = xf_coerce_str(a), sb = xf_coerce_str(b);
-            bool found = (sa.state==XF_STATE_OK && sb.state==XF_STATE_OK)
-                         ? (strstr(sa.data.str->data, sb.data.str->data) != NULL)
-                         : false;
-            vm_push(vm, val_num((op==OP_MATCH) == found ? 1.0 : 0.0));
-            break;
-        }
-
         case OP_GET_STATE: a=vm_pop(vm); vm_push(vm,val_num((double)a.state)); break;
         case OP_GET_TYPE:  a=vm_pop(vm); vm_push(vm,val_num((double)a.type));  break;
         case OP_COALESCE:
             b=vm_pop(vm); a=vm_pop(vm);
             vm_push(vm, (a.state==XF_STATE_OK) ? a : b);
             break;
+        case OP_MATCH:
+case OP_NMATCH: {
+    b = vm_pop(vm);
+    a = vm_pop(vm);
 
-        case OP_PRINT: {
-            uint8_t argc = READ_U8();
-            /* args are on stack in reverse — collect then print */
-            xf_Value args[64];
-            for (int i = argc-1; i >= 0; i--)
-                args[i] = vm_pop(vm);
-            for (int i = 0; i < argc; i++) {
-                if (i > 0) printf("%s", vm->rec.ofs);
-                xf_Value sv = xf_coerce_str(args[i]);
-                if (sv.state==XF_STATE_OK && sv.data.str)
-                    printf("%s", sv.data.str->data);
-                else
-                    printf("%s", XF_STATE_NAMES[args[i].state]);
-            }
-            printf("%s", vm->rec.ors);
-            break;
-        }
+    xf_Value sa = xf_coerce_str(a);
+    xf_Value sb = xf_coerce_str(b);
 
+    bool found = (sa.state == XF_STATE_OK && sb.state == XF_STATE_OK)
+                 ? (strstr(sa.data.str->data, sb.data.str->data) != NULL)
+                 : false;
+
+    xf_value_release(sa);
+    xf_value_release(sb);
+
+    vm_push(vm, val_num((op == OP_MATCH) == found ? 1.0 : 0.0));
+    break;
+}
+
+case OP_PRINT: {
+    uint8_t argc = READ_U8();
+    xf_Value args[64];
+
+    for (int i = argc - 1; i >= 0; i--)
+        args[i] = vm_pop(vm);
+
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) printf("%s", vm->rec.ofs);
+
+        xf_Value sv = xf_coerce_str(args[i]);
+        if (sv.state == XF_STATE_OK && sv.data.str)
+            printf("%s", sv.data.str->data);
+        else
+            printf("%s", XF_STATE_NAMES[args[i].state]);
+
+        xf_value_release(sv);
+    }
+
+    printf("%s", vm->rec.ors);
+    break;
+}
         case OP_JUMP: {
             int16_t delta = (int16_t)READ_U16();
             frame->ip += (size_t)((int)delta);

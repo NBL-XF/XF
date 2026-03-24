@@ -330,13 +330,24 @@ xf_arr_t *xf_arr_retain(xf_arr_t *a) {
 }
 
 void xf_arr_release(xf_arr_t *a) {
-    if (!a || atomic_fetch_sub(&a->refcount, 1) != 1) return;
-    for (size_t i = 0; i < a->len; i++)
+    if (!a) return;
+
+    uint32_t old = atomic_fetch_sub(&a->refcount, 1);
+    printf("xf_arr_release a=%p old_rc=%u new_rc=%u len=%zu\n",
+           (void *)a, old, old - 1, a->len);
+
+    if (old != 1) return;
+
+    printf("FREE ARRAY a=%p len=%zu\n", (void *)a, a->len);
+
+    for (size_t i = 0; i < a->len; i++) {
+        printf("  arr=%p releasing item[%zu]\n", (void *)a, i);
         xf_value_release(a->items[i]);
+    }
+
     free(a->items);
     free(a);
 }
-
 void xf_arr_push(xf_arr_t *a, xf_value_t v) {
     if (a->len >= a->cap) {
         a->cap   = a->cap ? a->cap * 2 : ARR_INIT_CAP;

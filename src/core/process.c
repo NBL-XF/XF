@@ -41,58 +41,91 @@ static xf_Value cp_split(xf_Value *args, size_t argc) {
     NEED(2);
     if (args[0].state != XF_STATE_OK || args[0].type != XF_TYPE_ARR || !args[0].data.arr)
         return xf_val_nav(XF_TYPE_ARR);
+
     double dn;
-    if (!arg_num(args, argc, 1, &dn) || dn < 1) return xf_val_nav(XF_TYPE_ARR);
+    if (!arg_num(args, argc, 1, &dn) || dn < 1)
+        return xf_val_nav(XF_TYPE_ARR);
+
     xf_arr_t *in = args[0].data.arr;
     size_t n = (size_t)dn, sz = in->len, per = (sz + n - 1) / n;
+
     xf_arr_t *out = xf_arr_new();
     for (size_t i = 0; i < n; i++) {
-        size_t from = i * per, to = from + per < sz ? from + per : sz;
+        size_t from = i * per;
+        size_t to   = from + per < sz ? from + per : sz;
+
         xf_arr_t *chunk = xf_arr_new();
-        for (size_t j = from; j < to; j++) xf_arr_push(chunk, in->items[j]);
-        xf_Value cv = xf_val_ok_arr(chunk); xf_arr_release(chunk);
+        for (size_t j = from; j < to; j++)
+            xf_arr_push(chunk, xf_value_retain(in->items[j]));
+
+        xf_Value cv = xf_val_ok_arr(chunk);
+        xf_arr_release(chunk);
         xf_arr_push(out, cv);
+
         if (to >= sz) break;
     }
-    xf_Value v = xf_val_ok_arr(out); xf_arr_release(out); return v;
-}
 
+    xf_Value v = xf_val_ok_arr(out);
+    xf_arr_release(out);
+    return v;
+}
 static xf_Value cp_assign(xf_Value *args, size_t argc) {
     NEED(1);
-    if (args[0].state != XF_STATE_OK || args[0].type != XF_TYPE_ARR || !args[0].data.arr)
+
+    if (args[0].state != XF_STATE_OK ||
+        args[0].type  != XF_TYPE_ARR ||
+        !args[0].data.arr) {
         return xf_val_nav(XF_TYPE_ARR);
+    }
+
     xf_arr_t *in = args[0].data.arr;
     xf_fn_t *fn = NULL;
-    if (argc >= 2 && args[1].state == XF_STATE_OK &&
-        args[1].type == XF_TYPE_FN && args[1].data.fn) {
+
+    if (argc >= 2 &&
+        args[1].state == XF_STATE_OK &&
+        args[1].type  == XF_TYPE_FN &&
+        args[1].data.fn) {
         fn = args[1].data.fn;
     }
+
     xf_arr_t *out = xf_arr_new();
+    if (!out) return xf_val_nav(XF_TYPE_ARR);
+
     for (size_t r = 0; r < in->len; r++) {
         xf_Value row = in->items[r];
-        if (fn) {
-            xf_Value xformed = xf_val_nav(XF_TYPE_VOID);
-            if (fn->is_native && fn->native_v) {
-                xformed = fn->native_v(&row, 1);
-            } else {
-                xf_fn_caller_t caller = core_get_fn_caller();
-                void *vm = core_get_fn_caller_vm();
-                void *sy = core_get_fn_caller_syms();
-                if (caller && vm) xformed = caller(vm, sy, fn, &row, 1);
-            }
-            if (xformed.state == XF_STATE_OK && xformed.type == XF_TYPE_MAP) {
-                xf_arr_push(out, xformed);
-            } else {
-                xf_arr_push(out, xf_value_retain(row));
-                xf_value_release(xformed);
-            }
+
+        if (!fn) {
+            xf_arr_push(out, xf_value_retain(row));   /* container steals */
+            continue;
+        }
+
+        xf_Value xformed = xf_val_nav(XF_TYPE_VOID);
+
+        if (fn->is_native && fn->native_v) {
+            xformed = fn->native_v(&row, 1);
         } else {
-            xf_arr_push(out, xf_value_retain(row));
+            xf_fn_caller_t caller = core_get_fn_caller();
+            void *vm = core_get_fn_caller_vm();
+            void *sy = core_get_fn_caller_syms();
+            if (caller && vm) {
+                xformed = caller(vm, sy, fn, &row, 1);
+            }
+        }
+
+        if (xformed.state == XF_STATE_OK &&
+            xformed.type  == XF_TYPE_MAP &&
+            xformed.data.map) {
+            xf_arr_push(out, xformed);                /* transfer ownership */
+        } else {
+            xf_value_release(xformed);               /* discard transform */
+            xf_arr_push(out, xf_value_retain(row));  /* fallback copy */
         }
     }
-    xf_Value v = xf_val_ok_arr(out); xf_arr_release(out); return v;
-}
 
+    xf_Value v = xf_val_ok_arr(out);
+    xf_arr_release(out);
+    return v;
+}
 static xf_Value cp_index(xf_Value *args, size_t argc) {
     NEED(1);
     if (args[0].state != XF_STATE_OK || args[0].type != XF_TYPE_ARR || !args[0].data.arr)

@@ -702,6 +702,7 @@ Expr *parse_compare(Parser *p) {
             left = make_core_ds_call2("merge", left, parse_concat(p), loc);
             continue;
         }
+        if (match_tok(p, TK_KW_IN))     { left = ast_binary(BINOP_IN,        left, parse_concat(p), loc);continue; }
         if (match_tok(p, TK_LT))        { left = ast_binary(BINOP_LT,       left, parse_concat(p), loc); continue; }
         if (match_tok(p, TK_GT))        { left = ast_binary(BINOP_GT,       left, parse_concat(p), loc); continue; }
         if (match_tok(p, TK_LT_EQ))     { left = ast_binary(BINOP_LTE,      left, parse_concat(p), loc); continue; }

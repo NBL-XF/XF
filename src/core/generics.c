@@ -1,10 +1,9 @@
 #include "internal.h"
 
-
 static xf_Value cg_join(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value coll = args[0];
-    if (coll.state != XF_STATE_OK) return coll;
+    if (coll.state != XF_STATE_OK) return xf_value_retain(coll);
 
     const char *sep;
     size_t seplen;
@@ -26,6 +25,12 @@ static xf_Value cg_join(xf_Value *args, size_t argc) {
         size_t total = alen + seplen + blen;
 
         char *buf = malloc(total + 1);
+        if (!buf) {
+            xf_value_release(as);
+            xf_value_release(bs);
+            return xf_val_nav(XF_TYPE_STR);
+        }
+
         memcpy(buf,                 as.data.str->data, alen);
         memcpy(buf + alen,          sep,               seplen);
         memcpy(buf + alen + seplen, bs.data.str->data, blen);
@@ -43,12 +48,13 @@ static xf_Value cg_join(xf_Value *args, size_t argc) {
             return num_try;
         }
 
+        xf_value_release(num_try);
         fprintf(stderr, "xf warning: join of num values produced non-numeric result\n");
         return joined;
     }
 
     if (coll.type == XF_TYPE_STR && coll.data.str) {
-        if (argc < 3) return coll;
+        if (argc < 3) return xf_value_retain(coll);
 
         const char *a = coll.data.str->data;
         size_t alen = coll.data.str->len;
@@ -59,6 +65,8 @@ static xf_Value cg_join(xf_Value *args, size_t argc) {
 
         size_t total = alen + seplen + blen;
         char *buf = malloc(total + 1);
+        if (!buf) return xf_val_nav(XF_TYPE_STR);
+
         memcpy(buf, a, alen);
         memcpy(buf + alen, sep, seplen);
         memcpy(buf + alen + seplen, b, blen);
@@ -83,6 +91,8 @@ static xf_Value cg_join(xf_Value *args, size_t argc) {
         }
 
         char *buf = malloc(total + 1);
+        if (!buf) return xf_val_nav(XF_TYPE_STR);
+
         size_t pos = 0;
 
         for (size_t i = 0; i < a->len; i++) {
@@ -127,6 +137,8 @@ static xf_Value cg_join(xf_Value *args, size_t argc) {
         }
 
         char *buf = malloc(total + 1);
+        if (!buf) return xf_val_nav(XF_TYPE_STR);
+
         size_t pos = 0;
 
         for (size_t i = 0; i < m->order_len; i++) {
@@ -161,7 +173,7 @@ static xf_Value cg_join(xf_Value *args, size_t argc) {
 static xf_Value cg_split(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value src = args[0];
-    if (src.state != XF_STATE_OK) return src;
+    if (src.state != XF_STATE_OK) return xf_value_retain(src);
 
     /* partition overload: split(arr|map, n) */
     if (src.type == XF_TYPE_ARR && src.data.arr) {
@@ -173,6 +185,8 @@ static xf_Value cg_split(xf_Value *args, size_t argc) {
         size_t sz = in->len;
 
         xf_arr_t *out = xf_arr_new();
+        if (!out) return xf_val_nav(XF_TYPE_ARR);
+
         size_t per = (sz + n - 1) / n;
 
         for (size_t i = 0; i < n; i++) {
@@ -180,6 +194,11 @@ static xf_Value cg_split(xf_Value *args, size_t argc) {
             size_t to   = from + per < sz ? from + per : sz;
 
             xf_arr_t *chunk = xf_arr_new();
+            if (!chunk) {
+                xf_arr_release(out);
+                return xf_val_nav(XF_TYPE_ARR);
+            }
+
             for (size_t j = from; j < to; j++)
                 xf_arr_push(chunk, xf_value_retain(in->items[j]));
 
@@ -204,6 +223,8 @@ static xf_Value cg_split(xf_Value *args, size_t argc) {
         size_t sz = in->order_len;
 
         xf_arr_t *out = xf_arr_new();
+        if (!out) return xf_val_nav(XF_TYPE_ARR);
+
         size_t per = (sz + n - 1) / n;
 
         for (size_t i = 0; i < n; i++) {
@@ -211,6 +232,11 @@ static xf_Value cg_split(xf_Value *args, size_t argc) {
             size_t to   = from + per < sz ? from + per : sz;
 
             xf_map_t *chunk = xf_map_new();
+            if (!chunk) {
+                xf_arr_release(out);
+                return xf_val_nav(XF_TYPE_ARR);
+            }
+
             for (size_t j = from; j < to; j++) {
                 xf_Str *key = in->order[j];
                 xf_map_set(chunk, key, xf_value_retain(xf_map_get(in, key)));
@@ -229,14 +255,18 @@ static xf_Value cg_split(xf_Value *args, size_t argc) {
     }
 
     /* string split */
-    const char *s; size_t slen;
+    const char *s;
+    size_t slen;
     if (!arg_str(args, argc, 0, &s, &slen)) return propagate(args, argc);
 
-    const char *pat; int cflags; bool is_regex;
+    const char *pat;
+    int cflags;
+    bool is_regex;
     if (!cs_arg_pat(args, argc, 1, &pat, &cflags, &is_regex))
         return propagate(args, argc);
 
     xf_arr_t *out = xf_arr_new();
+    if (!out) return xf_val_nav(XF_TYPE_ARR);
 
     if (!is_regex) {
         size_t seplen2 = strlen(pat);
@@ -282,7 +312,7 @@ static xf_Value cg_split(xf_Value *args, size_t argc) {
 static xf_Value cg_strip(xf_Value *args, size_t argc) {
     NEED(1);
     xf_Value v = args[0];
-    if (v.state != XF_STATE_OK) return v;
+    if (v.state != XF_STATE_OK) return xf_value_retain(v);
 
     const char *chars = NULL;
     size_t chars_len = 0;
@@ -298,7 +328,7 @@ static xf_Value cg_strip(xf_Value *args, size_t argc) {
     if (v.type == XF_TYPE_STR && v.data.str) {
         const char *s = v.data.str->data;
         size_t lo = 0, hi = v.data.str->len;
-        while (lo < hi && STRIP_CHAR(s[lo]))    lo++;
+        while (lo < hi && STRIP_CHAR(s[lo]))     lo++;
         while (hi > lo && STRIP_CHAR(s[hi - 1])) hi--;
         return make_str_val(s + lo, hi - lo);
     }
@@ -306,17 +336,17 @@ static xf_Value cg_strip(xf_Value *args, size_t argc) {
     if (v.type == XF_TYPE_ARR && v.data.arr) {
         xf_arr_t *in = v.data.arr;
         xf_arr_t *out = xf_arr_new();
+        if (!out) return xf_val_nav(XF_TYPE_ARR);
 
         for (size_t i = 0; i < in->len; i++) {
             xf_Value e = in->items[i];
 
-            /* Filter out non-OK values (NAV, NULL, UNDEF) */
             if (e.state != XF_STATE_OK) continue;
 
             if (e.type == XF_TYPE_STR && e.data.str) {
                 const char *s = e.data.str->data;
                 size_t lo = 0, hi = e.data.str->len;
-                while (lo < hi && STRIP_CHAR(s[lo]))    lo++;
+                while (lo < hi && STRIP_CHAR(s[lo]))     lo++;
                 while (hi > lo && STRIP_CHAR(s[hi - 1])) hi--;
                 xf_arr_push(out, make_str_val(s + lo, hi - lo));
             } else {
@@ -332,6 +362,7 @@ static xf_Value cg_strip(xf_Value *args, size_t argc) {
     if (v.type == XF_TYPE_MAP && v.data.map) {
         xf_map_t *in = v.data.map;
         xf_map_t *out = xf_map_new();
+        if (!out) return xf_val_nav(XF_TYPE_MAP);
 
         for (size_t i = 0; i < in->order_len; i++) {
             xf_Str *key = in->order[i];
@@ -340,7 +371,7 @@ static xf_Value cg_strip(xf_Value *args, size_t argc) {
             if (val.state == XF_STATE_OK && val.type == XF_TYPE_STR && val.data.str) {
                 const char *s = val.data.str->data;
                 size_t lo = 0, hi = val.data.str->len;
-                while (lo < hi && STRIP_CHAR(s[lo]))    lo++;
+                while (lo < hi && STRIP_CHAR(s[lo]))     lo++;
                 while (hi > lo && STRIP_CHAR(s[hi - 1])) hi--;
                 xf_map_set(out, key, make_str_val(s + lo, hi - lo));
             } else {
@@ -356,14 +387,19 @@ static xf_Value cg_strip(xf_Value *args, size_t argc) {
     if (v.type == XF_TYPE_SET && v.data.map) {
         xf_map_t *in = v.data.map;
         xf_map_t *out = xf_map_new();
+        if (!out) return xf_val_nav(XF_TYPE_SET);
 
         for (size_t i = 0; i < in->order_len; i++) {
             xf_Str *key = in->order[i];
             const char *s = key->data;
             size_t lo = 0, hi = key->len;
-            while (lo < hi && STRIP_CHAR(s[lo]))    lo++;
+            while (lo < hi && STRIP_CHAR(s[lo]))     lo++;
             while (hi > lo && STRIP_CHAR(s[hi - 1])) hi--;
             xf_Str *nk = xf_str_new(s + lo, hi - lo);
+            if (!nk) {
+                xf_map_release(out);
+                return xf_val_nav(XF_TYPE_SET);
+            }
             xf_map_set(out, nk, xf_val_ok_num(1.0));
             xf_str_release(nk);
         }
@@ -380,8 +416,8 @@ static xf_Value cg_strip(xf_Value *args, size_t argc) {
 static xf_Value cg_contains(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value coll = args[0], needle = args[1];
-    if (coll.state != XF_STATE_OK) return coll;
-    if (needle.state != XF_STATE_OK) return needle;
+    if (coll.state != XF_STATE_OK) return xf_value_retain(coll);
+    if (needle.state != XF_STATE_OK) return xf_value_retain(needle);
 
     if (coll.type == XF_TYPE_STR && coll.data.str) {
         xf_Value ns = xf_coerce_str(needle);
@@ -436,15 +472,22 @@ static xf_Value cg_contains(xf_Value *args, size_t argc) {
 static xf_Value cg_length(xf_Value *args, size_t argc) {
     NEED(1);
     xf_Value v = args[0];
-    if (v.state != XF_STATE_OK) return v;
+    if (v.state != XF_STATE_OK) return xf_value_retain(v);
+
     switch (v.type) {
-        case XF_TYPE_STR:   return xf_val_ok_num(v.data.str   ? (double)v.data.str->len        : 0.0);
-        case XF_TYPE_ARR:   return xf_val_ok_num(v.data.arr   ? (double)v.data.arr->len        : 0.0);
-        case XF_TYPE_TUPLE: return xf_val_ok_num(v.data.tuple ? (double)xf_tuple_len(v.data.tuple) : 0.0);
+        case XF_TYPE_STR:
+            return xf_val_ok_num(v.data.str ? (double)v.data.str->len : 0.0);
+        case XF_TYPE_ARR:
+            return xf_val_ok_num(v.data.arr ? (double)v.data.arr->len : 0.0);
+        case XF_TYPE_TUPLE:
+            return xf_val_ok_num(v.data.tuple ? (double)xf_tuple_len(v.data.tuple) : 0.0);
         case XF_TYPE_MAP:
-        case XF_TYPE_SET:   return xf_val_ok_num(v.data.map   ? (double)v.data.map->order_len  : 0.0);
-        case XF_TYPE_NUM:   return xf_val_ok_num((double)sizeof(double));
-        default:            return xf_val_nav(XF_TYPE_NUM);
+        case XF_TYPE_SET:
+            return xf_val_ok_num(v.data.map ? (double)v.data.map->order_len : 0.0);
+        case XF_TYPE_NUM:
+            return xf_val_ok_num((double)sizeof(double));
+        default:
+            return xf_val_nav(XF_TYPE_NUM);
     }
 }
 xf_module_t *build_generics(void) {
