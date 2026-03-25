@@ -542,7 +542,7 @@ if (t->kind == TK_LPAREN) {
     if (t->kind == TK_KW_UNDEF)  { advance(p); return ast_state_lit(XF_STATE_UNDEF, loc); }
     if (t->kind == TK_KW_TRUE)   { advance(p); return ast_state_lit(XF_STATE_TRUE,  loc); }
     if (t->kind == TK_KW_FALSE)  { advance(p); return ast_state_lit(XF_STATE_FALSE, loc); }
-
+    if (t->kind == TK_KW_UNDET)  { advance(p); return ast_state_lit(XF_STATE_UNDET, loc); }
     parser_error(p, "expected expression");
     advance(p);
     return ast_num(0, loc);

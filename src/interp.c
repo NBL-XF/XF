@@ -736,7 +736,7 @@ void interp_error(Interp *it, Loc loc, const char *fmt, ...) {
     vsnprintf(msg, sizeof(msg), fmt ? fmt : "<error>", ap);
     va_end(ap);
 
-    fprintf(stderr, "ERR ──────────────────────────────────────\n");
+    fprintf(stderr, "ERR ──────CRAPPLES!!──────────────────────\n");
     fprintf(stderr, "  %s\n", msg);
     fprintf(stderr, "  --> %s:%u:%u\n", src, loc.line, loc.col);
     fprintf(stderr, "──────────────────────────────────────────\n");
@@ -1146,7 +1146,7 @@ static xf_Value lvalue_load(Interp *it, Expr *target) {
     if (target->kind == EXPR_IDENT) {
         Symbol *s = sym_lookup_str(it->syms, target->as.ident.name);
         if (!s) {
-            interp_error(it, target->loc, "undefined variable '%s'",
+            interp_error(it, target->loc, "undetermined variable '%s'",
                          ((target->as.ident.name && target->as.ident.name->data) ? target->as.ident.name->data : "<null-ident>"));
             return xf_val_nav(XF_TYPE_VOID);
         }
@@ -1711,16 +1711,14 @@ case EXPR_SET_LIT: {
     out.type = XF_TYPE_SET;
     return out;
 }
-    case EXPR_IDENT: {
-        Symbol *s = sym_lookup_str(it->syms, e->as.ident.name);
-        if (!s) {
-            interp_error(it, e->loc, "undefined variable '%s'",
-                         ((e->as.ident.name && e->as.ident.name->data) ? e->as.ident.name->data : "<null-ident>"));
-            return xf_val_nav(XF_TYPE_VOID);
-        }
-        return xf_value_retain(s->value);
+case EXPR_IDENT: {
+    Symbol *s = sym_lookup_str(it->syms, e->as.ident.name);
+    if (!s) {
+        /* variable does not exist → UNDET */
+        return xf_val_undet(XF_TYPE_BOOL);
     }
-
+    return xf_value_retain(s->value);
+}
     case EXPR_FIELD: {
         int n = e->as.field.index;
         RecordCtx *_rc = IT_REC(it);

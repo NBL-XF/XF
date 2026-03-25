@@ -52,6 +52,7 @@ typedef enum {
     TK_KW_NULL,       /* NULL                                   */
     TK_KW_VOID_S,     /* VOID  (state, distinct from void type) */
     TK_KW_UNDEF,      /* UNDEF                                  */
+    TK_KW_UNDET,
     TK_KW_TRUE,       /* TRUE                                   */
     TK_KW_FALSE,      /* FALSE                                  */
 

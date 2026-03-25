@@ -27,16 +27,16 @@
  * States
  * ------------------------------------------------------------ */
 
-#define XF_STATE_OK            0   /* value is valid and usable           */
-#define XF_STATE_ERR           1   /* value carries a fault               */
-#define XF_STATE_VOID          2   /* no return expected, value leaked     */
-#define XF_STATE_NULL          3   /* no return expected, none given       */
-#define XF_STATE_NAV           4   /* return expected, nothing returned    */
-#define XF_STATE_UNDEF         5   /* declared but not yet assigned        */
-#define XF_STATE_TRUE          6   /* boolean true  (terminal)            */
-#define XF_STATE_FALSE         7   /* boolean false (terminal)            */
-
-#define XF_STATE_COUNT         8
+#define XF_STATE_OK     0
+#define XF_STATE_ERR    1
+#define XF_STATE_VOID   2
+#define XF_STATE_NULL   3
+#define XF_STATE_NAV    4
+#define XF_STATE_UNDEF  5
+#define XF_STATE_UNDET  6
+#define XF_STATE_TRUE   7
+#define XF_STATE_FALSE  8
+#define XF_STATE_COUNT  9
 
 /* is state terminal (no further collapse possible) */
 #define XF_STATE_IS_TERMINAL(s) \
@@ -46,23 +46,24 @@
      (s) == XF_STATE_NULL  || \
      (s) == XF_STATE_NAV   || \
      (s) == XF_STATE_TRUE  || \
-     (s) == XF_STATE_FALSE)
+     (s) == XF_STATE_FALSE || \
+     (s) == XF_STATE_UNDET)
 
 /* is state an error condition */
 #define XF_STATE_IS_ERROR(s) \
     ((s) == XF_STATE_ERR || (s) == XF_STATE_NAV)
 
-/* is state a boolean */
 #define XF_STATE_IS_BOOL(s) \
-    ((s) == XF_STATE_TRUE || (s) == XF_STATE_FALSE)
-
+    ((s) == XF_STATE_TRUE || \
+     (s) == XF_STATE_FALSE || \
+     (s) == XF_STATE_UNDET)
 /* is state unresolved */
 #define XF_STATE_IS_PENDING(s) \
-    ((s) == XF_STATE_UNDEF)
+    ((s) == XF_STATE_UNDET)
 
 /* human-readable state names */
 static const char *const XF_STATE_NAMES[XF_STATE_COUNT] = {
-    "OK", "ERR", "VOID", "NULL", "NAV", "UNDEF", "TRUE", "FALSE"
+    "OK", "ERR", "VOID", "NULL", "NAV", "UNDEF", "UNDET","TRUE", "FALSE"
 };
 
 
@@ -248,7 +249,7 @@ struct xf_value {
         xf_regex_t  *re;
         xf_module_t *mod;
         xf_complex_t complex;
-        
+
     } data;
 
     xf_err_t *err;    /* non-NULL only when state == XF_STATE_ERR */
@@ -344,11 +345,11 @@ xf_value_t xf_val_undef(uint8_t type);
 xf_value_t xf_val_true(void);
 xf_value_t xf_val_false(void);
 xf_value_t xf_val_ok_bool(bool b);
-
+xf_value_t xf_val_undet(uint8_t type);
 /* convenience */
 #define XF_NULL  (xf_val_null())
 #define XF_UNDEF (xf_val_undef(XF_TYPE_VOID))
-
+#define XF_UNDET (xf_val_undet(XF_TYPE_BOOL))
 /* ── ownership helpers ───────────────────────────────────────
  * xf_value_retain  — retain underlying heap object, returns v
  * xf_value_release — release underlying heap object

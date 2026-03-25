@@ -5,11 +5,13 @@
 #include <string.h>
 #include <assert.h>
 #include <regex.h>
-struct xf_tuple {
+
+typedef struct xf_tuple {
     _Atomic uint32_t refcount;
     size_t len;
     xf_Value *items;
-};
+} xf_tuple_impl_t;
+
 /* ============================================================
  * String implementation
  * ============================================================ */
@@ -60,7 +62,6 @@ int xf_str_cmp(const xf_str_t *a, const xf_str_t *b) {
     return (int)(a->len - b->len);
 }
 
-
 /* ============================================================
  * Error implementation
  * ============================================================ */
@@ -105,7 +106,6 @@ xf_err_t *xf_err_chain(xf_err_t *parent, xf_err_t *cause,
                        xf_value_t **siblings, size_t sibling_count) {
     if (!parent) return cause;
 
-    /* replace existing cause safely */
     if (parent->cause) {
         xf_err_release(parent->cause);
         parent->cause = NULL;
@@ -113,7 +113,6 @@ xf_err_t *xf_err_chain(xf_err_t *parent, xf_err_t *cause,
 
     parent->cause = xf_err_retain(cause);
 
-    /* replace existing sibling pointer list safely */
     free(parent->siblings);
     parent->siblings = NULL;
     parent->sibling_count = 0;
@@ -129,9 +128,6 @@ xf_err_t *xf_err_chain(xf_err_t *parent, xf_err_t *cause,
 
     return parent;
 }
-
-
-
 
 /* ============================================================
  * Value constructors
@@ -164,11 +160,14 @@ xf_value_t xf_val_ok_set(xf_set_t *s) {
         .data  = { .set = (xf_set_t *)xf_map_retain((xf_map_t *)s) }
     };
 }
+
 size_t xf_tuple_len(const xf_tuple_t *t) {
-    return t ? t->len : 0;
+    const xf_tuple_impl_t *tt = (const xf_tuple_impl_t *)t;
+    return tt ? tt->len : 0;
 }
+
 xf_tuple_t *xf_tuple_new(xf_Value *items, size_t len) {
-    xf_tuple_t *t = calloc(1, sizeof(xf_tuple_t));
+    xf_tuple_impl_t *t = calloc(1, sizeof(xf_tuple_impl_t));
     if (!t) return NULL;
 
     atomic_store(&t->refcount, 1);
@@ -184,28 +183,33 @@ xf_tuple_t *xf_tuple_new(xf_Value *items, size_t len) {
         t->items[i] = items[i]; /* steals ownership from caller */
     }
 
-    return t;
+    return (xf_tuple_t *)t;
 }
+
 xf_tuple_t *xf_tuple_retain(xf_tuple_t *t) {
-    if (t) atomic_fetch_add(&t->refcount, 1);
+    xf_tuple_impl_t *tt = (xf_tuple_impl_t *)t;
+    if (tt) atomic_fetch_add(&tt->refcount, 1);
     return t;
 }
 
 void xf_tuple_release(xf_tuple_t *t) {
-    if (!t) return;
-    if (atomic_fetch_sub(&t->refcount, 1) != 1) return;
+    xf_tuple_impl_t *tt = (xf_tuple_impl_t *)t;
+    if (!tt) return;
+    if (atomic_fetch_sub(&tt->refcount, 1) != 1) return;
 
-    for (size_t i = 0; i < t->len; i++) {
-        xf_value_release(t->items[i]);
+    for (size_t i = 0; i < tt->len; i++) {
+        xf_value_release(tt->items[i]);
     }
-    free(t->items);
-    free(t);
+    free(tt->items);
+    free(tt);
 }
 
 xf_Value xf_tuple_get(const xf_tuple_t *t, size_t idx) {
-    if (!t || idx >= t->len) return xf_val_nav(XF_TYPE_VOID);
-    return t->items[idx];
+    const xf_tuple_impl_t *tt = (const xf_tuple_impl_t *)t;
+    if (!tt || idx >= tt->len) return xf_val_nav(XF_TYPE_VOID);
+    return tt->items[idx];
 }
+
 xf_Value xf_val_ok_tuple(xf_tuple_t *t) {
     return (xf_Value){
         .state = XF_STATE_OK,
@@ -213,6 +217,7 @@ xf_Value xf_val_ok_tuple(xf_tuple_t *t) {
         .data  = { .tuple = xf_tuple_retain(t) }
     };
 }
+
 xf_value_t xf_val_ok_arr(xf_arr_t *a) {
     return (xf_value_t){
         .state = XF_STATE_OK,
@@ -228,6 +233,7 @@ xf_value_t xf_val_ok_module(xf_module_t *m) {
         .data  = { .mod = xf_module_retain(m) }
     };
 }
+
 xf_value_t xf_val_ok_fn(xf_fn_t *f) {
     return (xf_value_t){
         .state = XF_STATE_OK,
@@ -235,9 +241,11 @@ xf_value_t xf_val_ok_fn(xf_fn_t *f) {
         .data  = { .fn = xf_fn_retain(f) }
     };
 }
+
 xf_value_t xf_val_native_fn(const char *name, uint8_t ret_type,
-                             xf_value_t (*fn)(xf_value_t *args, size_t argc)) {
+                            xf_value_t (*fn)(xf_value_t *args, size_t argc)) {
     xf_fn_t *f = calloc(1, sizeof(xf_fn_t));
+    if (!f) return xf_val_nav(XF_TYPE_FN);
     atomic_store(&f->refcount, 1);
     f->name        = name ? xf_str_from_cstr(name) : NULL;
     f->return_type = ret_type;
@@ -251,10 +259,10 @@ xf_fn_t *xf_fn_retain(xf_fn_t *f) {
     if (f) atomic_fetch_add(&f->refcount, 1);
     return f;
 }
+
 void xf_fn_release(xf_fn_t *f) {
     if (!f || atomic_fetch_sub(&f->refcount, 1) != 1) return;
     xf_str_release(f->name);
-    /* params and body are owned by the AST, not by the fn value */
     free(f);
 }
 
@@ -263,16 +271,17 @@ xf_regex_t *xf_regex_retain(xf_regex_t *r) {
     if (r) atomic_fetch_add(&r->refcount, 1);
     return r;
 }
+
 void xf_regex_release(xf_regex_t *r) {
     if (!r || atomic_fetch_sub(&r->refcount, 1) != 1) return;
     xf_str_release(r->pattern);
-    /* compiled is a POSIX regex_t allocated inline; regfree then free */
     if (r->compiled) {
         regfree((regex_t *)r->compiled);
         free(r->compiled);
     }
     free(r);
 }
+
 xf_Value xf_value_retain(xf_Value v) {
     if (v.state != XF_STATE_OK) return v;
     switch (v.type) {
@@ -288,6 +297,7 @@ xf_Value xf_value_retain(xf_Value v) {
     }
     return v;
 }
+
 void xf_value_release(xf_Value v) {
     if (v.state != XF_STATE_OK) return;
     switch (v.type) {
@@ -309,7 +319,6 @@ xf_value_t xf_val_ok_re(xf_regex_t *r) {
                          .data  = { .re = r } };
 }
 
-
 /* ============================================================
  * xf_arr — dynamic array of xf_value_t
  * ============================================================ */
@@ -318,9 +327,14 @@ xf_value_t xf_val_ok_re(xf_regex_t *r) {
 
 xf_arr_t *xf_arr_new(void) {
     xf_arr_t *a = calloc(1, sizeof(xf_arr_t));
+    if (!a) return NULL;
     atomic_store(&a->refcount, 1);
     a->cap   = ARR_INIT_CAP;
     a->items = calloc(a->cap, sizeof(xf_value_t));
+    if (!a->items) {
+        free(a);
+        return NULL;
+    }
     return a;
 }
 
@@ -331,27 +345,24 @@ xf_arr_t *xf_arr_retain(xf_arr_t *a) {
 
 void xf_arr_release(xf_arr_t *a) {
     if (!a) return;
-
-    uint32_t old = atomic_fetch_sub(&a->refcount, 1);
-    printf("xf_arr_release a=%p old_rc=%u new_rc=%u len=%zu\n",
-           (void *)a, old, old - 1, a->len);
-
-    if (old != 1) return;
-
-    printf("FREE ARRAY a=%p len=%zu\n", (void *)a, a->len);
+    if (atomic_fetch_sub(&a->refcount, 1) != 1) return;
 
     for (size_t i = 0; i < a->len; i++) {
-        printf("  arr=%p releasing item[%zu]\n", (void *)a, i);
         xf_value_release(a->items[i]);
     }
 
     free(a->items);
     free(a);
 }
+
 void xf_arr_push(xf_arr_t *a, xf_value_t v) {
+    if (!a) return;
     if (a->len >= a->cap) {
-        a->cap   = a->cap ? a->cap * 2 : ARR_INIT_CAP;
-        a->items = realloc(a->items, a->cap * sizeof(xf_value_t));
+        size_t new_cap = a->cap ? a->cap * 2 : ARR_INIT_CAP;
+        xf_value_t *tmp = realloc(a->items, new_cap * sizeof(xf_value_t));
+        if (!tmp) return;
+        a->items = tmp;
+        a->cap   = new_cap;
     }
     a->items[a->len++] = v;
 }
@@ -366,13 +377,15 @@ void xf_arr_set(xf_arr_t *a, size_t idx, xf_value_t v) {
     if (idx >= a->cap) {
         size_t new_cap = a->cap ? a->cap : ARR_INIT_CAP;
         while (new_cap <= idx) new_cap *= 2;
-        a->items = realloc(a->items, new_cap * sizeof(xf_value_t));
+        xf_value_t *tmp = realloc(a->items, new_cap * sizeof(xf_value_t));
+        if (!tmp) return;
+        a->items = tmp;
         for (size_t i = a->cap; i < new_cap; i++)
             a->items[i] = xf_val_nav(XF_TYPE_VOID);
         a->cap = new_cap;
     }
-    if (idx < a->len) xf_value_release(a->items[idx]);  /* release old */
-    a->items[idx] = v;   /* steal new */
+    if (idx < a->len) xf_value_release(a->items[idx]);
+    a->items[idx] = v;
     if (idx >= a->len) a->len = idx + 1;
 }
 
@@ -384,8 +397,11 @@ xf_value_t xf_arr_pop(xf_arr_t *a) {
 void xf_arr_unshift(xf_arr_t *a, xf_value_t v) {
     if (!a) return;
     if (a->len >= a->cap) {
-        a->cap = a->cap ? a->cap * 2 : ARR_INIT_CAP;
-        a->items = realloc(a->items, a->cap * sizeof(xf_value_t));
+        size_t new_cap = a->cap ? a->cap * 2 : ARR_INIT_CAP;
+        xf_value_t *tmp = realloc(a->items, new_cap * sizeof(xf_value_t));
+        if (!tmp) return;
+        a->items = tmp;
+        a->cap   = new_cap;
     }
     memmove(a->items + 1, a->items, a->len * sizeof(xf_value_t));
     a->items[0] = v;
@@ -402,18 +418,19 @@ xf_value_t xf_arr_shift(xf_arr_t *a) {
 
 void xf_arr_delete(xf_arr_t *a, size_t idx) {
     if (!a || idx >= a->len) return;
-    xf_value_release(a->items[idx]);  /* release item being removed */
-    memmove(a->items + idx, a->items + idx + 1, (a->len - idx - 1) * sizeof(xf_value_t));
+    xf_value_release(a->items[idx]);
+    memmove(a->items + idx, a->items + idx + 1,
+            (a->len - idx - 1) * sizeof(xf_value_t));
     a->len--;
 }
-
 
 /* ============================================================
  * xf_map — open-addressing hash map  xf_str_t* → xf_value_t
  * ============================================================ */
 
 #define MAP_INIT_CAP  16
-#define MAP_LOAD_MAX  0.7   /* rehash when load > 70% */
+#define MAP_LOAD_MAX  0.7
+
 xf_Value xf_val_ok_complex(double re, double im) {
     xf_Value v;
     memset(&v, 0, sizeof(v));
@@ -423,14 +440,15 @@ xf_Value xf_val_ok_complex(double re, double im) {
     v.data.complex.im = im;
     return v;
 }
+
 static size_t map_find_slot(const xf_map_t *m, const xf_str_t *key) {
     uint32_t h    = xf_str_hash((xf_str_t *)key);
     size_t   mask = m->cap - 1;
     size_t   idx  = h & mask;
     for (;;) {
         xf_map_slot_t *sl = &m->slots[idx];
-        if (!sl->key) return idx;               /* empty → insert here */
-        if (xf_str_cmp(sl->key, key) == 0) return idx;  /* found */
+        if (!sl->key) return idx;
+        if (xf_str_cmp(sl->key, key) == 0) return idx;
         idx = (idx + 1) & mask;
     }
 }
@@ -438,25 +456,37 @@ static size_t map_find_slot(const xf_map_t *m, const xf_str_t *key) {
 static void map_rehash(xf_map_t *m) {
     size_t new_cap = m->cap * 2;
     xf_map_slot_t *old = m->slots;
-    size_t         old_cap = m->cap;
+    size_t old_cap = m->cap;
+
     m->slots = calloc(new_cap, sizeof(xf_map_slot_t));
-    m->cap   = new_cap;
-    m->used  = 0;
+    if (!m->slots) {
+        m->slots = old;
+        return;
+    }
+
+    m->cap  = new_cap;
+    m->used = 0;
+
     for (size_t i = 0; i < old_cap; i++) {
         if (!old[i].key) continue;
         size_t idx = map_find_slot(m, old[i].key);
         m->slots[idx] = old[i];
         m->used++;
     }
+
     free(old);
-    /* order array holds borrowed refs into slots — slots still live, order survives */
 }
 
 xf_map_t *xf_map_new(void) {
     xf_map_t *m = calloc(1, sizeof(xf_map_t));
+    if (!m) return NULL;
     atomic_store(&m->refcount, 1);
     m->cap   = MAP_INIT_CAP;
     m->slots = calloc(m->cap, sizeof(xf_map_slot_t));
+    if (!m->slots) {
+        free(m);
+        return NULL;
+    }
     return m;
 }
 
@@ -470,7 +500,7 @@ void xf_map_release(xf_map_t *m) {
     for (size_t i = 0; i < m->cap; i++) {
         if (m->slots[i].key) {
             xf_str_release(m->slots[i].key);
-            xf_value_release(m->slots[i].val);  /* release val */
+            xf_value_release(m->slots[i].val);
         }
     }
     free(m->slots);
@@ -486,6 +516,7 @@ xf_value_t xf_map_get(const xf_map_t *m, const xf_str_t *key) {
 
     return xf_value_retain(m->slots[idx].val);
 }
+
 void xf_map_set(xf_map_t *m, xf_str_t *key, xf_value_t val) {
     if (!m || !key) return;
 
@@ -519,22 +550,25 @@ void xf_map_set(xf_map_t *m, xf_str_t *key, xf_value_t val) {
 
     m->slots[idx].val = xf_value_retain(val);
 }
+
 bool xf_map_delete(xf_map_t *m, const xf_str_t *key) {
     if (!m || !key) return false;
     size_t mask = m->cap - 1;
     uint32_t h  = xf_str_hash((xf_str_t *)key);
     size_t idx  = h & mask;
+
     for (;;) {
         if (!m->slots[idx].key) return false;
         if (xf_str_cmp(m->slots[idx].key, key) == 0) break;
         idx = (idx + 1) & mask;
     }
+
     xf_str_t *dead_key = m->slots[idx].key;
-    xf_value_release(m->slots[idx].val);  /* release val before clearing slot */
+    xf_value_release(m->slots[idx].val);
     m->slots[idx].key = NULL;
-    m->slots[idx].val = xf_val_nav(XF_TYPE_VOID);  /* clear val */
+    m->slots[idx].val = xf_val_nav(XF_TYPE_VOID);
     m->used--;
-    /* Robin Hood backshift */
+
     size_t j = (idx + 1) & mask;
     while (m->slots[j].key) {
         size_t natural = xf_str_hash(m->slots[j].key) & mask;
@@ -545,7 +579,7 @@ bool xf_map_delete(xf_map_t *m, const xf_str_t *key) {
         }
         j = (j + 1) & mask;
     }
-    /* remove from insertion-order list */
+
     for (size_t i = 0; i < m->order_len; i++) {
         if (m->order[i] == dead_key) {
             memmove(m->order + i, m->order + i + 1,
@@ -554,11 +588,14 @@ bool xf_map_delete(xf_map_t *m, const xf_str_t *key) {
             break;
         }
     }
+
     xf_str_release(dead_key);
     return true;
 }
 
-size_t xf_map_count(const xf_map_t *m) { return m ? m->used : 0; }
+size_t xf_map_count(const xf_map_t *m) {
+    return m ? m->used : 0;
+}
 
 xf_value_t xf_val_err(xf_err_t *e, uint8_t type) {
     return (xf_value_t){ .state = XF_STATE_ERR,
@@ -577,10 +614,14 @@ xf_value_t xf_val_null(void) {
 }
 
 xf_value_t xf_val_void(xf_value_t inner) {
-    /* wrap an unexpected return as VOID — preserves type */
-    xf_value_t v  = inner;
-    v.state        = XF_STATE_VOID;
+    xf_value_t v = inner;
+    v.state = XF_STATE_VOID;
     return v;
+}
+
+xf_value_t xf_val_undet(uint8_t type) {
+    (void)type;
+    return (xf_value_t){ .state = XF_STATE_UNDET, .type = XF_TYPE_BOOL };
 }
 
 xf_value_t xf_val_undef(uint8_t type) {
@@ -598,8 +639,6 @@ xf_value_t xf_val_false(void) {
 xf_value_t xf_val_ok_bool(bool b) {
     return b ? xf_val_true() : xf_val_false();
 }
-
-
 
 /* ============================================================
  * Atomic collapse
@@ -630,25 +669,34 @@ xf_value_t xf_snapshot(const xf_atomic_value_t *av) {
     return v;
 }
 
-
 /* ============================================================
  * Type coercion
  * ============================================================ */
 
+static bool xf_state_is_boolish(uint8_t state) {
+    return state == XF_STATE_TRUE ||
+           state == XF_STATE_FALSE ||
+           state == XF_STATE_UNDET;
+}
+
 xf_value_t xf_coerce_num(xf_value_t v) {
     if (v.state == XF_STATE_TRUE)  return xf_val_ok_num(1.0);
     if (v.state == XF_STATE_FALSE) return xf_val_ok_num(0.0);
+    if (v.state == XF_STATE_UNDET) return xf_val_ok_num(0.5);
+
     if (v.state != XF_STATE_OK) return v;
     if (v.type == XF_TYPE_NUM)  return v;
-    if (v.type == XF_TYPE_BOOL) return xf_val_ok_num(v.data.num != 0.0 ? 1.0 : 0.0);
+
     if (v.type == XF_TYPE_STR) {
         char *end;
         double n = strtod(v.data.str->data, &end);
         if (end != v.data.str->data && *end == '\0')
             return xf_val_ok_num(n);
     }
+
     return xf_val_nav(XF_TYPE_NUM);
 }
+
 xf_value_t xf_coerce_str(xf_value_t v) {
     if (v.state == XF_STATE_TRUE) {
         xf_str_t *s = xf_str_from_cstr("true");
@@ -662,19 +710,20 @@ xf_value_t xf_coerce_str(xf_value_t v) {
         xf_str_release(s);
         return out;
     }
-    if (v.state != XF_STATE_OK) return v;
-
-    if (v.type == XF_TYPE_STR)
-        return xf_value_retain(v);
-
-    if (v.type == XF_TYPE_BOOL) {
-        xf_str_t *s = xf_str_from_cstr(v.data.num != 0.0 ? "true" : "false");
+    if (v.state == XF_STATE_UNDET) {
+        xf_str_t *s = xf_str_from_cstr("undet");
         xf_value_t out = xf_val_ok_str(s);
         xf_str_release(s);
         return out;
     }
 
-    char buf[64];
+    if (v.state != XF_STATE_OK) return v;
+
+    if (v.type == XF_TYPE_STR)
+        return xf_value_retain(v);
+
+    char buf[96];
+
     if (v.type == XF_TYPE_NUM) {
         if (v.data.num == (long long)v.data.num)
             snprintf(buf, sizeof(buf), "%lld", (long long)v.data.num);
@@ -686,26 +735,27 @@ xf_value_t xf_coerce_str(xf_value_t v) {
         xf_str_release(s);
         return out;
     }
-if (v.type == XF_TYPE_COMPLEX) {
-    char buf[96];
-    double re = v.data.complex.re;
-    double im = v.data.complex.im;
 
-    if (re == 0.0) {
-        snprintf(buf, sizeof(buf), "%.14gi", im);
-    } else if (im < 0.0) {
-        snprintf(buf, sizeof(buf), "%.14g%.14gi", re, im);
-    } else {
-        snprintf(buf, sizeof(buf), "%.14g+%.14gi", re, im);
+    if (v.type == XF_TYPE_COMPLEX) {
+        double re = v.data.complex.re;
+        double im = v.data.complex.im;
+
+        if (re == 0.0) {
+            snprintf(buf, sizeof(buf), "%.14gi", im);
+        } else if (im < 0.0) {
+            snprintf(buf, sizeof(buf), "%.14g%.14gi", re, im);
+        } else {
+            snprintf(buf, sizeof(buf), "%.14g+%.14gi", re, im);
+        }
+
+        xf_str_t *s = xf_str_from_cstr(buf);
+        xf_value_t out = xf_val_ok_str(s);
+        xf_str_release(s);
+        return out;
     }
 
-    xf_str_t *s = xf_str_from_cstr(buf);
-    xf_value_t out = xf_val_ok_str(s);
-    xf_str_release(s);
-    return out;
-}
     if (v.type == XF_TYPE_TUPLE) {
-        xf_tuple_t *t = v.data.tuple;
+        const xf_tuple_impl_t *t = (const xf_tuple_impl_t *)v.data.tuple;
         size_t cap = 64;
         size_t len = 0;
         char *outbuf = malloc(cap);
@@ -731,7 +781,7 @@ if (v.type == XF_TYPE_COMPLEX) {
                     len += slen;
                 }
 
-                xf_value_t elem = xf_tuple_get(t, i);
+                xf_value_t elem = xf_tuple_get(v.data.tuple, i);
                 xf_value_t sv = xf_coerce_str(elem);
                 const char *s = (sv.state == XF_STATE_OK && sv.data.str)
                               ? sv.data.str->data
@@ -785,43 +835,45 @@ if (v.type == XF_TYPE_COMPLEX) {
     xf_str_release(s);
     return out;
 }
+
 bool xf_can_coerce(xf_value_t v, uint8_t target_type) {
-    if (v.type == target_type)  return true;
-    if (target_type == XF_TYPE_STR) return true; /* everything stringifies */
+    if (v.type == target_type) return true;
+    if (target_type == XF_TYPE_STR) return true;
     if (target_type == XF_TYPE_NUM && v.type == XF_TYPE_STR) {
         char *end;
         strtod(v.data.str->data, &end);
         return end != v.data.str->data && *end == '\0';
     }
+    if (target_type == XF_TYPE_NUM && xf_state_is_boolish(v.state)) return true;
+    if (target_type == XF_TYPE_BOOL && xf_state_is_boolish(v.state)) return true;
     return false;
 }
-
 
 /* ============================================================
  * State propagation
  * ============================================================ */
 
 uint8_t xf_dominant_state(xf_value_t a, xf_value_t b) {
-    /* ERR > NAV > UNDEF > VOID > NULL > TRUE > FALSE > OK */
     static const uint8_t priority[XF_STATE_COUNT] = {
         [XF_STATE_OK]    = 0,
         [XF_STATE_FALSE] = 1,
-        [XF_STATE_TRUE]  = 2,
-        [XF_STATE_NULL]  = 3,
-        [XF_STATE_VOID]  = 4,
-        [XF_STATE_UNDEF] = 5,
-        [XF_STATE_NAV]   = 6,
-        [XF_STATE_ERR]   = 7,
+        [XF_STATE_TRUE]  = 1,
+        [XF_STATE_UNDET] = 1,
+        [XF_STATE_NULL]  = 2,
+        [XF_STATE_VOID]  = 3,
+        [XF_STATE_UNDEF] = 4,
+        [XF_STATE_NAV]   = 5,
+        [XF_STATE_ERR]   = 6,
     };
+
     return priority[a.state] >= priority[b.state] ? a.state : b.state;
 }
 
 xf_value_t xf_collect_err(xf_value_t *children, size_t n,
-                           const char *src, uint32_t line) {
-    /* build a single ERR value from n children, at least one of which is ERR */
+                          const char *src, uint32_t line) {
     xf_err_t *root = xf_err_new("child error", src, line, 0);
+    if (!root) return xf_val_nav(XF_TYPE_VOID);
 
-    /* find first ERR child as cause */
     for (size_t i = 0; i < n; i++) {
         if (children[i].state == XF_STATE_ERR) {
             root->cause = xf_err_retain(children[i].err);
@@ -829,7 +881,6 @@ xf_value_t xf_collect_err(xf_value_t *children, size_t n,
         }
     }
 
-    /* attach all siblings */
     root->sibling_count = n;
     root->siblings = malloc(sizeof(xf_value_t *) * n);
     if (root->siblings) {
@@ -839,36 +890,34 @@ xf_value_t xf_collect_err(xf_value_t *children, size_t n,
                 *root->siblings[i] = children[i];
         }
     }
+
     return xf_val_err(root, XF_TYPE_VOID);
 }
-
 
 /* ============================================================
  * Display
  * ============================================================ */
 
 static void print_value_data(xf_value_t v) {
-    /* boolean states print directly without needing data union */
     if (v.state == XF_STATE_TRUE)  { printf("true");  return; }
     if (v.state == XF_STATE_FALSE) { printf("false"); return; }
+    if (v.state == XF_STATE_UNDET) { printf("undet"); return; }
     if (v.state != XF_STATE_OK && v.state != XF_STATE_VOID) return;
-    switch (v.type) {
-    case XF_TYPE_COMPLEX: {
-    double re = v.data.complex.re;
-    double im = v.data.complex.im;
 
-    if (re == 0.0) {
-        printf("%.15gi", im);
-    } else if (im < 0.0) {
-        printf("%.15g%.15gi", re, im);
-    } else {
-        printf("%.15g+%.15gi", re, im);
-    }
-    break;
-}
-        case XF_TYPE_BOOL:
-            printf(v.data.num != 0.0 ? "true" : "false");
+    switch (v.type) {
+        case XF_TYPE_COMPLEX: {
+            double re = v.data.complex.re;
+            double im = v.data.complex.im;
+
+            if (re == 0.0) {
+                printf("%.15gi", im);
+            } else if (im < 0.0) {
+                printf("%.15g%.15gi", re, im);
+            } else {
+                printf("%.15g+%.15gi", re, im);
+            }
             break;
+        }
         case XF_TYPE_NUM:
             if (v.data.num == (long long)v.data.num)
                 printf("%lld", (long long)v.data.num);
@@ -882,7 +931,7 @@ static void print_value_data(xf_value_t v) {
             if (v.data.fn && v.data.fn->name)
                 printf("<fn %s(%s)->%s>",
                        v.data.fn->name->data,
-                       "",  /* param list — todo */
+                       "",
                        XF_TYPE_NAMES[v.data.fn->return_type]);
             else
                 printf("<fn>");
@@ -901,14 +950,11 @@ static void print_value_data(xf_value_t v) {
                     if (i) printf(", ");
                     xf_str_t *k = m->order[i];
                     size_t slot = map_find_slot(m, k);
-                    /* Print key: bare if it's a pure integer, quoted otherwise */
-                    {
-                        char *end;
-                        strtod(k->data, &end);
-                        bool is_num = (end != k->data && *end == '\0');
-                        if (is_num) printf("%s: ", k->data);
-                        else        printf("\"%s\": ", k->data);
-                    }
+                    char *end;
+                    strtod(k->data, &end);
+                    bool is_num = (end != k->data && *end == '\0');
+                    if (is_num) printf("%s: ", k->data);
+                    else        printf("\"%s\": ", k->data);
                     print_value_data(m->slots[slot].val);
                 }
             }
@@ -949,26 +995,27 @@ static void print_value_data(xf_value_t v) {
             break;
         }
         case XF_TYPE_TUPLE: {
-    xf_tuple_t *t = v.data.tuple;
-    printf("(");
-    if (t) {
-        size_t n = xf_tuple_len(t);
-        for (size_t i = 0; i < n; i++) {
-            if (i > 0) printf(", ");
-            print_value_data(xf_tuple_get(t, i));
+            const xf_tuple_impl_t *t = (const xf_tuple_impl_t *)v.data.tuple;
+            printf("(");
+            if (t) {
+                for (size_t i = 0; i < t->len; i++) {
+                    if (i > 0) printf(", ");
+                    print_value_data(xf_tuple_get(v.data.tuple, i));
+                }
+                if (t->len == 1) printf(",");
+            }
+            printf(")");
+            break;
         }
-        if (n == 1) printf(",");
-    }
-    printf(")");
-    break;
-}
         case XF_TYPE_MODULE:
             if (v.data.mod && v.data.mod->name)
                 printf("<module %s>", v.data.mod->name);
             else
                 printf("<module>");
             break;
-        default:            printf("<void>");  break;
+        default:
+            printf("<void>");
+            break;
     }
 }
 
@@ -977,10 +1024,9 @@ void xf_value_print(xf_value_t v) {
 }
 
 void xf_value_repl_print(xf_value_t v) {
-    /* "=> true  [bool, TRUE]" */
     printf("=> ");
     print_value_data(v);
-    uint8_t type = (XF_STATE_IS_BOOL(v.state)) ? XF_TYPE_BOOL : v.type;
+    uint8_t type = xf_state_is_boolish(v.state) ? XF_TYPE_BOOL : v.type;
     printf("  [%s, %s]\r\n",
            XF_TYPE_NAMES[type < XF_TYPE_COUNT ? type : 0],
            XF_STATE_NAMES[v.state < XF_STATE_COUNT ? v.state : 0]);
@@ -1007,8 +1053,8 @@ void xf_err_print(xf_err_t *e) {
             printf("    [%zu] ", i);
             print_value_data(*c);
             printf("  [%s, %s]\n",
-                   XF_TYPE_NAMES[c->type],
-                   XF_STATE_NAMES[c->state]);
+                   XF_TYPE_NAMES[c->type < XF_TYPE_COUNT ? c->type : 0],
+                   XF_STATE_NAMES[c->state < XF_STATE_COUNT ? c->state : 0]);
         }
     }
     printf("──────────────────────────────────────────────\r\n");
@@ -1022,10 +1068,15 @@ void xf_err_print(xf_err_t *e) {
 
 xf_module_t *xf_module_new(const char *name) {
     xf_module_t *m = calloc(1, sizeof(xf_module_t));
+    if (!m) return NULL;
     atomic_store(&m->refcount, 1);
-    m->name    = name;   /* static string — not owned */
+    m->name    = name;
     m->cap     = MODULE_INIT_CAP;
     m->entries = calloc(m->cap, sizeof(xf_module_entry_t));
+    if (!m->entries) {
+        free(m);
+        return NULL;
+    }
     return m;
 }
 
@@ -1044,6 +1095,7 @@ void xf_module_release(xf_module_t *m) {
 }
 
 void xf_module_set(xf_module_t *m, const char *name, xf_value_t val) {
+    if (!m || !name) return;
     for (size_t i = 0; i < m->count; i++) {
         if (strcmp(m->entries[i].name, name) == 0) {
             xf_value_release(m->entries[i].val);
@@ -1053,14 +1105,18 @@ void xf_module_set(xf_module_t *m, const char *name, xf_value_t val) {
     }
 
     if (m->count >= m->cap) {
-        m->cap *= 2;
-        m->entries = realloc(m->entries, m->cap * sizeof(xf_module_entry_t));
+        size_t new_cap = m->cap * 2;
+        xf_module_entry_t *tmp = realloc(m->entries, new_cap * sizeof(xf_module_entry_t));
+        if (!tmp) return;
+        m->entries = tmp;
+        m->cap = new_cap;
     }
 
     m->entries[m->count].name = name;
     m->entries[m->count].val  = val;
     m->count++;
 }
+
 xf_value_t xf_module_get(const xf_module_t *m, const char *name) {
     if (!m) return xf_val_nav(XF_TYPE_VOID);
     for (size_t i = 0; i < m->count; i++) {

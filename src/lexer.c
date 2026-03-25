@@ -16,7 +16,7 @@
  * lookup instead of the naive O(n) linear scan.
  * ============================================================ */
 
-static const Keyword keywords[] = {
+ static const Keyword keywords[] = {
     { "BEGIN",   TK_KW_BEGIN  },
     { "END",     TK_KW_END    },
     { "ERR",     TK_KW_ERR    },
@@ -34,6 +34,7 @@ static const Keyword keywords[] = {
     { "RS",      TK_VAR_RS    },
     { "TRUE",    TK_KW_TRUE   },
     { "UNDEF",   TK_KW_UNDEF  },
+    { "UNDET",   TK_KW_UNDET  },
     { "VOID",    TK_KW_VOID_S },
     { "arr",     TK_KW_ARR    },
     { "bool",    TK_KW_BOOL   },
@@ -61,9 +62,11 @@ static const Keyword keywords[] = {
     { "str",     TK_KW_STR    },
     { "true",    TK_KW_TRUE   },
     { "tuple",   TK_KW_TUPLE  },
+    { "undet",   TK_KW_UNDET  },
     { "void",    TK_KW_VOID   },
     { "while",   TK_KW_WHILE  },
-};
+}; 
+ 
 #define KEYWORD_COUNT (sizeof(keywords) / sizeof(keywords[0]))
 
 static const Keyword implicit_vars[] = {
@@ -440,7 +443,7 @@ static Token scan_ident(Lexer *l, size_t start, Loc loc) {
     l->after_value = (kind == TK_IDENT     || kind == TK_KW_OK  ||
                       kind == TK_KW_ERR    || kind == TK_KW_NAV ||
                       kind == TK_KW_NULL   || kind == TK_KW_VOID_S ||
-                      kind == TK_KW_UNDEF);
+                      kind == TK_KW_UNDEF  || kind == TK_KW_UNDET);
     return t;
 }
 
@@ -687,6 +690,7 @@ const char *xf_token_kind_name(TokenKind kind) {
         case TK_KW_SET:       return "kw:set";
         case TK_KW_ARR:       return "kw:arr";
         case TK_KW_FN:        return "kw:fn";
+        case TK_KW_UNDET:     return "kw:UNDET";
         case TK_KW_VOID:      return "kw:void";
         case TK_KW_OK:        return "kw:OK";
         case TK_KW_ERR:       return "kw:ERR";
