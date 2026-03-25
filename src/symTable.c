@@ -20,17 +20,36 @@ static Scope *scope_new(ScopeKind kind, Scope *parent, uint8_t fn_ret) {
 
 void scope_free(Scope *sc) {
     if (!sc) return;
+
+    fprintf(stderr,
+            "scope_free sc=%p entries=%p cap=%zu count=%zu kind=%d parent=%p\n",
+            (void *)sc, (void *)sc->entries, sc->capacity, sc->count,
+            (int)sc->kind, (void *)sc->parent);
+
     for (size_t i = 0; i < sc->capacity; i++) {
-        if (sc->entries[i].name) {
-            xf_str_release(sc->entries[i].name);
-            xf_value_release(sc->entries[i].value);  /* drop owned ref */
-        }
+        if (!sc->entries[i].name) continue;
+
+        fprintf(stderr,
+                "  free sym[%zu] name=%p value_type=%u value_state=%u\n",
+                i,
+                (void *)sc->entries[i].name,
+                sc->entries[i].value.type,
+                sc->entries[i].value.state);
+
+        fprintf(stderr, "    -> releasing name\n");
+        xf_str_release(sc->entries[i].name);
+        fprintf(stderr, "    <- released name\n");
+
+        fprintf(stderr, "    -> releasing value\n");
+        xf_value_release(sc->entries[i].value);
+        fprintf(stderr, "    <- released value\n");
     }
+
+    fprintf(stderr, "  -> free entries\n");
     free(sc->entries);
+    fprintf(stderr, "  -> free scope\n");
     free(sc);
 }
-
-
 /* ============================================================
  * SymTable init / free
  * ============================================================ */
@@ -60,24 +79,28 @@ void sym_free(SymTable *st) {
  * ============================================================ */
 
 Scope *sym_push(SymTable *st, ScopeKind kind) {
-    uint8_t fn_ret = kind == SCOPE_FN
-                         ? XF_TYPE_VOID        /* caller sets fn_ret_type */
-                         : st->current->fn_ret_type;
-    Scope *sc   = scope_new(kind, st->current, fn_ret);
+    uint8_t fn_ret = kind == SCOPE_FN ? XF_TYPE_VOID : st->current->fn_ret_type;
+    Scope *sc = scope_new(kind, st->current, fn_ret);
     st->current = sc;
     st->depth++;
+    fprintf(stderr, "PUSH kind=%d depth=%zu sc=%p parent=%p\n",
+            kind, st->depth, (void *)sc, (void *)sc->parent);
     return sc;
 }
 
 Scope *sym_pop(SymTable *st) {
-    if (st->current == st->global) return st->global;
+    if (st->current == st->global) {
+        fprintf(stderr, "POP at global depth=%zu current=%p global=%p\n",
+                st->depth, (void *)st->current, (void *)st->global);
+        return st->global;
+    }
     Scope *popped = st->current;
-    st->current   = popped->parent;
+    st->current = popped->parent;
     st->depth--;
+    fprintf(stderr, "POP depth=%zu popped=%p new_current=%p\n",
+            st->depth, (void *)popped, (void *)st->current);
     return popped;
 }
-
-
 /* ============================================================
  * Internal hash lookup within a single scope
  * ============================================================ */

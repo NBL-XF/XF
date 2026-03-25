@@ -1,12 +1,11 @@
-CC      ?= cc
-AR      ?= ar
-CFLAGS  ?= -O2 -Wall -Wextra -Wpedantic -std=c11
-LDFLAGS ?=
+CC      = /opt/homebrew/opt/llvm/bin/clang
+AR = /opt/homebrew/opt/llvm/bin/llvm-ar
+CFLAGS  = -O0 -g -fsanitize=address,leak,undefined -fno-omit-frame-pointer  -Wall -Wextra -Wpedantic -std=c11
+#CFLAGS  = -O0 -g -fsanitize=thread -fno-omit-frame-pointer  -Wall -Wextra -Wpedantic -std=c11
+LDFLAGS = -fsanitize=address,leak,undefined
 LDLIBS  ?= -lm -lpthread
-
 PREFIX  ?= /usr/local
 DESTDIR ?=
-
 OBJDIR  = obj
 BINDIR  = bin
 LIBDIR  = lib
@@ -51,7 +50,11 @@ CLI_OBJS     = $(patsubst %.c,$(OBJDIR)/%.o,$(CLI_SRCS))
 $(patsubst %.c,$(OBJDIR)/%.o,$(CORE_SRCS)): src/core/internal.h
 
 all: $(LIBXF) $(BIN)
-
+run:
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+	LSAN_OPTIONS=verbosity=1:report_objects=1 \
+UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+		./bin/xf -r tests/torture.xf
 $(LIBXF): $(RUNTIME_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
@@ -82,4 +85,4 @@ uninstall:
 clean:
 	rm -rf $(OBJDIR) $(BIN) $(LIBXF)
 
-.PHONY: all install uninstall clean
+.PHONY: all run install uninstall clean

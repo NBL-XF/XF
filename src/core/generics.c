@@ -239,7 +239,9 @@ static xf_Value cg_split(xf_Value *args, size_t argc) {
 
             for (size_t j = from; j < to; j++) {
                 xf_Str *key = in->order[j];
-                xf_map_set(chunk, key, xf_value_retain(xf_map_get(in, key)));
+                xf_Value tmp = xf_map_get(in, key);
+xf_map_set(chunk, key, tmp);
+xf_value_release(tmp);
             }
 
             xf_Value cv = xf_val_ok_map(chunk);
@@ -375,8 +377,7 @@ static xf_Value cg_strip(xf_Value *args, size_t argc) {
                 while (hi > lo && STRIP_CHAR(s[hi - 1])) hi--;
                 xf_map_set(out, key, make_str_val(s + lo, hi - lo));
             } else {
-                xf_map_set(out, key, xf_value_retain(val));
-            }
+xf_map_set(out, key, val);            }
         }
 
         xf_Value rv = xf_val_ok_map(out);

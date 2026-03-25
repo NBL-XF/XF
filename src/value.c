@@ -480,31 +480,45 @@ void xf_map_release(xf_map_t *m) {
 
 xf_value_t xf_map_get(const xf_map_t *m, const xf_str_t *key) {
     if (!m || !key) return xf_val_nav(XF_TYPE_VOID);
+
     size_t idx = map_find_slot(m, key);
     if (!m->slots[idx].key) return xf_val_nav(XF_TYPE_VOID);
-    return m->slots[idx].val;
-}
 
+    return xf_value_retain(m->slots[idx].val);
+}
 void xf_map_set(xf_map_t *m, xf_str_t *key, xf_value_t val) {
     if (!m || !key) return;
-    if ((double)m->used / (double)m->cap > MAP_LOAD_MAX) map_rehash(m);
+
+    if ((double)m->used / (double)m->cap > MAP_LOAD_MAX)
+        map_rehash(m);
+
     size_t idx = map_find_slot(m, key);
     bool is_new = !m->slots[idx].key;
+
     if (is_new) {
         m->slots[idx].key = xf_str_retain(key);
         m->used++;
+
         if (m->order_len == m->order_cap) {
             size_t nc = m->order_cap ? m->order_cap * 2 : 8;
-            m->order = realloc(m->order, nc * sizeof(*m->order));
+            xf_str_t **tmp = realloc(m->order, nc * sizeof(*m->order));
+            if (!tmp) {
+                xf_str_release(m->slots[idx].key);
+                m->slots[idx].key = NULL;
+                m->used--;
+                return;
+            }
+            m->order = tmp;
             m->order_cap = nc;
         }
+
         m->order[m->order_len++] = m->slots[idx].key;
     } else {
-        xf_value_release(m->slots[idx].val);  /* release old val on overwrite */
+        xf_value_release(m->slots[idx].val);
     }
-    m->slots[idx].val = val;  /* steal new val */
-}
 
+    m->slots[idx].val = xf_value_retain(val);
+}
 bool xf_map_delete(xf_map_t *m, const xf_str_t *key) {
     if (!m || !key) return false;
     size_t mask = m->cap - 1;

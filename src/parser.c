@@ -1450,9 +1450,13 @@ Program *parse(Lexer *lex, SymTable *syms) {
         if (p.had_error && p.panic_mode) synchronize(&p);
     }
 
+    fprintf(stderr, "PARSE END depth=%zu current=%p global=%p\n",
+            p.syms ? p.syms->depth : 0,
+            p.syms ? (void *)p.syms->current : NULL,
+            p.syms ? (void *)p.syms->global  : NULL);
+
     return prog;
 }
-
 TopLevel *parse_repl_line(Lexer *lex, SymTable *syms) {
     Parser p = {0};
     p.lex  = lex;

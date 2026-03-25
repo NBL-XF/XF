@@ -226,7 +226,7 @@ static void *spawn_thread_fn(void *arg) {
 
             it.returning = false;
             interp_eval_stmt(&it, (Stmt *)fn->body);
-xf_Value ret0 = it.returning ? it.return_val : xf_val_null();
+xf_Value ret0 = it.returning ? xf_value_retain(it.return_val) : xf_val_null();
 ctx->result = ret0;
 it.returning = false;
 
@@ -304,7 +304,7 @@ static xf_Value interp_exec_xf_fn(void *vm_ptr, void *syms_ptr,
     it.vm       = vm;
     it.last_err = xf_val_null();
 
-    core_set_fn_caller(vm, &syms, interp_exec_xf_fn);
+    core_set_fn_caller(vm, parent_st, interp_exec_xf_fn);
 
     /* Snapshot record context — worker sees the record at call time */
     vm_rec_snapshot(vm, &it.rec_snap);
@@ -329,7 +329,7 @@ static xf_Value interp_exec_xf_fn(void *vm_ptr, void *syms_ptr,
 
     it.returning = false;
     interp_eval_stmt(&it, (Stmt *)fn->body);
-    xf_Value result = it.returning ? it.return_val : xf_val_null();
+    xf_Value result = it.returning ? xf_value_retain(it.return_val) : xf_val_null();
 it.returning = false;
 
 scope_free(sym_pop(&syms));
@@ -889,19 +889,21 @@ static xf_Value make_bool(bool b) {
     return b ? xf_val_true() : xf_val_false();
 }
 static int val_cmp(xf_Value a, xf_Value b) {
-    /* Both non-OK: compare states directly (NULL != NAV, TRUE != FALSE).
-     * If only one is non-OK, fall through to coercion so num(1) == TRUE works. */
-    if (a.state != XF_STATE_OK && b.state != XF_STATE_OK) {
+    if (a.state != XF_STATE_OK && b.state != XF_STATE_OK)
         return (int)a.state - (int)b.state;
-    }
-    /* numeric path */
+
     xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
     if (na.state == XF_STATE_OK && nb.state == XF_STATE_OK) {
-        if (na.data.num < nb.data.num) return -1;
-        if (na.data.num > nb.data.num) return  1;
-        return 0;
+        int out = 0;
+        if (na.data.num < nb.data.num) out = -1;
+        else if (na.data.num > nb.data.num) out = 1;
+        xf_value_release(na);
+        xf_value_release(nb);
+        return out;
     }
-    /* string path */
+    xf_value_release(na);
+    xf_value_release(nb);
+
     xf_Value sa = xf_coerce_str(a), sb = xf_coerce_str(b);
     int cmp = 0;
     if (sa.state == XF_STATE_OK && sb.state == XF_STATE_OK && sa.data.str && sb.data.str)
@@ -943,9 +945,18 @@ static xf_Value arr_broadcast(xf_Value a, xf_Value b, int op) {
     return xf_val_nav(XF_TYPE_NUM);
 }
 static xf_Value elem_op(xf_Value a, xf_Value b, int op) {
-    if((a.state==XF_STATE_OK&&a.type==XF_TYPE_ARR)||(b.state==XF_STATE_OK&&b.type==XF_TYPE_ARR)) return arr_broadcast(a,b,op);
-    xf_Value na=xf_coerce_num(a),nb=xf_coerce_num(b);
-    return xf_val_ok_num(scalar_op((na.state==XF_STATE_OK)?na.data.num:0,(nb.state==XF_STATE_OK)?nb.data.num:0,op));
+    if ((a.state == XF_STATE_OK && a.type == XF_TYPE_ARR) ||
+        (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR))
+        return arr_broadcast(a, b, op);
+
+    xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
+    xf_Value out = xf_val_ok_num(
+        scalar_op((na.state == XF_STATE_OK) ? na.data.num : 0,
+                  (nb.state == XF_STATE_OK) ? nb.data.num : 0, op)
+    );
+    xf_value_release(na);
+    xf_value_release(nb);
+    return out;
 }
 static xf_Value mat_mul(xf_Value a, xf_Value b) {
     if(!(a.state==XF_STATE_OK&&a.type==XF_TYPE_ARR&&a.data.arr)) return xf_val_nav(XF_TYPE_ARR);
@@ -961,11 +972,19 @@ static xf_Value mat_mul(xf_Value a, xf_Value b) {
             for(size_t k=0;k<k_max;k++){
                 double aik=0,bkj=0;
                 xf_Value ar=a.data.arr->items[i];
-                if(ar.state==XF_STATE_OK&&ar.type==XF_TYPE_ARR&&ar.data.arr&&k<ar.data.arr->len){xf_Value n=xf_coerce_num(ar.data.arr->items[k]);if(n.state==XF_STATE_OK)aik=n.data.num;}
+                if (ar.state == XF_STATE_OK && ar.type == XF_TYPE_ARR && ar.data.arr && k < ar.data.arr->len) {
+    xf_Value n = xf_coerce_num(ar.data.arr->items[k]);
+    if (n.state == XF_STATE_OK) aik = n.data.num;
+    xf_value_release(n);
+}
                 else if(ar.state==XF_STATE_OK&&ar.type==XF_TYPE_NUM&&k==0)aik=ar.data.num;
                 if(k<b.data.arr->len){xf_Value br=b.data.arr->items[k];
-                    if(br.state==XF_STATE_OK&&br.type==XF_TYPE_ARR&&br.data.arr&&j<br.data.arr->len){xf_Value n=xf_coerce_num(br.data.arr->items[j]);if(n.state==XF_STATE_OK)bkj=n.data.num;}
-                    else if(br.state==XF_STATE_OK&&br.type==XF_TYPE_NUM&&j==0)bkj=br.data.num;}
+if (br.state == XF_STATE_OK && br.type == XF_TYPE_ARR && br.data.arr && j < br.data.arr->len) {
+    xf_Value n = xf_coerce_num(br.data.arr->items[j]);
+    if (n.state == XF_STATE_OK) bkj = n.data.num;
+    xf_value_release(n);
+}
+                                        else if(br.state==XF_STATE_OK&&br.type==XF_TYPE_NUM&&j==0)bkj=br.data.num;}
                 sum+=aik*bkj;
             }
             xf_arr_push(row,xf_val_ok_num(sum));
@@ -1082,8 +1101,7 @@ static bool lvalue_store(Interp *it, Expr *target, xf_Value val) {
             return false;
         }
 
-        xf_map_set(container.data.map, sk.data.str, xf_value_retain(val));
-
+xf_map_set(container.data.map, sk.data.str, val);
         xf_value_release(sk);
         xf_value_release(key);
         xf_value_release(container);
@@ -1369,18 +1387,21 @@ xf_Value interp_call_builtin(Interp *it, const char *name, xf_Value *args, size_
     }
 
     if (strcmp(name, "push") == 0 && argc == 2) {
-        if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_ARR && args[0].data.arr) {
-            xf_arr_push(args[0].data.arr, xf_value_retain(args[1]));
-        } else if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_SET && args[0].data.map) {
-            xf_Value ks = xf_coerce_str(args[1]);
-            if (ks.state == XF_STATE_OK && ks.data.str) {
-                xf_map_set(args[0].data.map, ks.data.str, xf_val_ok_num(1.0));
-            }
-            xf_value_release(ks);
+    if (args[0].state == XF_STATE_OK &&
+        args[0].type  == XF_TYPE_ARR &&
+        args[0].data.arr) {
+        xf_arr_push(args[0].data.arr, xf_value_retain(args[1]));
+    } else if (args[0].state == XF_STATE_OK &&
+               args[0].type  == XF_TYPE_SET &&
+               args[0].data.map) {
+        xf_Value ks = xf_coerce_str(args[1]);
+        if (ks.state == XF_STATE_OK && ks.data.str) {
+            xf_map_set(args[0].data.map, ks.data.str, xf_val_ok_num(1.0));
         }
-        return xf_value_retain(args[0]);
+        xf_value_release(ks);
     }
-
+    return xf_value_retain(args[0]);
+}
     if (strcmp(name, "pop") == 0 && argc == 1) {
         if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_ARR && args[0].data.arr) {
             return xf_arr_pop(args[0].data.arr);
@@ -1389,12 +1410,13 @@ xf_Value interp_call_builtin(Interp *it, const char *name, xf_Value *args, size_
     }
 
     if (strcmp(name, "unshift") == 0 && argc == 2) {
-        if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_ARR && args[0].data.arr) {
-            xf_arr_unshift(args[0].data.arr, xf_value_retain(args[1]));
-        }
-        return xf_value_retain(args[0]);
+    if (args[0].state == XF_STATE_OK &&
+        args[0].type  == XF_TYPE_ARR &&
+        args[0].data.arr) {
+        xf_arr_unshift(args[0].data.arr, xf_value_retain(args[1]));
     }
-
+    return xf_value_retain(args[0]);
+}
     if (strcmp(name, "shift") == 0 && argc == 1) {
         if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_ARR && args[0].data.arr) {
             return xf_arr_shift(args[0].data.arr);
@@ -1632,13 +1654,11 @@ case EXPR_MAP_LIT: {
             return kv;
         }
 
-        /* Allow non-OK values (NULL, NAV) as map values */
         xf_Value vv = interp_eval_expr(it, e->as.map_lit.vals[i]);
 
         xf_Value ks = xf_coerce_str(kv);
         if (ks.state != XF_STATE_OK) {
             xf_value_release(kv);
-            /* vv not inserted yet, so release it here */
             xf_value_release(vv);
             xf_map_release(m);
             return ks;
@@ -1646,9 +1666,9 @@ case EXPR_MAP_LIT: {
 
         xf_map_set(m, ks.data.str, vv);
 
-        /* kv/ks are temporaries; vv is now owned by the map */
         xf_value_release(kv);
         xf_value_release(ks);
+        /* do NOT release vv here */
     }
 
     xf_Value out = xf_val_ok_map(m);
@@ -2306,7 +2326,7 @@ case EXPR_CALL: {
                     it->returning = false;
                     interp_eval_stmt(it, (Stmt *)fn->body);
 
-                    xf_Value ret0 = it->returning ? it->return_val : xf_val_null();
+                    xf_Value ret0 = it->returning ? xf_value_retain(it->return_val) : xf_val_null();
                     xf_Value ret  = xf_value_retain(ret0);
                     it->returning = false;
 
@@ -2407,14 +2427,7 @@ case EXPR_CALL: {
                 }
             }
 
-            it->returning = false;
-            interp_eval_stmt(it, (Stmt *)fn->body);
-
-            xf_Value ret0 = it->returning ? it->return_val : xf_val_null();
-            xf_Value ret  = xf_value_retain(ret0);
-            it->returning = false;
-
-            scope_free(sym_pop(it->syms));
+            xf_Value ret = interp_exec_xf_fn(it->vm, it->syms, fn, args, argc);
 
             if (fn->return_type != XF_TYPE_VOID &&
                 ret.state == XF_STATE_NULL)
@@ -2591,7 +2604,7 @@ case EXPR_CALL: {
         interp_error(it, e->loc, "unknown member '.%s'", field);
         return xf_val_nav(XF_TYPE_VOID);
     }
-    
+
     case EXPR_PIPE_FN: {
     xf_Value left = interp_eval_expr(it, e->as.pipe_fn.left);
     Expr *rhs = e->as.pipe_fn.right;
@@ -2653,7 +2666,7 @@ case EXPR_CALL: {
     interp_error(it, e->loc, "pipe target is not callable");
     return xf_val_nav(XF_TYPE_VOID);
 }
-    
+
     case EXPR_FN: {
         xf_Fn *fn = build_fn(NULL, e->as.fn.return_type,
                              e->as.fn.params, e->as.fn.param_count,
@@ -2923,14 +2936,17 @@ case STMT_VAR_DECL: {
         return xf_val_null();
     }
 
+case STMT_RETURN: {
+    xf_Value rv = s->as.ret.value
+        ? interp_eval_expr(it, s->as.ret.value)
+        : xf_val_null();
 
-    case STMT_RETURN:
-        it->return_val = s->as.ret.value
-                          ? interp_eval_expr(it, s->as.ret.value)
-                          : xf_val_null();
-        it->returning = true;
-        return it->return_val;
+    xf_value_release(it->return_val);
+    it->return_val = xf_value_retain(rv);
+    it->returning  = true;
 
+    return xf_val_null();  // or NAV depending on your semantics
+}
     case STMT_NEXT:
         it->nexting = true;
         return xf_val_null();
