@@ -1,14 +1,31 @@
 CC      = /opt/homebrew/opt/llvm/bin/clang
-AR = /opt/homebrew/opt/llvm/bin/llvm-ar
-CFLAGS  = -O0 -g -fsanitize=address,leak,undefined -fno-omit-frame-pointer  -Wall -Wextra -Wpedantic -std=c11
-#CFLAGS  = -O0 -g -fsanitize=thread -fno-omit-frame-pointer  -Wall -Wextra -Wpedantic -std=c11
-LDFLAGS = -fsanitize=address,leak,undefined
+AR      = /opt/homebrew/opt/llvm/bin/llvm-ar
+
+WARNFLAGS    = -Wall -Wextra -Wpedantic -std=c11
+DEBUGFLAGS   = -O0 -g -fsanitize=address,leak,undefined -fno-omit-frame-pointer
+THREADFLAGS  = -O0 -g -fsanitize=thread -fno-omit-frame-pointer
+RELEASEFLAGS = -O3
+
+MODE ?= release
+
+ifeq ($(MODE),debug)
+	CFLAGS  = $(DEBUGFLAGS) $(WARNFLAGS)
+	LDFLAGS = -fsanitize=address,leak,undefined
+else ifeq ($(MODE),thread)
+	CFLAGS  = $(THREADFLAGS) $(WARNFLAGS)
+	LDFLAGS = -fsanitize=thread
+else
+	CFLAGS  = $(RELEASEFLAGS) $(WARNFLAGS)
+	LDFLAGS =
+endif
+
 LDLIBS  ?= -lm -lpthread
 PREFIX  ?= /usr/local
 DESTDIR ?=
-OBJDIR  = obj
-BINDIR  = bin
-LIBDIR  = lib
+
+OBJDIR  = obj/$(MODE)
+BINDIR  = bin/$(MODE)
+LIBDIR  = lib/$(MODE)
 
 BIN     = $(BINDIR)/xf
 LIBXF   = $(LIBDIR)/static/libxf.a
@@ -29,7 +46,7 @@ CORE_SRCS = \
 RUNTIME_SRCS = \
 	src/ast.c \
 	src/interp.c \
- src/gc.c \
+	src/gc.c \
 	src/lexer.c \
 	src/parser.c \
 	src/symTable.c \
@@ -50,17 +67,23 @@ CLI_OBJS     = $(patsubst %.c,$(OBJDIR)/%.o,$(CLI_SRCS))
 $(patsubst %.c,$(OBJDIR)/%.o,$(CORE_SRCS)): src/core/internal.h
 
 all: $(LIBXF) $(BIN)
-run:
+
+run: $(BIN)
+ifeq ($(MODE),debug)
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 	LSAN_OPTIONS=verbosity=1:report_objects=1 \
-UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
-		./bin/xf -r tests/torture.xf
+	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+	$(BIN) -r tests/torture.xf
+else
+	$(BIN) -r tests/torture.xf
+endif
+
 $(LIBXF): $(RUNTIME_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 
 $(BIN): $(CLI_OBJS) $(LIBXF)
-	@mkdir -p $(BINDIR)
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ $(CLI_OBJS) $(LIBXF) $(LDFLAGS) $(LDLIBS)
 
 $(OBJDIR)/%.o: %.c
@@ -83,6 +106,6 @@ uninstall:
 	rm -rf $(DESTDIR)$(PREFIX)/include/xf
 
 clean:
-	rm -rf $(OBJDIR) $(BIN) $(LIBXF)
+	rm -rf obj/* bin/* lib/*.a
 
 .PHONY: all run install uninstall clean
