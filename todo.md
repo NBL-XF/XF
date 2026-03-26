@@ -1,6 +1,6 @@
 1. fix pairs for maps for loop
 2. chain pipes
-3. walrus val/cond
-4. []<=> TRUE is wrong
-5. NULL!=NAV should be true
-6. fmt/hex adding previous chars
+3. TSAN ASAN LSAN UBSAN
+4. CHAOS 10,000 LOC TEST with 3 IMPORT FILES ASAPPPPPPP TIME TO DIE XF
+5. ALL OF THE IMPENDING LEAKS UNDEFS AND ADDR ISSUES
+6. V 1.0.0!!!!!!!!!!!!!!!!!!!!!!!!!!!

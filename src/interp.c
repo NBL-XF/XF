@@ -2855,18 +2855,38 @@ static void iter_collection(Interp *it, xf_Value col,
             if (it->returning || it->exiting || it->had_error) break;
         }
     } else if ((col.type == XF_TYPE_MAP || col.type == XF_TYPE_SET) && col.data.map) {
-        xf_map_t *m   = col.data.map;
+        xf_map_t *m     = col.data.map;
         bool      is_set = (col.type == XF_TYPE_SET);
+
         for (size_t i = 0; i < m->order_len; i++) {
             xf_Str  *key = m->order[i];
             xf_Value kv  = xf_val_ok_str(key);
             xf_Value vv  = is_set ? xf_val_ok_str(key) : xf_map_get(m, key);
+
             sym_push(it->syms, SCOPE_LOOP);
-            bind_loop_index_value(it, iter_key, iter_val, kv, vv, loc);
+
+            /* `for (k, v) in map` — parser encodes both bindings as a single
+             * 2-element LOOP_BIND_TUPLE on iter_val with no iter_key.
+             * Split it here so each element is bound to key and value
+             * individually, rather than trying to destructure the map value
+             * as a tuple (which always fails for non-tuple values).         */
+            if (!iter_key &&
+                iter_val && iter_val->kind == LOOP_BIND_TUPLE &&
+                iter_val->as.tuple.count == 2) {
+                bind_loop_index_value(it,
+                    iter_val->as.tuple.items[0],
+                    iter_val->as.tuple.items[1],
+                    kv, vv, loc);
+            } else {
+                bind_loop_index_value(it, iter_key, iter_val, kv, vv, loc);
+            }
+
             interp_eval_stmt(it, body);
             scope_free(sym_pop(it->syms));
+
             xf_value_release(kv);
-            if (is_set) xf_value_release(vv);
+            xf_value_release(vv);   /* unconditional — fixes map value leak */
+
             if (it->nexting)  { it->nexting  = false; continue; }
             if (it->breaking) { it->breaking = false; break; }
             if (it->returning || it->exiting || it->had_error) break;
@@ -2876,7 +2896,6 @@ static void iter_collection(Interp *it, xf_Value col,
                      XF_TYPE_NAMES[col.type]);
     }
 }
-
 xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
     if (!s) return xf_val_null();
     if (it->had_error || it->returning || it->exiting || it->nexting || it->breaking)
