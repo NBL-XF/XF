@@ -67,7 +67,8 @@ extern bool cs_arg_pat(xf_Value *args, size_t argc, size_t pat_idx,
                        const char **pat_out, int *cflags_out, bool *is_regex);
 
 /* ── build_* forward declarations ────────────────────────────── */
-
+/* internal.h */
+xf_module_t *build_img(void);
 xf_module_t *build_math(void);
 xf_module_t *build_str(void);
 xf_module_t *build_os(void);

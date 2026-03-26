@@ -41,7 +41,8 @@ CORE_SRCS = \
 	src/core/format.c \
 	src/core/ds.c \
 	src/core/edit.c \
-	src/core/process.c
+	src/core/process.c\
+	src/core/img.c
 
 RUNTIME_SRCS = \
 	src/ast.c \

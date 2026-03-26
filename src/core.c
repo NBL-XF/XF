@@ -10,6 +10,7 @@ void core_register(SymTable *st) {
     xf_module_t *format_m   = build_format();
     xf_module_t *regex_m    = build_regex();
     xf_module_t *process_m  = build_process();
+    xf_module_t *img_m      = build_img();
 
     xf_module_t *core_m = xf_module_new("core");
     xf_module_set(core_m, "math",     xf_val_ok_module(math_m));
@@ -21,12 +22,13 @@ void core_register(SymTable *st) {
     xf_module_set(core_m, "edit",     xf_val_ok_module(edit_m));
     xf_module_set(core_m, "format",   xf_val_ok_module(format_m));
     xf_module_set(core_m, "process",  xf_val_ok_module(process_m));
+    xf_module_set(core_m, "img",      xf_val_ok_module(img_m));
 
     xf_module_release(math_m);   xf_module_release(str_m);
     xf_module_release(os_m);     xf_module_release(generics_m);
     xf_module_release(ds_m);     xf_module_release(regex_m);
     xf_module_release(edit_m);   xf_module_release(format_m);
-    xf_module_release(process_m);
+    xf_module_release(process_m);xf_module_release(img_m);
 
     xf_Value core_val = xf_val_ok_module(core_m);
     xf_module_release(core_m);
