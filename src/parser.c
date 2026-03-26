@@ -616,11 +616,6 @@ Expr *parse_postfix(Parser *p) {
             continue;
         }
         /* pipe-fn:  expr |> fn */
-        if (match_tok(p, TK_PIPE_GT)) {
-            Expr *right = parse_unary(p);
-            e = ast_pipe_fn(e, right, loc);
-            continue;
-        }
         break;
     }
     return e;
@@ -759,10 +754,22 @@ Expr *parse_or(Parser *p) {
     }
     return left;
 }
-
+/* ── pipe: left-associative |> chaining ─────────────────────── */
+static Expr *parse_pipe(Parser *p) {
+    Expr *left = parse_or(p);
+    while (check(p, TK_PIPE_GT)) {
+        Loc loc = cur(p)->loc;
+        advance(p);
+        /* parse_unary handles calls/members on the RHS but won't
+         * consume another |> — that's handled by the while loop here */
+        Expr *right = parse_unary(p);
+        left = ast_pipe_fn(left, right, loc);
+    }
+    return left;
+}
 /* ── null coalescing: ?? ─────────────────────────────────────── */
 Expr *parse_coalesce(Parser *p) {
-    Expr *left = parse_or(p);
+    Expr *left = parse_pipe(p);
     if (check(p, TK_COALESCE)) {
         Loc loc = cur(p)->loc;
         advance(p);

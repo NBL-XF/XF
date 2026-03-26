@@ -2685,31 +2685,87 @@ case EXPR_CALL: {
         return xf_val_nav(XF_TYPE_VOID);
     }
 
-    case EXPR_PIPE_FN: {
+case EXPR_PIPE_FN: {
     xf_Value left = interp_eval_expr(it, e->as.pipe_fn.left);
     Expr *rhs = e->as.pipe_fn.right;
 
-    if (rhs->kind == EXPR_IDENT) {
-        const char *name =
-            (rhs->as.ident.name && rhs->as.ident.name->data)
-            ? rhs->as.ident.name->data
-            : "<null-ident>";
+    /* ── a |> f(b, c)  →  f(left, b, c) ──────────────────────
+     * Inject left as the first argument into the call.         */
+    if (rhs->kind == EXPR_CALL) {
+        size_t extra_argc = rhs->as.call.argc < 63 ? rhs->as.call.argc : 63;
+        xf_Value args[64];
+        args[0] = left;
+        for (size_t i = 0; i < extra_argc; i++)
+            args[i + 1] = interp_eval_expr(it, rhs->as.call.args[i]);
+        size_t total_argc = extra_argc + 1;
 
-        xf_Value r = interp_call_builtin(it, name, &left, 1);
-        if (r.state != XF_STATE_NAV) {
-            xf_Value ret = xf_value_retain(r);
-            xf_value_release(left);
-            return ret;
+        xf_Value result = xf_val_nav(XF_TYPE_VOID);
+
+        /* try builtin by name first */
+        if (rhs->as.call.callee->kind == EXPR_IDENT &&
+            rhs->as.call.callee->as.ident.name) {
+            const char *bname = rhs->as.call.callee->as.ident.name->data;
+            xf_Value r = interp_call_builtin(it, bname, args, total_argc);
+            if (r.state != XF_STATE_NAV) {
+                result = xf_value_retain(r);
+                for (size_t i = 0; i < total_argc; i++) xf_value_release(args[i]);
+                return result;
+            }
         }
+
+        /* evaluate callee and dispatch */
+        xf_Value callee_val = interp_eval_expr(it, rhs->as.call.callee);
+        if (callee_val.state == XF_STATE_OK &&
+            callee_val.type  == XF_TYPE_FN  &&
+            callee_val.data.fn) {
+            xf_Fn *fn = callee_val.data.fn;
+            if (fn->is_native && fn->native_v) {
+                xf_Value r0 = fn->native_v(args, total_argc);
+                result = xf_value_retain(r0);
+            } else {
+                result = interp_exec_xf_fn(it->vm, it->syms, fn, args, total_argc);
+            }
+        } else {
+            interp_error(it, e->loc, "pipe target is not callable");
+        }
+        xf_value_release(callee_val);
+        for (size_t i = 0; i < total_argc; i++) xf_value_release(args[i]);
+        return result;
     }
 
+    /* ── a |> obj.method ────────────────────────────────────── */
     if (rhs->kind == EXPR_MEMBER) {
         xf_Value obj = interp_eval_expr(it, rhs->as.member.obj);
-        const char *mn =
-            (rhs->as.member.field && rhs->as.member.field->data)
-            ? rhs->as.member.field->data
-            : "<null-member>";
+        const char *mn = (rhs->as.member.field && rhs->as.member.field->data)
+                         ? rhs->as.member.field->data : "<null-member>";
 
+        /* module member: look up fn in module, call with left */
+        if (obj.state == XF_STATE_OK &&
+            obj.type  == XF_TYPE_MODULE && obj.data.mod) {
+            xf_Value fv = xf_module_get(obj.data.mod, mn);
+            if (fv.state == XF_STATE_OK &&
+                fv.type  == XF_TYPE_FN  && fv.data.fn) {
+                xf_Fn *fn = fv.data.fn;
+                xf_Value result;
+                if (fn->is_native && fn->native_v) {
+                    xf_Value r0 = fn->native_v(&left, 1);
+                    result = xf_value_retain(r0);
+                } else {
+                    result = interp_exec_xf_fn(it->vm, it->syms, fn, &left, 1);
+                }
+                xf_value_release(fv);
+                xf_value_release(obj);
+                xf_value_release(left);
+                return result;
+            }
+            xf_value_release(fv);
+            interp_error(it, e->loc, "module has no callable member '%s'", mn);
+            xf_value_release(obj);
+            xf_value_release(left);
+            return xf_val_nav(XF_TYPE_VOID);
+        }
+
+        /* non-module: try builtin with (obj, left) as before */
         xf_Value margs[2] = { obj, left };
         xf_Value mr = interp_call_builtin(it, mn, margs, 2);
         if (mr.state != XF_STATE_NAV) {
@@ -2721,20 +2777,31 @@ case EXPR_CALL: {
         xf_value_release(obj);
     }
 
+    /* ── a |> ident ─────────────────────────────────────────── */
+    if (rhs->kind == EXPR_IDENT) {
+        const char *name = (rhs->as.ident.name && rhs->as.ident.name->data)
+                           ? rhs->as.ident.name->data : "<null-ident>";
+        xf_Value r = interp_call_builtin(it, name, &left, 1);
+        if (r.state != XF_STATE_NAV) {
+            xf_Value ret = xf_value_retain(r);
+            xf_value_release(left);
+            return ret;
+        }
+    }
+
+    /* ── fallback: evaluate rhs as a fn value and call it ───── */
     xf_Value callee = interp_eval_expr(it, rhs);
     if (callee.state == XF_STATE_OK &&
-        callee.type == XF_TYPE_FN &&
+        callee.type  == XF_TYPE_FN  &&
         callee.data.fn) {
         xf_Fn *fn = callee.data.fn;
-
         if (fn->is_native && fn->native_v) {
-            xf_Value ret0 = fn->native_v(&left, 1);
-            xf_Value ret  = xf_value_retain(ret0);
+            xf_Value r0 = fn->native_v(&left, 1);
+            xf_Value ret = xf_value_retain(r0);
             xf_value_release(callee);
             xf_value_release(left);
             return ret;
         }
-
         xf_Value ret = interp_exec_xf_fn(it->vm, it->syms, fn, &left, 1);
         xf_value_release(callee);
         xf_value_release(left);
@@ -2746,7 +2813,6 @@ case EXPR_CALL: {
     interp_error(it, e->loc, "pipe target is not callable");
     return xf_val_nav(XF_TYPE_VOID);
 }
-
     case EXPR_FN: {
         xf_Fn *fn = build_fn(NULL, e->as.fn.return_type,
                              e->as.fn.params, e->as.fn.param_count,
