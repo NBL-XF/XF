@@ -272,7 +272,39 @@ if (ds) {
 }
     }
 }
+static xf_Value interp_call_xf_fn(Interp *it, xf_fn_t *fn, xf_Value *args, size_t argc, Loc loc) {
+    Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
+    fn_sc->fn_ret_type = fn->return_type;
 
+    for (size_t i = 0; i < fn->param_count; i++) {
+        xf_Value av = (i < argc) ? args[i] : xf_val_undef(fn->params[i].type);
+        Symbol *ps = sym_declare(it->syms, fn->params[i].name,
+                                 SYM_PARAM, fn->params[i].type, loc);
+        if (ps) {
+            xf_value_release(ps->value);
+            ps->value      = xf_value_retain(av);
+            ps->state      = av.state;
+            ps->is_defined = true;
+        }
+    }
+
+    bool saved_returning = it->returning;
+    xf_Value saved_ret   = it->return_val;
+
+    it->returning = false;
+    it->return_val = xf_val_null();
+
+    interp_eval_stmt(it, (Stmt *)fn->body);
+
+    xf_Value result = it->returning ? xf_value_retain(it->return_val) : xf_val_null();
+
+    xf_value_release(it->return_val);
+    it->return_val = saved_ret;
+    it->returning  = saved_returning;
+
+    scope_free(sym_pop(it->syms));
+    return result;
+}
 /* ── interp_exec_xf_fn ───────────────────────────────────────────
  * Executes an XF-language (or native) fn in the calling thread.
  * Creates a private SymTable+Interp that shares only the VM pointer.
@@ -338,6 +370,7 @@ scope_free(sym_pop(&syms));
     sym_free(&syms);
     return result;
 }
+
 static bool bind_loop_value(Interp *it, LoopBind *bind, xf_Value v, Loc loc);
 static bool is_complex_like(xf_Value v) {
     return v.state == XF_STATE_OK &&
@@ -355,7 +388,24 @@ static xf_complex_t to_complex(xf_Value v) {
     return z;
 }
 
-static xf_Value apply_binary_op(BinOp op, xf_Value a, xf_Value b, Loc loc) {
+static xf_Value apply_binary_op(Interp *it,BinOp op, xf_Value a, xf_Value b, Loc loc) {
+    if (a.state == XF_STATE_UNDEF || b.state == XF_STATE_UNDEF) {
+        interp_error(it, loc, "undefined value used in operation");
+        xf_err_t *e = xf_err_new("undefined value used in operation",
+                                 loc.source, loc.line, loc.col);
+        xf_Value out = xf_val_err(e, XF_TYPE_VOID);
+        xf_err_release(e);
+        return out;
+    }
+
+    if (a.state == XF_STATE_UNDET || b.state == XF_STATE_UNDET) {
+        interp_error(it, loc, "undetermined value used in operation");
+        xf_err_t *e = xf_err_new("undetermined value used in operation",
+                                 loc.source, loc.line, loc.col);
+        xf_Value out = xf_val_err(e, XF_TYPE_VOID);
+        xf_err_release(e);
+        return out;
+    }
     if (is_complex_like(a) && is_complex_like(b) &&
         (a.type == XF_TYPE_COMPLEX || b.type == XF_TYPE_COMPLEX)) {
         xf_complex_t x = to_complex(a);
@@ -993,21 +1043,23 @@ if (br.state == XF_STATE_OK && br.type == XF_TYPE_ARR && br.data.arr && j < br.d
     }
     xf_Value r=xf_val_ok_arr(result);xf_arr_release(result);return r;
 }
-static xf_Value apply_assign_op(AssignOp op, xf_Value cur, xf_Value rhs, Loc loc) {
-    switch (op) {
-        case ASSIGNOP_EQ:     return rhs;
-        case ASSIGNOP_ADD:    return apply_binary_op(BINOP_ADD,    cur, rhs, loc);
-        case ASSIGNOP_SUB:    return apply_binary_op(BINOP_SUB,    cur, rhs, loc);
-        case ASSIGNOP_MUL:    return apply_binary_op(BINOP_MUL,    cur, rhs, loc);
-        case ASSIGNOP_MADD: return apply_binary_op(BINOP_MADD, cur, rhs, loc);
-case ASSIGNOP_MSUB: return apply_binary_op(BINOP_MSUB, cur, rhs, loc);
-case ASSIGNOP_MMUL: return apply_binary_op(BINOP_MMUL, cur, rhs, loc);
-case ASSIGNOP_MDIV: return apply_binary_op(BINOP_MDIV, cur, rhs, loc);
-        case ASSIGNOP_DIV:    return apply_binary_op(BINOP_DIV,    cur, rhs, loc);
-        case ASSIGNOP_MOD:    return apply_binary_op(BINOP_MOD,    cur, rhs, loc);
-        case ASSIGNOP_CONCAT: return apply_binary_op(BINOP_CONCAT, cur, rhs, loc);
-        default:              return rhs;
-    }
+static xf_Value apply_assign_op(Interp *it,AssignOp op, xf_Value cur, xf_Value rhs, Loc loc) {
+
+switch (op) {
+    case ASSIGNOP_EQ:     return rhs;
+    case ASSIGNOP_ADD:    return apply_binary_op(it, BINOP_ADD,    cur, rhs, loc);
+    case ASSIGNOP_SUB:    return apply_binary_op(it, BINOP_SUB,    cur, rhs, loc);
+    case ASSIGNOP_MUL:    return apply_binary_op(it, BINOP_MUL,    cur, rhs, loc);
+    case ASSIGNOP_MADD:   return apply_binary_op(it, BINOP_MADD,   cur, rhs, loc);
+    case ASSIGNOP_MSUB:   return apply_binary_op(it, BINOP_MSUB,   cur, rhs, loc);
+    case ASSIGNOP_MMUL:   return apply_binary_op(it, BINOP_MMUL,   cur, rhs, loc);
+    case ASSIGNOP_MDIV:   return apply_binary_op(it, BINOP_MDIV,   cur, rhs, loc);
+    case ASSIGNOP_DIV:    return apply_binary_op(it, BINOP_DIV,    cur, rhs, loc);
+    case ASSIGNOP_MOD:    return apply_binary_op(it, BINOP_MOD,    cur, rhs, loc);
+    case ASSIGNOP_CONCAT: return apply_binary_op(it, BINOP_CONCAT, cur, rhs, loc);
+    default:              return rhs;
+}
+
 }
 static xf_Value lvalue_load(Interp *it, Expr *target);
 static bool lvalue_store(Interp *it, Expr *target, xf_Value val) {
@@ -1148,7 +1200,7 @@ static xf_Value lvalue_load(Interp *it, Expr *target) {
         if (!s) {
             interp_error(it, target->loc, "undetermined variable '%s'",
                          ((target->as.ident.name && target->as.ident.name->data) ? target->as.ident.name->data : "<null-ident>"));
-            return xf_val_nav(XF_TYPE_VOID);
+            return xf_val_nav(XF_TYPE_BOOL);
         }
         return xf_value_retain(s->value);
     }
@@ -1711,14 +1763,16 @@ case EXPR_SET_LIT: {
     out.type = XF_TYPE_SET;
     return out;
 }
-case EXPR_IDENT: {
-    Symbol *s = sym_lookup_str(it->syms, e->as.ident.name);
-    if (!s) {
-        /* variable does not exist → UNDET */
-        return xf_val_undet(XF_TYPE_BOOL);
+    case EXPR_IDENT: {
+        Symbol *s = sym_lookup_str(it->syms, e->as.ident.name);
+        if (!s) {
+            interp_error(it, e->loc, "undetermined variable '%s'",
+                         ((e->as.ident.name && e->as.ident.name->data) ? e->as.ident.name->data : "<null-ident>"));
+            return xf_val_undet(XF_TYPE_BOOL);
+        }
+        return xf_value_retain(s->value);
     }
-    return xf_value_retain(s->value);
-}
+
     case EXPR_FIELD: {
         int n = e->as.field.index;
         RecordCtx *_rc = IT_REC(it);
@@ -1951,7 +2005,7 @@ case EXPR_IDENT: {
         case BINOP_MSUB:
         case BINOP_MMUL:
         case BINOP_MDIV: {
-            xf_Value ret = apply_binary_op(e->as.binary.op, a, b, e->loc);
+            xf_Value ret = apply_binary_op(it,e->as.binary.op, a, b, e->loc);
             xf_value_release(a);
             xf_value_release(b);
             return ret;
@@ -2232,7 +2286,7 @@ case EXPR_IDENT: {
     if (e->as.assign.op != ASSIGNOP_EQ) {
         xf_Value cur = lvalue_load(it, e->as.assign.target);
         xf_Value old_rhs = rhs;
-        rhs = apply_assign_op(e->as.assign.op, cur, old_rhs, e->loc);
+        rhs = apply_assign_op(it,e->as.assign.op, cur, old_rhs, e->loc);
         xf_value_release(cur);
         xf_value_release(old_rhs);
     }
@@ -2266,6 +2320,7 @@ case EXPR_WALRUS: {
 
     return xf_value_retain(rhs);
 }
+
 case EXPR_CALL: {
     xf_Value args[64];
     size_t argc = e->as.call.argc < 64 ? e->as.call.argc : 64;
@@ -2315,18 +2370,27 @@ case EXPR_CALL: {
                                                  e->loc);
                         if (ps) {
                             xf_value_release(ps->value);
-                            ps->value = xf_value_retain(av);
-                            ps->state = av.state;
+                            ps->value      = xf_value_retain(av);
+                            ps->state      = av.state;
                             ps->is_defined = true;
                         }
                     }
 
-                    it->returning = false;
+                    bool saved_returning = it->returning;
+                    xf_Value saved_ret   = it->return_val;
+
+                    it->returning  = false;
+                    it->return_val = xf_val_null();
+
                     interp_eval_stmt(it, (Stmt *)fn->body);
 
-                    xf_Value ret0 = it->returning ? xf_value_retain(it->return_val) : xf_val_null();
-                    xf_Value ret  = xf_value_retain(ret0);
-                    it->returning = false;
+                    xf_Value ret = it->returning
+                        ? xf_value_retain(it->return_val)
+                        : xf_val_null();
+
+                    xf_value_release(it->return_val);
+                    it->return_val = saved_ret;
+                    it->returning  = saved_returning;
 
                     scope_free(sym_pop(it->syms));
 
@@ -2394,7 +2458,6 @@ case EXPR_CALL: {
     /* -----------------------------
      * NORMAL CALL: f(...)
      * ----------------------------- */
-
     xf_Value callee = interp_eval_expr(it, e->as.call.callee);
 
     if (callee.state == XF_STATE_OK &&
@@ -2419,13 +2482,29 @@ case EXPR_CALL: {
                                          e->loc);
                 if (ps) {
                     xf_value_release(ps->value);
-                    ps->value = xf_value_retain(av);
-                    ps->state = av.state;
+                    ps->value      = xf_value_retain(av);
+                    ps->state      = av.state;
                     ps->is_defined = true;
                 }
             }
 
-            xf_Value ret = interp_exec_xf_fn(it->vm, it->syms, fn, args, argc);
+            bool saved_returning = it->returning;
+            xf_Value saved_ret   = it->return_val;
+
+            it->returning  = false;
+            it->return_val = xf_val_null();
+
+            interp_eval_stmt(it, (Stmt *)fn->body);
+
+            xf_Value ret = it->returning
+                ? xf_value_retain(it->return_val)
+                : xf_val_null();
+
+            xf_value_release(it->return_val);
+            it->return_val = saved_ret;
+            it->returning  = saved_returning;
+
+            scope_free(sym_pop(it->syms));
 
             if (fn->return_type != XF_TYPE_VOID &&
                 ret.state == XF_STATE_NULL)
@@ -2479,7 +2558,10 @@ case EXPR_CALL: {
     interp_error(it, e->loc, "attempt to call non-function");
     return xf_val_nav(XF_TYPE_VOID);
 }
-    case EXPR_STATE: {
+
+
+
+                case EXPR_STATE: {
         xf_Value v = interp_eval_expr(it, e->as.introspect.operand);
 
         uint8_t st = (v.state < XF_STATE_COUNT) ? v.state : XF_STATE_OK;
@@ -2809,7 +2891,6 @@ case STMT_BLOCK: {
         xf_Value cur = interp_eval_stmt(it, s->as.block.stmts[i]);
         xf_value_release(last);
         last = cur;
-
         if (it->returning || it->exiting || it->nexting ||
             it->breaking || it->had_error) break;
     }
@@ -2854,27 +2935,33 @@ case STMT_VAR_DECL: {
 
     return xf_value_retain(init);
 }
-    case STMT_FN_DECL: {
-        xf_Fn *fn = build_fn(s->as.fn_decl.name, s->as.fn_decl.return_type,
-                             s->as.fn_decl.params, s->as.fn_decl.param_count,
-                             s->as.fn_decl.body);
-        xf_Value fv = xf_val_ok_fn(fn);
+case STMT_FN_DECL: {
+    xf_Fn *fn = build_fn(s->as.fn_decl.name, s->as.fn_decl.return_type,
+                         s->as.fn_decl.params, s->as.fn_decl.param_count,
+                         s->as.fn_decl.body);
+    xf_Value fv = xf_val_ok_fn(fn);
 
-        Symbol *sym = sym_lookup_local(it->syms,
-                          s->as.fn_decl.name->data, s->as.fn_decl.name->len);
-        if (!sym)
-            sym = sym_declare(it->syms, s->as.fn_decl.name,
-                              SYM_FN, XF_TYPE_FN, s->loc);
+    Scope *saved = it->syms->current;
+    it->syms->current = it->syms->global;
 
-        if (sym) {
-            xf_value_release(sym->value);
-            sym->value = fv;
-            sym->state = XF_STATE_OK;
-            sym->is_defined = true;
-        }
-        return xf_val_null();
+    Symbol *sym = sym_lookup_local(it->syms,
+                      s->as.fn_decl.name->data, s->as.fn_decl.name->len);
+    if (!sym)
+        sym = sym_declare(it->syms, s->as.fn_decl.name,
+                          SYM_FN, XF_TYPE_FN, s->loc);
+
+    it->syms->current = saved;
+
+    if (sym) {
+        xf_value_release(sym->value);
+        sym->value = fv;
+        sym->state = XF_STATE_OK;
+        sym->is_defined = true;
     }
 
+    xf_fn_release(fn);
+    return xf_val_null();
+}
     case STMT_IF: {
         for (size_t i = 0; i < s->as.if_stmt.count; i++) {
             xf_Value cond = interp_eval_expr(it, s->as.if_stmt.branches[i].cond);

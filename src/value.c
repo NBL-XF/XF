@@ -682,8 +682,21 @@ static bool xf_state_is_boolish(uint8_t state) {
 xf_value_t xf_coerce_num(xf_value_t v) {
     if (v.state == XF_STATE_TRUE)  return xf_val_ok_num(1.0);
     if (v.state == XF_STATE_FALSE) return xf_val_ok_num(0.0);
-    if (v.state == XF_STATE_UNDET) return xf_val_ok_num(0.5);
+if (v.state == XF_STATE_UNDET) {
+    xf_err_t *e = xf_err_new("undetermined value used in numeric operation",
+                             "<runtime>", 0, 0);
+    xf_value_t out = xf_val_err(e, XF_TYPE_NUM);
+    xf_err_release(e);
+    return out;
+}
 
+if (v.state == XF_STATE_UNDEF) {
+    xf_err_t *e = xf_err_new("undefined value used in numeric operation",
+                             "<runtime>", 0, 0);
+    xf_value_t out = xf_val_err(e, XF_TYPE_NUM);
+    xf_err_release(e);
+    return out;
+}
     if (v.state != XF_STATE_OK) return v;
     if (v.type == XF_TYPE_NUM)  return v;
 
