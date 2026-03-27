@@ -238,7 +238,7 @@ xf_value_t xf_val_ok_fn(xf_fn_t *f) {
     return (xf_value_t){
         .state = XF_STATE_OK,
         .type  = XF_TYPE_FN,
-        .data  = { .fn = xf_fn_retain(f) }
+        .data  = { .fn = f }
     };
 }
 
@@ -259,13 +259,28 @@ xf_fn_t *xf_fn_retain(xf_fn_t *f) {
     if (f) atomic_fetch_add(&f->refcount, 1);
     return f;
 }
-
 void xf_fn_release(xf_fn_t *f) {
-    if (!f || atomic_fetch_sub(&f->refcount, 1) != 1) return;
+    if (!f) return;
+
+    uint32_t prev = atomic_fetch_sub(&f->refcount, 1);
+    if (f->is_native && f->name) {
+        fprintf(stderr, "[xf_fn_release] native=%s rc %u -> %u\n",
+                f->name->data, prev, prev - 1);
+    }
+
+    if (prev != 1) return;
+
     xf_str_release(f->name);
+
+    if (f->params) {
+        for (size_t i = 0; i < f->param_count; i++) {
+            xf_str_release(f->params[i].name);
+        }
+        free(f->params);
+    }
+
     free(f);
 }
-
 /* ── regex retain / release ─────────────────────────────────── */
 xf_regex_t *xf_regex_retain(xf_regex_t *r) {
     if (r) atomic_fetch_add(&r->refcount, 1);

@@ -101,7 +101,6 @@ static xf_Value cr_build_match_map(const char *subject, regmatch_t *pm,
                                   (size_t)(pm[0].rm_eo - pm[0].rm_so));
     xf_map_set(m, mkey, xf_val_ok_str(mval_s));
     xf_str_release(mkey); xf_str_release(mval_s);
-
     xf_Str *ikey = xf_str_from_cstr("index");
     xf_map_set(m, ikey, xf_val_ok_num((double)pm[0].rm_so));
     xf_str_release(ikey);
@@ -111,6 +110,7 @@ static xf_Value cr_build_match_map(const char *subject, regmatch_t *pm,
         if (pm[g].rm_so >= 0) {
             xf_Str *gs = xf_str_new(subject + pm[g].rm_so,
                                      (size_t)(pm[g].rm_eo - pm[g].rm_so));
+              
             xf_arr_push(grp_arr, xf_val_ok_str(gs)); xf_str_release(gs);
         } else {
             xf_Str *empty = xf_str_from_cstr("");
@@ -129,7 +129,7 @@ static xf_Value cr_build_match_map(const char *subject, regmatch_t *pm,
 static xf_Value cr_match(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value sv = xf_coerce_str(args[0]);
-    if (sv.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_MAP);
+    if (sv.state != XF_STATE_OK)xf_value_release(sv); return xf_val_nav(XF_TYPE_MAP);
     const char *pat; int cflags;
     if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) return xf_val_nav(XF_TYPE_MAP);
 
@@ -141,6 +141,7 @@ static xf_Value cr_match(xf_Value *args, size_t argc) {
     if (ngroups > CR_MAX_GROUPS) ngroups = CR_MAX_GROUPS;
     regmatch_t pm[CR_MAX_GROUPS];
     const char *subject = sv.data.str->data;
+    xf_value_release(sv);
     int rc = regexec(&re, subject, ngroups, pm, 0);
     regfree(&re);
     if (rc != 0) return xf_val_nav(XF_TYPE_MAP);
@@ -152,8 +153,9 @@ static xf_Value cr_match(xf_Value *args, size_t argc) {
 static xf_Value cr_search(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value sv = xf_coerce_str(args[0]);
-    if (sv.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_ARR);
+    if (sv.state != XF_STATE_OK) xf_value_release(sv);  return xf_val_nav(XF_TYPE_ARR);
     const char *pat; int cflags;
+    xf_value_release(sv);
     if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) return xf_val_nav(XF_TYPE_ARR);
 
     regex_t re; char errmsg[256];
@@ -166,7 +168,6 @@ static xf_Value cr_search(xf_Value *args, size_t argc) {
     xf_arr_t   *results     = xf_arr_new();
     const char *cursor      = sv.data.str->data;
     size_t      base_offset = 0;
-
     while (*cursor) {
         int rc = regexec(&re, cursor, ngroups, pm,
                          base_offset ? REG_NOTBOL : 0);
@@ -180,9 +181,10 @@ static xf_Value cr_search(xf_Value *args, size_t argc) {
             }
         }
         xf_Value mv = cr_build_match_map(sv.data.str->data, abs_pm, ngroups);
-        xf_arr_push(results, mv);
+xf_value_release(sv);        xf_arr_push(results, mv);
         size_t adv = (pm[0].rm_eo > pm[0].rm_so) ? (size_t)pm[0].rm_eo : 1;
         base_offset += adv; cursor += adv;
+            xf_value_release(mv);
     }
     regfree(&re);
     xf_Value rv = xf_val_ok_arr(results); xf_arr_release(results); return rv;
@@ -195,7 +197,7 @@ static xf_Value cr_replace_impl(xf_Value *args, size_t argc, bool global) {
     xf_Value sv   = xf_coerce_str(args[0]);
     xf_Value repv = xf_coerce_str(args[2]);
     if (sv.state != XF_STATE_OK || repv.state != XF_STATE_OK)
-        return xf_val_nav(XF_TYPE_STR);
+       xf_value_release(sv); xf_value_release(repv); return xf_val_nav(XF_TYPE_STR);
     const char *pat; int cflags;
     if (!cr_arg_pat(args, argc, 1, 3, &pat, &cflags)) return xf_val_nav(XF_TYPE_STR);
 
@@ -234,6 +236,7 @@ static xf_Value cr_replace_impl(xf_Value *args, size_t argc, bool global) {
     if (used+tail+1>=cap){cap=used+tail+2;out=realloc(out,cap);}
     memcpy(out+used, cursor, tail); used += tail; out[used] = '\0';
     regfree(&re);
+    xf_value_release(sv); xf_value_release(repv);
     xf_Str *result = xf_str_new(out, used); free(out);
     xf_Value rv = xf_val_ok_str(result); xf_str_release(result); return rv;
 }
@@ -250,9 +253,9 @@ static xf_Value cr_replace_all(xf_Value *args, size_t argc) {
 static xf_Value cr_groups(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value sv = xf_coerce_str(args[0]);
-    if (sv.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_ARR);
+    if (sv.state != XF_STATE_OK) xf_value_release(sv); return xf_val_nav(XF_TYPE_ARR);
     const char *pat; int cflags;
-    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) return xf_val_nav(XF_TYPE_ARR);
+    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) xf_value_release(sv); return xf_val_nav(XF_TYPE_ARR);
 
     regex_t re; char errmsg[256];
     if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
@@ -285,7 +288,7 @@ static xf_Value cr_groups(xf_Value *args, size_t argc) {
 static xf_Value cr_test(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value sv = xf_coerce_str(args[0]);
-    if (sv.state != XF_STATE_OK) return xf_val_ok_num(0);
+    if (sv.state != XF_STATE_OK) xf_value_release(sv); return xf_val_ok_num(0);
     const char *pat; int cflags;
     if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) return xf_val_ok_num(0);
 

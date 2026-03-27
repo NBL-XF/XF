@@ -126,6 +126,7 @@ static xf_Value cg_join(xf_Value *args, size_t argc) {
             } else {
                 xf_Value val = xf_map_get(m, m->order[i]);
                 sv = xf_coerce_str(val);
+                xf_value_release(val);
             }
 
             if (sv.state == XF_STATE_OK && sv.data.str)
@@ -148,6 +149,7 @@ static xf_Value cg_join(xf_Value *args, size_t argc) {
             } else {
                 xf_Value val = xf_map_get(m, m->order[i]);
                 sv = xf_coerce_str(val);
+                xf_value_release(val);
             }
 
             if (sv.state == XF_STATE_OK && sv.data.str) {
@@ -376,8 +378,9 @@ static xf_Value cg_strip(xf_Value *args, size_t argc) {
                 while (lo < hi && STRIP_CHAR(s[lo]))     lo++;
                 while (hi > lo && STRIP_CHAR(s[hi - 1])) hi--;
                 xf_map_set(out, key, make_str_val(s + lo, hi - lo));
+                xf_value_release(val);
             } else {
-xf_map_set(out, key, val);            }
+xf_map_set(out, key, val);         xf_value_release(val);   }
         }
 
         xf_Value rv = xf_val_ok_map(out);
@@ -465,7 +468,9 @@ static xf_Value cg_contains(xf_Value *args, size_t argc) {
 
         xf_Value got = xf_map_get(coll.data.map, ks.data.str);
         xf_value_release(ks);
-        return got.state == XF_STATE_OK ? xf_val_true() : xf_val_false();
+        bool found = (got.state==XF_STATE_OK);
+        xf_value_release(got);
+        return found ? xf_val_true() : xf_val_false();
     }
 
     return xf_val_false();

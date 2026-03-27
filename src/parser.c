@@ -273,35 +273,72 @@ uint8_t parse_type(Parser *p) {
 /* ============================================================
  * Parameter list:  (type name, type name = default, ...)
  * ============================================================ */
-
+static void free_param_array(Param *params, size_t count) {
+    if (!params) return;
+    for (size_t i = 0; i < count; i++) {
+        xf_str_release(params[i].name);
+        ast_expr_free(params[i].default_val);
+    }
+    free(params);
+}
 Param *parse_paramlist(Parser *p, size_t *out_count) {
     size_t cap = 4, count = 0;
     Param *params = malloc(sizeof(Param) * cap);
+    if (!params) return NULL;
 
-    expect(p, TK_LPAREN, "expected '(' in parameter list");
+    *out_count = 0;
+
+    if (!expect(p, TK_LPAREN, "expected '(' in parameter list")) {
+        free(params);
+        return NULL;
+    }
 
     while (!check(p, TK_RPAREN) && !check(p, TK_EOF)) {
-        if (count >= cap) { cap *= 2; params = realloc(params, sizeof(Param)*cap); }
+        if (count >= cap) {
+            cap *= 2;
+            Param *tmp = realloc(params, sizeof(Param) * cap);
+            if (!tmp) {
+                free_param_array(params, count);
+                parser_error(p, "out of memory");
+                return NULL;
+            }
+            params = tmp;
+        }
 
         Param pr = {0};
         pr.loc  = cur(p)->loc;
         pr.type = is_type_kw(p) ? parse_type(p) : XF_TYPE_VOID;
 
         Token *name = expect(p, TK_IDENT, "expected parameter name");
+        if (!name || p->had_error) {
+            free_param_array(params, count);
+            return NULL;
+        }
+
         pr.name = tok_to_str(name);
 
-        if (match_tok(p, TK_EQ))
+        if (match_tok(p, TK_EQ)) {
             pr.default_val = parse_expr(p);
+            if (p->had_error) {
+                xf_str_release(pr.name);
+                ast_expr_free(pr.default_val);
+                free_param_array(params, count);
+                return NULL;
+            }
+        }
 
         params[count++] = pr;
         if (!match_tok(p, TK_COMMA)) break;
     }
 
-    expect(p, TK_RPAREN, "expected ')' after parameter list");
+    if (!expect(p, TK_RPAREN, "expected ')' after parameter list") || p->had_error) {
+        free_param_array(params, count);
+        return NULL;
+    }
+
     *out_count = count;
     return params;
 }
-
 
 /* ============================================================
  * Argument list:  (expr, expr, ...)
@@ -328,7 +365,11 @@ Expr **parse_arglist(Parser *p, size_t *out_count) {
 /* ============================================================
  * Expression parsing — precedence climbing
  * ============================================================ */
-
+static void free_expr_array(Expr **items, size_t count) {
+    if (!items) return;
+    for (size_t i = 0; i < count; i++) ast_expr_free(items[i]);
+    free(items);
+}
 Expr *parse_primary(Parser *p) {
     Token *t = cur(p);
     Loc    loc = t->loc;
@@ -1104,6 +1145,7 @@ Stmt *parse_fn_decl(Parser *p) {
 scope_free(sym_pop(p->syms));
     Stmt *s = ast_fn_decl(ret, name, params, pc, body, loc);
     xf_str_release(name);
+    
     return s;
 }
 

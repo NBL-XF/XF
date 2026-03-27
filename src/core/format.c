@@ -12,6 +12,7 @@ static xf_Value cf_pad_left(xf_Value *args, size_t argc) {
     if (argc >= 3 && args[2].state == XF_STATE_OK && args[2].type == XF_TYPE_STR
         && args[2].data.str && args[2].data.str->len > 0)
         pad_ch = args[2].data.str->data[0];
+    xf_value_release(*args);
     if (slen >= width) return make_str_val(s, slen);
     size_t pad = width - slen;
     char *buf = malloc(width + 1);
@@ -29,6 +30,7 @@ static xf_Value cf_pad_right(xf_Value *args, size_t argc) {
     if (argc >= 3 && args[2].state == XF_STATE_OK && args[2].type == XF_TYPE_STR
         && args[2].data.str && args[2].data.str->len > 0)
         pad_ch = args[2].data.str->data[0];
+    xf_value_release(*args);
     if (slen >= width) return make_str_val(s, slen);
     size_t pad = width - slen;
     char *buf = malloc(width + 1);
@@ -46,6 +48,7 @@ static xf_Value cf_pad_center(xf_Value *args, size_t argc) {
     if (argc >= 3 && args[2].state == XF_STATE_OK && args[2].type == XF_TYPE_STR
         && args[2].data.str && args[2].data.str->len > 0)
         pad_ch = args[2].data.str->data[0];
+    xf_value_release(*args);
     if (slen >= width) return make_str_val(s, slen);
     size_t total_pad = width - slen, left_pad = total_pad/2, right_pad = total_pad - left_pad;
     char *buf = malloc(width + 1);
@@ -267,7 +270,7 @@ static xf_Value cf_bin(xf_Value *args, size_t argc) {
     if (val == 0) return make_str_val("0", 1);
     char bits[72]; int bi = 0;
     while (val) { bits[bi++] = '0' + (int)(val & 1); val >>= 1; }
-    char buf[70]; 
+    char buf[70];
     for (int i = 0; i < bi; i++) buf[i] = bits[bi-1-i]; buf[bi] = '\0';
     return make_str_val(buf, (size_t)bi);
 }
@@ -431,6 +434,7 @@ static xf_Value jp_parse(JsonParser *jp, int depth) {
         if (jp->p<jp->end && *jp->p==']') { jp->p++; goto arr_done; }
         while (jp->p<jp->end) {
             xf_arr_push(a, jp_parse(jp,depth+1)); jp_skip_ws(jp);
+        xf_arr_release(a);
             if (jp->p>=jp->end) break;
             if (*jp->p==']'){jp->p++;break;} if (*jp->p==',') jp->p++;
         }

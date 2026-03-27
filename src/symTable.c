@@ -25,7 +25,6 @@ void scope_free(Scope *sc) {
     for (size_t i = 0; i < sc->capacity; i++) {
         if (!sc->entries[i].name) continue;
 
-
         xf_str_release(sc->entries[i].name);
 
         xf_value_release(sc->entries[i].value);
@@ -77,6 +76,7 @@ Scope *sym_pop(SymTable *st) {
     Scope *popped = st->current;
     st->current = popped->parent;
     st->depth--;
+    
     return popped;
 }
 /* ============================================================

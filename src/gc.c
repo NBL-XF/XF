@@ -270,46 +270,8 @@ typedef struct {
 } xf_GcDoomed;
 
 static void gc_force_release(void *ptr, xf_GcObjKind kind) {
-    if (!ptr) return;
-
-    switch (kind) {
-        case XF_GC_OBJ_STR:
-            atomic_store(&((xf_str_t *)ptr)->refcount, 1);
-            xf_str_release((xf_str_t *)ptr);
-            break;
-
-        case XF_GC_OBJ_ARR:
-            atomic_store(&((xf_arr_t *)ptr)->refcount, 1);
-            xf_arr_release((xf_arr_t *)ptr);
-            break;
-
-        case XF_GC_OBJ_TUPLE:
-    /* tuple internals not visible here — skip forced release for now */
-    xf_tuple_release((xf_tuple_t *)ptr);
-    break;
-        case XF_GC_OBJ_MAP:
-            atomic_store(&((xf_map_t *)ptr)->refcount, 1);
-            xf_map_release((xf_map_t *)ptr);
-            break;
-
-        case XF_GC_OBJ_FN:
-            atomic_store(&((xf_fn_t *)ptr)->refcount, 1);
-            xf_fn_release((xf_fn_t *)ptr);
-            break;
-
-        case XF_GC_OBJ_REGEX:
-            atomic_store(&((xf_regex_t *)ptr)->refcount, 1);
-            xf_regex_release((xf_regex_t *)ptr);
-            break;
-
-        case XF_GC_OBJ_MODULE:
-            atomic_store(&((xf_module_t *)ptr)->refcount, 1);
-            xf_module_release((xf_module_t *)ptr);
-            break;
-
-        default:
-            break;
-    }
+(void)ptr;
+(void)kind;
 }
 
 static size_t gc_collect_doomed(xf_GcDoomed **out) {

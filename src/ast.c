@@ -542,6 +542,12 @@ void ast_expr_free(Expr *e) {
             free(e->as.fn.params);
             ast_stmt_free(e->as.fn.body);
             break;
+        case EXPR_LEN:   // ← missing, falls to default: break
+    ast_expr_free(e->as.introspect.operand);
+    break;
+case EXPR_CAST:  // ← missing, falls to default: break
+    ast_expr_free(e->as.cast.operand);
+    break;
         case EXPR_STATE_LIT: break;  /* uint8_t only — nothing to free */
         case EXPR_SPAWN:
             ast_expr_free(e->as.spawn_expr.call);
