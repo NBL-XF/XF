@@ -1772,6 +1772,7 @@ case EXPR_MAP_LIT: {
 
         xf_value_release(kv);
         xf_value_release(ks);
+        xf_value_release(vv);
         /* do NOT release vv here */
     }
 
