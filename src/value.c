@@ -263,10 +263,6 @@ void xf_fn_release(xf_fn_t *f) {
     if (!f) return;
 
     uint32_t prev = atomic_fetch_sub(&f->refcount, 1);
-    if (f->is_native && f->name) {
-        fprintf(stderr, "[xf_fn_release] native=%s rc %u -> %u\n",
-                f->name->data, prev, prev - 1);
-    }
 
     if (prev != 1) return;
 
@@ -298,6 +294,7 @@ void xf_regex_release(xf_regex_t *r) {
 }
 
 xf_Value xf_value_retain(xf_Value v) {
+    if (v.state == XF_STATE_ERR) { xf_err_retain(v.err); return v; }
     if (v.state != XF_STATE_OK) return v;
     switch (v.type) {
         case XF_TYPE_STR:    xf_str_retain(v.data.str);       break;
@@ -314,6 +311,7 @@ xf_Value xf_value_retain(xf_Value v) {
 }
 
 void xf_value_release(xf_Value v) {
+    if (v.state == XF_STATE_ERR) { xf_err_release(v.err); return; }
     if (v.state != XF_STATE_OK) return;
     switch (v.type) {
         case XF_TYPE_STR:    xf_str_release(v.data.str);      break;
@@ -517,6 +515,9 @@ void xf_map_release(xf_map_t *m) {
             xf_str_release(m->slots[i].key);
             xf_value_release(m->slots[i].val);
         }
+        if (m->slots[i].val.state != XF_STATE_UNDEF) {
+    xf_value_release(m->slots[i].val);
+}
     }
     free(m->slots);
     free(m->order);

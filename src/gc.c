@@ -270,8 +270,16 @@ typedef struct {
 } xf_GcDoomed;
 
 static void gc_force_release(void *ptr, xf_GcObjKind kind) {
-(void)ptr;
-(void)kind;
+    if (!ptr) return;
+    switch (kind) {
+        case XF_GC_OBJ_STR:    xf_str_release((xf_Str *)ptr);       break;
+        case XF_GC_OBJ_ARR:    xf_arr_release((xf_arr_t *)ptr);     break;
+        case XF_GC_OBJ_MAP:    xf_map_release((xf_map_t *)ptr);     break;
+        case XF_GC_OBJ_TUPLE:  xf_tuple_release((xf_tuple_t *)ptr); break;
+        case XF_GC_OBJ_FN:     xf_fn_release((xf_fn_t *)ptr);       break;
+        case XF_GC_OBJ_MODULE: xf_module_release((xf_module_t *)ptr); break;
+        default: break;
+    }
 }
 
 static size_t gc_collect_doomed(xf_GcDoomed **out) {

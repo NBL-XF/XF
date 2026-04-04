@@ -1,5 +1,5 @@
 BEGIN {
-    str path = "tests/data_1k.csv"
+    str path = "tests/data_1m.csv"
 
     # ── 1. Load the file ────────────────────────────────────────
     arr lines = core.os.lines(path)
@@ -94,7 +94,7 @@ BEGIN {
     # ── 9. Test the XF-language fn path (was broken by g_fn_caller_syms) ──
     #       Uses process.run with an XF fn — the other reported bug.
 
-    arr chunks  = core.process.split(dataset, 10)
+    arr chunks  = core.process.split(dataset, 200)
     num nchunks = core.generics.length(chunks)
     print "Chunks     : " .. nchunks
 

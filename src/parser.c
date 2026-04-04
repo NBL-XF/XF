@@ -344,32 +344,70 @@ Param *parse_paramlist(Parser *p, size_t *out_count) {
  * Argument list:  (expr, expr, ...)
  * ============================================================ */
 
+static void free_expr_array(Expr **items, size_t count) {
+    if (!items) return;
+    for (size_t i = 0; i < count; i++) {
+        if (items[i]) ast_expr_free(items[i]);
+    }
+    free(items);
+}
+
 Expr **parse_arglist(Parser *p, size_t *out_count) {
     size_t cap = 4, count = 0;
-    Expr **args = malloc(sizeof(Expr *) * cap);
+    Expr **args = calloc(cap, sizeof(Expr *));
+    if (!args) {
+        if (out_count) *out_count = 0;
+        parser_error(p, "out of memory");
+        return NULL;
+    }
 
-    expect(p, TK_LPAREN, "expected '(' in argument list");
+    if (out_count) *out_count = 0;
+
+    if (!check(p, TK_LPAREN)) {
+        parser_error(p, "expected '(' in argument list");
+        free(args);
+        return NULL;
+    }
+    advance(p);
 
     while (!check(p, TK_RPAREN) && !check(p, TK_EOF)) {
-        if (count >= cap) { cap *= 2; args = realloc(args, sizeof(Expr*)*cap); }
-        args[count++] = parse_expr(p);
+        if (count >= cap) {
+            size_t new_cap = cap * 2;
+            Expr **tmp = realloc(args, sizeof(Expr *) * new_cap);
+            if (!tmp) {
+                free_expr_array(args, count);
+                parser_error(p, "out of memory");
+                return NULL;
+            }
+            memset(tmp + cap, 0, sizeof(Expr *) * (new_cap - cap));
+            args = tmp;
+            cap = new_cap;
+        }
+
+        Expr *arg = parse_expr(p);
+        if (!arg || p->had_error) {
+            free_expr_array(args, count);
+            return NULL;
+        }
+
+        args[count++] = arg;
+
         if (!match_tok(p, TK_COMMA)) break;
     }
 
-    expect(p, TK_RPAREN, "expected ')' after argument list");
-    *out_count = count;
+    if (!check(p, TK_RPAREN)) {
+        free_expr_array(args, count);
+        parser_error(p, "expected ')' after argument list");
+        return NULL;
+    }
+    advance(p);
+
+    if (out_count) *out_count = count;
     return args;
 }
-
-
 /* ============================================================
  * Expression parsing — precedence climbing
  * ============================================================ */
-static void free_expr_array(Expr **items, size_t count) {
-    if (!items) return;
-    for (size_t i = 0; i < count; i++) ast_expr_free(items[i]);
-    free(items);
-}
 Expr *parse_primary(Parser *p) {
     Token *t = cur(p);
     Loc    loc = t->loc;
@@ -595,13 +633,27 @@ Expr *parse_postfix(Parser *p) {
 
     for (;;) {
         Loc loc = cur(p)->loc;
+if (check(p, TK_LPAREN)) {
+    size_t argc = 0;
+    Expr **args = parse_arglist(p, &argc);
 
-        if (check(p, TK_LPAREN)) {
-            size_t argc;
-            Expr **args = parse_arglist(p, &argc);
-            e = ast_call(e, args, argc, loc);
-            continue;
-        }
+    if (!args || p->had_error) {
+        free_expr_array(args, argc);
+        ast_expr_free(e);
+        return NULL;
+    }
+
+    Expr *call = ast_call(e, args, argc, loc);
+    if (!call) {
+        free_expr_array(args, argc);
+        ast_expr_free(e);
+        parser_error(p, "failed to build call expression");
+        return NULL;
+    }
+
+    e = call;
+    continue;
+}
         if (match_tok(p, TK_LBRACKET)) {
             Expr *key = parse_expr(p);
             expect(p, TK_RBRACKET, "expected ']' after subscript");
@@ -836,14 +888,21 @@ Expr *parse_ternary(Parser *p) {
 /* ── assignment: = += -= *= /= %= ..= := ───────────────────── */
 Expr *parse_assign(Parser *p) {
     Expr *left = parse_ternary(p);
-    Loc   loc  = cur(p)->loc;
+    if (!left) return NULL;
 
-    /* walrus := — declare + assign in expression position */
+    Loc loc = cur(p)->loc;
+
     if (left->kind == EXPR_IDENT && check(p, TK_WALRUS)) {
         advance(p);
         xf_Str *name = xf_str_retain(left->as.ident.name);
         Expr *val = parse_assign(p);
         ast_expr_free(left);
+
+        if (!val) {
+            xf_str_release(name);
+            return NULL;
+        }
+
         Expr *e = ast_walrus(name, XF_TYPE_VOID, val, loc);
         xf_str_release(name);
         return e;
@@ -851,12 +910,24 @@ Expr *parse_assign(Parser *p) {
 
     if (check(p, TK_PUSH_ARROW)) {
         advance(p);
-        return make_builtin_call2("push", left, parse_assign(p), loc);
+        Expr *rhs = parse_assign(p);
+        if (!rhs) {
+            ast_expr_free(left);
+            return NULL;
+        }
+        return make_builtin_call2("push", left, rhs, loc);
     }
+
     if (check(p, TK_UNSHIFT_ARROW)) {
         advance(p);
-        return make_builtin_call2("unshift", left, parse_assign(p), loc);
+        Expr *rhs = parse_assign(p);
+        if (!rhs) {
+            ast_expr_free(left);
+            return NULL;
+        }
+        return make_builtin_call2("unshift", left, rhs, loc);
     }
+
     if (check(p, TK_FLATTEN_ASSIGN)) {
         advance(p);
         Expr *dup = clone_expr_min(left);
@@ -869,24 +940,30 @@ Expr *parse_assign(Parser *p) {
 
     AssignOp op;
     switch (cur_kind(p)) {
-        case TK_EQ:          op = ASSIGNOP_EQ;     break;
-        case TK_PLUS_EQ:     op = ASSIGNOP_ADD;    break;
-        case TK_MINUS_EQ:    op = ASSIGNOP_SUB;    break;
-        case TK_STAR_EQ:     op = ASSIGNOP_MUL;    break;
-        case TK_SLASH_EQ:    op = ASSIGNOP_DIV;    break;
-        case TK_PERCENT_EQ:  op = ASSIGNOP_MOD;    break;
-        case TK_DOT_DOT_EQ:  op = ASSIGNOP_CONCAT; break;
-        case TK_DOT_PLUS_EQ:  op = ASSIGNOP_MADD; break;
-case TK_DOT_MINUS_EQ: op = ASSIGNOP_MSUB; break;
-case TK_DOT_STAR_EQ:  op = ASSIGNOP_MMUL; break;
-case TK_DOT_SLASH_EQ: op = ASSIGNOP_MDIV; break;
-        default: return left;
+        case TK_EQ:           op = ASSIGNOP_EQ;     break;
+        case TK_PLUS_EQ:      op = ASSIGNOP_ADD;    break;
+        case TK_MINUS_EQ:     op = ASSIGNOP_SUB;    break;
+        case TK_STAR_EQ:      op = ASSIGNOP_MUL;    break;
+        case TK_SLASH_EQ:     op = ASSIGNOP_DIV;    break;
+        case TK_PERCENT_EQ:   op = ASSIGNOP_MOD;    break;
+        case TK_DOT_DOT_EQ:   op = ASSIGNOP_CONCAT; break;
+        case TK_DOT_PLUS_EQ:  op = ASSIGNOP_MADD;   break;
+        case TK_DOT_MINUS_EQ: op = ASSIGNOP_MSUB;   break;
+        case TK_DOT_STAR_EQ:  op = ASSIGNOP_MMUL;   break;
+        case TK_DOT_SLASH_EQ: op = ASSIGNOP_MDIV;   break;
+        default:
+            return left;
     }
+
     advance(p);
-    Expr *value = parse_assign(p);    /* right-assoc */
+    Expr *value = parse_assign(p);
+    if (!value) {
+        ast_expr_free(left);
+        return NULL;
+    }
+
     return ast_assign(op, left, value, loc);
 }
-
 Expr *parse_expr(Parser *p) { return parse_assign(p); }
 
 

@@ -363,6 +363,7 @@ static xf_Value interp_exec_xf_fn(void *vm_ptr, void *syms_ptr,
     it.returning = false;
     interp_eval_stmt(&it, (Stmt *)fn->body);
     xf_Value result = it.returning ? xf_value_retain(it.return_val) : xf_val_null();
+    if (it.returning) xf_value_release(it.return_val);  // ← add: drop the original ref
 it.returning = false;
 
 scope_free(sym_pop(&syms));
@@ -670,6 +671,12 @@ void interp_init(Interp *it, SymTable *syms, VM *vm) {
     if (vm) core_set_fn_caller(vm, syms, interp_exec_xf_fn);
 }
 void interp_free(Interp *it) {
+    //xf_value_release(it->return_val);   // ← add
+   // xf_value_release(it->last_err);     // ← add (works once ERR state is handled above)
+    it->return_val = xf_val_null();
+    it->last_err   = xf_val_null();
+   xf_value_release(it->return_val);   // ← add
+   xf_value_release(it->last_err);     // ← add (works once ERR state is handled above)
     for (size_t i = 0; i < it->imp_prog_count; i++)
         ast_program_free(it->imp_progs[i]);
     free(it->imp_progs);
@@ -1248,7 +1255,7 @@ static bool lvalue_store(Interp *it, Expr *target, xf_Value val) {
 static xf_Value lvalue_load(Interp *it, Expr *target) {
     if (target->kind == EXPR_IDENT) {
         Symbol *s = sym_lookup_str(it->syms, target->as.ident.name);
-        if (!s) {
+        if (!s || !s->is_defined || s->state == XF_STATE_UNDEF || s->state == XF_STATE_UNDET) {
             interp_error(it, target->loc, "undetermined variable '%s'",
                          ((target->as.ident.name && target->as.ident.name->data) ? target->as.ident.name->data : "<null-ident>"));
             return xf_val_nav(XF_TYPE_BOOL);
@@ -1673,6 +1680,31 @@ return found ? xf_val_true() : xf_val_false();
 
     return xf_val_nav(XF_TYPE_VOID);
 }
+static xf_Value eval_rip_call(Interp *it, Expr *arg, Loc loc) {
+    if (!arg || arg->kind != EXPR_IDENT) {
+        interp_error(it, loc, "rip() requires an identifier");
+        return xf_val_nav(XF_TYPE_VOID);
+    }
+
+    Symbol *sym = sym_lookup_str(it->syms, arg->as.ident.name);
+    if (!sym) {
+        interp_error(it, loc, "cannot rip undefined variable '%s'",
+                     arg->as.ident.name ? arg->as.ident.name->data : "<null>");
+        return xf_val_nav(XF_TYPE_VOID);
+    }
+
+    xf_Value old = sym->value;
+
+    sym->value = xf_val_undet(XF_TYPE_BOOL);
+    sym->state = XF_STATE_UNDET;
+    sym->is_defined = false;
+
+    xf_value_release(old);
+    maybe_auto_gc(it);
+
+    return xf_val_null();
+}
+
 xf_Value interp_eval_expr(Interp *it, Expr *e) {
     if (!e) return xf_val_null();
     if (it->had_error || it->returning || it->exiting || it->nexting)
@@ -2374,7 +2406,15 @@ case EXPR_WALRUS: {
 }
 
 case EXPR_CALL: {
-    xf_Value args[64];
+    Expr *callee_expr = e->as.call.callee;
+
+    if (callee_expr &&
+        callee_expr->kind == EXPR_IDENT &&
+        e->as.call.argc == 1 &&
+        strcmp(callee_expr->as.ident.name->data, "rip") == 0) {
+        return eval_rip_call(it, e->as.call.args[0], e->loc);
+    }
+        xf_Value args[64];
     size_t argc = e->as.call.argc < 64 ? e->as.call.argc : 64;
 
     for (size_t i = 0; i < argc; i++)
@@ -3043,16 +3083,16 @@ case STMT_BLOCK: {
     }
 
     scope_free(sym_pop(it->syms));
-    return last;
+        xf_value_release(last);   // ← add: always drop before returning
+    return xf_val_null();
 }
     case STMT_EXPR:{
-    xf_Value v = interp_eval_expr(it, s->as.expr.expr);
-xf_value_release(v);
-return xf_val_null();}
+    return  interp_eval_expr(it, s->as.expr.expr);
+}
 case STMT_VAR_DECL: {
     xf_Value init = s->as.var_decl.init
-                     ? interp_eval_expr(it, s->as.var_decl.init)
-                     : xf_val_undef(s->as.var_decl.type);
+        ? interp_eval_expr(it, s->as.var_decl.init)
+        : xf_val_undef(s->as.var_decl.type);
 
     if (init.state == XF_STATE_OK &&
         s->as.var_decl.type != XF_TYPE_VOID &&
@@ -3069,21 +3109,21 @@ case STMT_VAR_DECL: {
     }
 
     Symbol *sym = sym_lookup_local(it->syms,
-                      s->as.var_decl.name->data, s->as.var_decl.name->len);
-    if (!sym)
+                                   s->as.var_decl.name->data,
+                                   s->as.var_decl.name->len);
+    if (!sym) {
         sym = sym_declare(it->syms, s->as.var_decl.name,
                           SYM_VAR, s->as.var_decl.type, s->loc);
+    }
 
     if (sym) {
         xf_value_release(sym->value);
-        sym->value = init;   /* transfer ownership */
+        sym->value = xf_value_retain(init);
         sym->state = init.state;
         sym->is_defined = true;
-    } else {
-        xf_value_release(init);
     }
 
-    return xf_val_null();
+    return init;
 }
 case STMT_FN_DECL: {
     xf_Fn *fn = build_fn(s->as.fn_decl.name, s->as.fn_decl.return_type,

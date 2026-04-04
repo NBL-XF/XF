@@ -6,9 +6,9 @@
 /* ============================================================
  * Internal alloc helpers
  * ============================================================ */
-
 static Expr *expr_alloc(ExprKind kind, Loc loc) {
     Expr *e = calloc(1, sizeof(Expr));
+    if (!e) return NULL;
     e->kind = kind;
     e->loc  = loc;
     return e;
@@ -16,6 +16,7 @@ static Expr *expr_alloc(ExprKind kind, Loc loc) {
 
 static Stmt *stmt_alloc(StmtKind kind, Loc loc) {
     Stmt *s = calloc(1, sizeof(Stmt));
+    if (!s) return NULL;
     s->kind = kind;
     s->loc  = loc;
     return s;
@@ -23,12 +24,15 @@ static Stmt *stmt_alloc(StmtKind kind, Loc loc) {
 
 static TopLevel *top_alloc(TopKind kind, Loc loc) {
     TopLevel *t = calloc(1, sizeof(TopLevel));
+    if (!t) return NULL;
     t->kind = kind;
     t->loc  = loc;
     return t;
 }
+
 static LoopBind *loop_bind_alloc(LoopBindKind kind, Loc loc) {
     LoopBind *b = calloc(1, sizeof(LoopBind));
+    if (!b) return NULL;
     b->kind = kind;
     b->loc  = loc;
     return b;
@@ -443,22 +447,34 @@ TopLevel *ast_top_stmt(Stmt *stmt, Loc loc) {
  * Program
  * ============================================================ */
 
+
 Program *ast_program_new(const char *source) {
-    Program *p  = calloc(1, sizeof(Program));
+    Program *p = calloc(1, sizeof(Program));
+    if (!p) return NULL;
+
     p->source   = source;
     p->capacity = 16;
-    p->items    = malloc(sizeof(TopLevel *) * p->capacity);
+    p->items    = calloc(p->capacity, sizeof(TopLevel *));
+    if (!p->items) {
+        free(p);
+        return NULL;
+    }
+
     return p;
 }
-
 void ast_program_push(Program *p, TopLevel *item) {
+    if (!p) return;
+
     if (p->count >= p->capacity) {
-        p->capacity *= 2;
-        p->items = realloc(p->items, sizeof(TopLevel *) * p->capacity);
+        size_t new_cap = p->capacity ? p->capacity * 2 : 16;
+        TopLevel **tmp = realloc(p->items, sizeof(TopLevel *) * new_cap);
+        if (!tmp) return; /* keep old buffer intact */
+        p->items = tmp;
+        p->capacity = new_cap;
     }
+
     p->items[p->count++] = item;
 }
-
 void ast_program_free(Program *p) {
     if (!p) return;
     for (size_t i = 0; i < p->count; i++)
@@ -471,69 +487,126 @@ void ast_program_free(Program *p) {
 /* ============================================================
  * Free
  * ============================================================ */
-
 void ast_expr_free(Expr *e) {
     if (!e) return;
+
     switch (e->kind) {
-        case EXPR_STR:       xf_str_release(e->as.str.value);       break;
-        case EXPR_REGEX:     xf_str_release(e->as.regex.pattern);    break;
-        case EXPR_IDENT:     xf_str_release(e->as.ident.name);       break;
-        case EXPR_UNARY:     ast_expr_free(e->as.unary.operand);      break;
+        case EXPR_NUM:
+        case EXPR_FIELD:
+        case EXPR_IVAR:
+        case EXPR_SVAR:
+        case EXPR_STATE_LIT:
+            break;
+
+        case EXPR_STR:
+            xf_str_release(e->as.str.value);
+            break;
+
+        case EXPR_REGEX:
+            xf_str_release(e->as.regex.pattern);
+            break;
+
+        case EXPR_IDENT:
+            xf_str_release(e->as.ident.name);
+            break;
+
+        case EXPR_UNARY:
+            ast_expr_free(e->as.unary.operand);
+            break;
+
         case EXPR_BINARY:
             ast_expr_free(e->as.binary.left);
             ast_expr_free(e->as.binary.right);
             break;
+
         case EXPR_TERNARY:
             ast_expr_free(e->as.ternary.cond);
             ast_expr_free(e->as.ternary.then);
             ast_expr_free(e->as.ternary.els);
             break;
+
         case EXPR_COALESCE:
             ast_expr_free(e->as.coalesce.left);
             ast_expr_free(e->as.coalesce.right);
             break;
+
         case EXPR_ASSIGN:
             ast_expr_free(e->as.assign.target);
             ast_expr_free(e->as.assign.value);
             break;
+
         case EXPR_WALRUS:
             xf_str_release(e->as.walrus.name);
             ast_expr_free(e->as.walrus.value);
             break;
+
         case EXPR_CALL:
             ast_expr_free(e->as.call.callee);
-            for (size_t i = 0; i < e->as.call.argc; i++)
+            for (size_t i = 0; i < e->as.call.argc; i++) {
                 ast_expr_free(e->as.call.args[i]);
+            }
             free(e->as.call.args);
             break;
+
         case EXPR_SUBSCRIPT:
             ast_expr_free(e->as.subscript.obj);
             ast_expr_free(e->as.subscript.key);
             break;
+
         case EXPR_MEMBER:
             ast_expr_free(e->as.member.obj);
             xf_str_release(e->as.member.field);
             break;
+
         case EXPR_STATE:
         case EXPR_TYPE:
+        case EXPR_LEN:
             ast_expr_free(e->as.introspect.operand);
             break;
-         case EXPR_TUPLE_LIT:
-    for (size_t i = 0; i < e->as.tuple_lit.count; i++)
-        ast_expr_free(e->as.tuple_lit.items[i]);
-    free(e->as.tuple_lit.items);
-    break;
-        case EXPR_ARR_LIT: for(size_t i=0;i<e->as.arr_lit.count;i++) ast_expr_free(e->as.arr_lit.items[i]); free(e->as.arr_lit.items); break;
-        case EXPR_MAP_LIT: for(size_t i=0;i<e->as.map_lit.count;i++){ast_expr_free(e->as.map_lit.keys[i]);ast_expr_free(e->as.map_lit.vals[i]);} free(e->as.map_lit.keys); free(e->as.map_lit.vals); break;
 
-                case EXPR_SET_LIT: for(size_t i=0;i<e->as.set_lit.count;i++) ast_expr_free(e->as.set_lit.items[i]); free(e->as.set_lit.items); break;
+        case EXPR_CAST:
+            ast_expr_free(e->as.cast.operand);
+            break;
+
+        case EXPR_TUPLE_LIT:
+            for (size_t i = 0; i < e->as.tuple_lit.count; i++) {
+                ast_expr_free(e->as.tuple_lit.items[i]);
+            }
+            free(e->as.tuple_lit.items);
+            break;
+
+        case EXPR_ARR_LIT:
+            for (size_t i = 0; i < e->as.arr_lit.count; i++) {
+                ast_expr_free(e->as.arr_lit.items[i]);
+            }
+            free(e->as.arr_lit.items);
+            break;
+
+        case EXPR_MAP_LIT:
+            for (size_t i = 0; i < e->as.map_lit.count; i++) {
+                ast_expr_free(e->as.map_lit.keys[i]);
+                ast_expr_free(e->as.map_lit.vals[i]);
+            }
+            free(e->as.map_lit.keys);
+            free(e->as.map_lit.vals);
+            break;
+
+        case EXPR_SET_LIT:
+            for (size_t i = 0; i < e->as.set_lit.count; i++) {
+                ast_expr_free(e->as.set_lit.items[i]);
+            }
+            free(e->as.set_lit.items);
+            break;
+
         case EXPR_PIPE_FN:
             ast_expr_free(e->as.pipe_fn.left);
             ast_expr_free(e->as.pipe_fn.right);
             break;
+
         case EXPR_SPREAD:
             ast_expr_free(e->as.spread.operand);
             break;
+
         case EXPR_FN:
             for (size_t i = 0; i < e->as.fn.param_count; i++) {
                 xf_str_release(e->as.fn.params[i].name);
@@ -542,18 +615,15 @@ void ast_expr_free(Expr *e) {
             free(e->as.fn.params);
             ast_stmt_free(e->as.fn.body);
             break;
-        case EXPR_LEN:   // ← missing, falls to default: break
-    ast_expr_free(e->as.introspect.operand);
-    break;
-case EXPR_CAST:  // ← missing, falls to default: break
-    ast_expr_free(e->as.cast.operand);
-    break;
-        case EXPR_STATE_LIT: break;  /* uint8_t only — nothing to free */
+
         case EXPR_SPAWN:
             ast_expr_free(e->as.spawn_expr.call);
             break;
-        default: break;
+
+        default:
+            break;
     }
+
     free(e);
 }
 void ast_loop_bind_free(LoopBind *b) {
@@ -565,8 +635,9 @@ void ast_loop_bind_free(LoopBind *b) {
             break;
 
         case LOOP_BIND_TUPLE:
-            for (size_t i = 0; i < b->as.tuple.count; i++)
+            for (size_t i = 0; i < b->as.tuple.count; i++) {
                 ast_loop_bind_free(b->as.tuple.items[i]);
+            }
             free(b->as.tuple.items);
             break;
 
@@ -578,17 +649,24 @@ void ast_loop_bind_free(LoopBind *b) {
 }
 void ast_stmt_free(Stmt *s) {
     if (!s) return;
+
     switch (s->kind) {
         case STMT_BLOCK:
-            for (size_t i = 0; i < s->as.block.count; i++)
+            for (size_t i = 0; i < s->as.block.count; i++) {
                 ast_stmt_free(s->as.block.stmts[i]);
+            }
             free(s->as.block.stmts);
             break;
-        case STMT_EXPR:    ast_expr_free(s->as.expr.expr); break;
+
+        case STMT_EXPR:
+            ast_expr_free(s->as.expr.expr);
+            break;
+
         case STMT_VAR_DECL:
             xf_str_release(s->as.var_decl.name);
             ast_expr_free(s->as.var_decl.init);
             break;
+
         case STMT_FN_DECL:
             xf_str_release(s->as.fn_decl.name);
             for (size_t i = 0; i < s->as.fn_decl.param_count; i++) {
@@ -598,6 +676,7 @@ void ast_stmt_free(Stmt *s) {
             free(s->as.fn_decl.params);
             ast_stmt_free(s->as.fn_decl.body);
             break;
+
         case STMT_IF:
             for (size_t i = 0; i < s->as.if_stmt.count; i++) {
                 ast_expr_free(s->as.if_stmt.branches[i].cond);
@@ -606,68 +685,105 @@ void ast_stmt_free(Stmt *s) {
             free(s->as.if_stmt.branches);
             ast_stmt_free(s->as.if_stmt.els);
             break;
+
         case STMT_WHILE:
             ast_expr_free(s->as.while_stmt.cond);
             ast_stmt_free(s->as.while_stmt.body);
             break;
+
         case STMT_FOR:
             ast_loop_bind_free(s->as.for_stmt.iter_key);
             ast_loop_bind_free(s->as.for_stmt.iter_val);
             ast_expr_free(s->as.for_stmt.collection);
             ast_stmt_free(s->as.for_stmt.body);
             break;
+
         case STMT_WHILE_SHORT:
             ast_expr_free(s->as.while_short.cond);
             ast_stmt_free(s->as.while_short.body);
             break;
+
         case STMT_FOR_SHORT:
             ast_expr_free(s->as.for_short.collection);
             ast_loop_bind_free(s->as.for_short.iter_key);
             ast_loop_bind_free(s->as.for_short.iter_val);
             ast_stmt_free(s->as.for_short.body);
             break;
-        case STMT_RETURN: ast_expr_free(s->as.ret.value);      break;
+
+        case STMT_RETURN:
+            ast_expr_free(s->as.ret.value);
+            break;
+
+        case STMT_NEXT:
+        case STMT_EXIT:
+        case STMT_BREAK:
+        case STMT_OUTFMT:
+            break;
+
         case STMT_PRINT:
-            for (size_t i = 0; i < s->as.print.count; i++)
+            for (size_t i = 0; i < s->as.print.count; i++) {
                 ast_expr_free(s->as.print.args[i]);
+            }
             free(s->as.print.args);
             ast_expr_free(s->as.print.redirect);
             break;
+
         case STMT_PRINTF:
-            for (size_t i = 0; i < s->as.printf_stmt.count; i++)
+            for (size_t i = 0; i < s->as.printf_stmt.count; i++) {
                 ast_expr_free(s->as.printf_stmt.args[i]);
+            }
             free(s->as.printf_stmt.args);
             ast_expr_free(s->as.printf_stmt.redirect);
             break;
-        case STMT_OUTFMT: break;
-        case STMT_IMPORT: xf_str_release(s->as.import.path);   break;
-        case STMT_DELETE: ast_expr_free(s->as.delete.target);   break;
-        case STMT_SPAWN:  ast_expr_free(s->as.spawn.call);      break;
-        case STMT_JOIN:   ast_expr_free(s->as.join.handle);     break;
+
+        case STMT_IMPORT:
+            xf_str_release(s->as.import.path);
+            break;
+
+        case STMT_DELETE:
+            ast_expr_free(s->as.delete.target);
+            break;
+
+        case STMT_SPAWN:
+            ast_expr_free(s->as.spawn.call);
+            break;
+
+        case STMT_JOIN:
+            ast_expr_free(s->as.join.handle);
+            break;
+
         case STMT_SUBST:
             xf_str_release(s->as.subst.pattern);
             xf_str_release(s->as.subst.replacement);
             ast_expr_free(s->as.subst.target);
             break;
+
         case STMT_TRANS:
             xf_str_release(s->as.trans.from);
             xf_str_release(s->as.trans.to);
             ast_expr_free(s->as.trans.target);
             break;
-        default: break;
+
+        default:
+            break;
     }
+
     free(s);
 }
-
 void ast_top_free(TopLevel *t) {
     if (!t) return;
+
     switch (t->kind) {
         case TOP_BEGIN:
-        case TOP_END:  ast_stmt_free(t->as.begin_end.body); break;
+        case TOP_END:
+            ast_stmt_free(t->as.begin_end.body);
+            break;
+
         case TOP_RULE:
             ast_expr_free(t->as.rule.pattern);
             ast_stmt_free(t->as.rule.body);
             break;
+
         case TOP_FN:
             xf_str_release(t->as.fn.name);
             for (size_t i = 0; i < t->as.fn.param_count; i++) {
@@ -677,11 +793,17 @@ void ast_top_free(TopLevel *t) {
             free(t->as.fn.params);
             ast_stmt_free(t->as.fn.body);
             break;
-        case TOP_STMT: ast_stmt_free(t->as.stmt.stmt); break;
+
+        case TOP_STMT:
+            ast_stmt_free(t->as.stmt.stmt);
+            break;
+
+        default:
+            break;
     }
+
     free(t);
 }
-
 
 /* ============================================================
  * Debug printer
