@@ -22,9 +22,9 @@ XF is a statically-typed, stream-processing scripting language inspired by AWK, 
 14. [Import](#import)
 15. [Core Module Reference](#core-module-reference)
 16. [Built-in Functions](#built-in-functions)
-17. [Small Examples (15–20)](#small-examples)
-18. [Algorithms (5–10)](#algorithms)
-19. [Larger Examples (5–10)](#larger-examples)
+17. [Small Examples](#small-examples)
+18. [Algorithms](#algorithms)
+19. [Larger Examples](#larger-examples)
 
 ---
 
@@ -36,7 +36,7 @@ XF processes input line by line (like AWK) or can run entirely in `BEGIN`/`END` 
 - **State system** — every value carries a lifecycle state (`OK`, `ERR`, `NAV`, `NULL`, `VOID`, `UNDEF`)
 - **Stream processing** — `BEGIN { }`, pattern-action rules, `END { }` over input records
 - **Threading** — `spawn`/`join` for parallel work
-- **Core library** — `core.math`, `core.str`, `core.regex`, `core.format`, `core.os`, `core.ds`
+- **Core library** — `core.math`, `core.str`, `core.regex`, `core.format`, `core.generics`, `core.os`, `core.edit`, `core.ds`, `core.process`, `core.img`
 - **Import** — load other `.xf` files
 
 ---
@@ -63,6 +63,7 @@ Run with:
 ```bash
 xf -f hello.xf
 xf -f sum_csv.xf data.csv
+xf -r script.xf          # run BEGIN block only (no input)
 ```
 
 ---
@@ -114,16 +115,18 @@ END {
 
 ### Type Properties
 
-Every value exposes three read-only properties:
+Every value exposes three read-only properties that return **strings**:
 
 ```xf
 str s = "hello"
-print s.type    # 2  (XF_TYPE_STR)
-print s.state   # 0  (XF_STATE_OK)
+print s.type    # "str"
+print s.state   # "OK"
 print s.len     # 5
 ```
 
-Type numeric codes: `void=0`, `num=1`, `str=2`, `map=3`, `set=4`, `arr=5`, `fn=6`, `tuple=9`
+`.type` values: `"void"`, `"num"`, `"str"`, `"map"`, `"set"`, `"arr"`, `"fn"`, `"tuple"`
+
+`.state` values: `"OK"`, `"ERR"`, `"VOID"`, `"NULL"`, `"NAV"`, `"UNDEF"`
 
 ### Type Casting
 
@@ -140,28 +143,29 @@ print (x ?? 0)          # recover with ??
 
 Every value carries a **state** alongside its data. State takes priority over type in all operations.
 
-| State   | Code | Meaning                                                 |
-|---------|------|---------------------------------------------------------|
-| `OK`    | 0    | Value is valid and usable                               |
-| `ERR`   | 1    | Value carries a fault (e.g. division by zero)           |
-| `VOID`  | 2    | No return expected; value was discarded                 |
-| `NULL`  | 3    | No return expected; none was given                      |
-| `NAV`   | 4    | Return expected, but nothing was returned               |
-| `UNDEF` | 5    | Variable declared but not yet assigned                  |
+| State   | Keyword  | Meaning                                                 |
+|---------|----------|---------------------------------------------------------|
+| `OK`    | `OK`     | Value is valid and usable                               |
+| `ERR`   | `ERR`    | Value carries a fault (e.g. division by zero)           |
+| `VOID`  | `VOID`   | No return expected; value was discarded                 |
+| `NULL`  | `NULL`   | Explicit null; no value was given                       |
+| `NAV`   | `NAV`    | Return expected, but nothing was returned               |
+| `UNDEF` | `UNDEF`  | Variable declared but not yet assigned                  |
 
-States propagate through arithmetic and expressions — if one operand is `ERR`, the result is `ERR`. Use `??` (null coalescing) to recover:
+States propagate through arithmetic and expressions — if one operand is `ERR` or `NAV`, the result inherits that state. Use `??` (null coalescing) to recover:
 
 ```xf
 num bad = 1 / 0         # ERR
 num ok  = bad ?? 0      # 0  — recovered
 ```
 
-Check state explicitly:
+Check state explicitly by comparing the string returned by `.state`:
 
 ```xf
 num x = some_fn()
-if (x.state == 1) { print "error occurred" }
-if (x.state == 4) { print "NAV — function returned nothing" }
+if (x.state == "ERR")  { print "error occurred" }
+if (x.state == "NAV")  { print "NAV — function returned nothing" }
+if (x.state == "OK")   { print "all good:", x }
 ```
 
 ---
@@ -182,8 +186,8 @@ tuple point = (3.0, 4.0)
 Declared but not assigned:
 
 ```xf
-num x          # state is UNDEF until assigned
-x = 42         # now OK
+num x          # state is "UNDEF" until assigned
+x = 42         # now "OK"
 ```
 
 ### Walrus Operator `:=`
@@ -205,14 +209,6 @@ num age
 name, age = t
 print name    # alice
 print age     # 30
-```
-
-### Multi-Assignment
-
-```xf
-num a = 5
-num b = 3
-a, b = b, a      # swap — not yet supported; use temp var
 ```
 
 ---
@@ -240,6 +236,8 @@ x <=> y   # spaceship: -1, 0, or 1
 x && y    x || y    !x
 ```
 
+Both `&&` and `||` short-circuit.
+
 ### String Concatenation
 
 ```xf
@@ -254,9 +252,10 @@ str s = "hello world"
 print s ~ /world/       # 1 (match)
 print s !~ /xyz/        # 1 (no match)
 print s ~ /WORLD/i      # 1 (case-insensitive)
+print s ~ /^hello$/m    # multiline flag
 ```
 
-Regex flags: `i` (case-insensitive), `m` (multiline), `g` (global), `x` (extended)
+Regex flags: `i` (case-insensitive), `m` (multiline)
 
 ### Null Coalescing
 
@@ -271,10 +270,17 @@ print (a ?? b ?? c ?? 0)      # chain
 num max = a > b ? a : b
 ```
 
-### Pipe Function
+### Pipe
 
 ```xf
-arr result = data |> transform |> filter
+str result = "hello" |> core.str.upper |> core.str.trim
+```
+
+### Spread
+
+```xf
+arr a = [1, 2, 3]
+arr b = [0, ...a, 4]    # [0, 1, 2, 3, 4]
 ```
 
 ### Spaceship
@@ -283,6 +289,14 @@ arr result = data |> transform |> filter
 print (1 <=> 2)        # -1
 print ("a" <=> "b")    # -1
 print (2 <=> 2)        # 0
+```
+
+### In
+
+```xf
+print (2 in [1, 2, 3])           # 1
+print ("key" in {"key": "val"})  # 1
+print ("lo" in "hello")          # 1
 ```
 
 ---
@@ -311,13 +325,6 @@ while (i < 10) {
 }
 ```
 
-### Shorthand While (`<>`)
-
-```xf
-num n = 5
-n > 0 <> { print n; n -= 1 }
-```
-
 ### For
 
 ```xf
@@ -334,7 +341,7 @@ for ((i, x) in arr) {
 }
 ```
 
-Iterating maps:
+Iterating maps (key-value):
 
 ```xf
 for ((k, v) in mymap) {
@@ -342,7 +349,7 @@ for ((k, v) in mymap) {
 }
 ```
 
-### Shorthand For (`[]>`)
+### Shorthand For (`collection[iter] > body`)
 
 ```xf
 arr items = [10, 20, 30]
@@ -355,20 +362,24 @@ items[i, x] > print i, x
 items[x] > {
     print "item:", x
 }
+
+# Maps
+mymap[k, v] > print k, v
 ```
 
 ### Break / Next / Exit
 
 ```xf
 while (true) {
-    if (done) break
+    if (done) { break }
 }
 
-NR > 0 {
-    if ($1 == "skip") next   # skip to next record
+for (x in data) {
+    if (x == "skip") { next }
+    print x
 }
 
-if (error) exit(1)           # exit with code
+if (error) { exit(1) }
 ```
 
 ---
@@ -404,8 +415,12 @@ print power(3, 3)   # 27
 ### Anonymous Functions
 
 ```xf
-fn square = fn(num x) { return x * x }
+num fn square = fn(num x) { return x * x }
 print square(5)     # 25
+
+# Inline
+num fn apply(fn f, num v) { return f(v) }
+print apply(fn(num n) { return n * 2 }, 7)    # 14
 ```
 
 ### Recursion
@@ -429,11 +444,11 @@ arr a = [1, 2, 3]
 a[0]           # 1
 a[2] = 99      # set
 push(a, 4)     # append
-pop(a)         # remove last
-shift(a)       # remove first
+pop(a)         # remove and return last
+shift(a)       # remove and return first
 unshift(a, 0)  # prepend
 a.len          # length
-delete a[1]    # remove by index
+delete a[1]    # remove element by index
 ```
 
 ### Maps
@@ -445,16 +460,17 @@ m["city"] = "NYC"     # add key
 delete m["age"]       # remove key
 has(m, "name")        # 1
 keys(m)               # arr of keys
-values(m)             # arr of values
+remove(m, "age")      # remove key (alternative to delete)
 ```
 
 ### Sets
 
 ```xf
 set colors = {"red", "green", "blue"}
-push(colors, "yellow")     # add
+push(colors, "yellow")     # add element
 has(colors, "red")         # 1
-remove(colors, "green")    # remove
+remove(colors, "green")    # remove element
+colors.len                 # 3
 ```
 
 ### Tuples
@@ -553,7 +569,7 @@ num fn worker(num id) {
     return sum + id
 }
 
-# Spawn returns a thread handle (num)
+# spawn returns a thread handle (num)
 num tid1 = spawn worker(1)
 num tid2 = spawn worker(2)
 
@@ -566,12 +582,6 @@ print r1, r2
 join tid1
 ```
 
-Set the maximum concurrent jobs before spawning:
-
-```xf
-# In the embedding API: xf_set_max_jobs(xf, 8)
-```
-
 ---
 
 ## Import
@@ -582,7 +592,6 @@ import "mathlib.xf"
 # All top-level functions and variables from mathlib.xf
 # are now available in the current script.
 print clamp(150, 0, 100)    # 100
-print PI                    # 3.14159...
 
 # Double import of the same path is a no-op.
 import "mathlib.xf"
@@ -595,108 +604,320 @@ import "mathlib.xf"
 ### `core.math`
 
 ```xf
+# Trig
 core.math.sin(x)      core.math.cos(x)     core.math.tan(x)
 core.math.asin(x)     core.math.acos(x)    core.math.atan(x)
-core.math.atan2(y,x)
-core.math.sqrt(x)     core.math.pow(x,y)   core.math.exp(x)
+core.math.atan2(y, x)
+
+# Exponential / logarithm
+core.math.sqrt(x)     core.math.pow(x, y)  core.math.exp(x)
+core.math.ln(x)       # natural log; ERR if x <= 0
 core.math.log(x)      core.math.log2(x)    core.math.log10(x)
+
+# Rounding
 core.math.abs(x)      core.math.floor(x)   core.math.ceil(x)
-core.math.round(x)    core.math.int(x)
-core.math.min(a,b)    core.math.max(a,b)   core.math.clamp(v,lo,hi)
+core.math.round(x)    core.math.int(x)     # truncate toward zero
+
+# Utility
+core.math.min(a, b)   core.math.max(a, b)  core.math.clamp(v, lo, hi)
 core.math.rand()      core.math.srand(seed)
-core.math.PI          core.math.E          core.math.INF
+
+# Constants
+core.math.pi      # 3.14159265358979...
+core.math.e       # 2.71828182845905...
+core.math.i       # imaginary unit (complex 0+1i)
+core.math.INF     # positive infinity
+core.math.NAN     # not-a-number
 ```
+
+> **Note:** constants `pi` and `e` are lowercase; `INF` and `NAN` are uppercase.
+
+---
 
 ### `core.str`
 
 ```xf
-core.str.len(s)
-core.str.upper(s)       core.str.lower(s)
-core.str.trim(s)        core.str.ltrim(s)    core.str.rtrim(s)
-core.str.substr(s,start,len)
-core.str.index(s,sub)
-core.str.contains(s,sub)
-core.str.starts_with(s,prefix)
-core.str.ends_with(s,suffix)
-core.str.replace(s,old,new)
-core.str.replace_all(s,old,new)
-core.str.repeat(s,n)
-core.str.reverse(s)
-core.str.split(s,sep)
-core.str.join(arr,sep)
-core.str.concat(...)    # variadic
-core.str.sprintf(fmt, ...)
+core.str.len(s)                          # → num
+core.str.upper(s)                        # → str
+core.str.lower(s)                        # → str
+core.str.capitalize(s)                   # → str  (first char upper, rest lower)
+core.str.trim(s)                         # → str  (strip both ends)
+core.str.ltrim(s)                        # → str  (strip left)
+core.str.rtrim(s)                        # → str  (strip right)
+core.str.substr(s, start)               # → str
+core.str.substr(s, start, len)          # → str
+core.str.index(s, sub)                  # → num  (-1 if not found)
+core.str.index(s, /regex/)              # → num  (-1 if not found)
+core.str.contains(s, sub)              # → num (1/0)
+core.str.contains(s, /regex/)         # → num (1/0)
+core.str.starts_with(s, prefix)        # → num (1/0)
+core.str.ends_with(s, suffix)          # → num (1/0)
+core.str.replace(s, old, new)          # → str  (first match)
+core.str.replace(s, /regex/, new)      # → str  (first match)
+core.str.replace_all(s, old, new)      # → str  (all matches)
+core.str.replace_all(s, /regex/, new)  # → str  (all matches)
+core.str.repeat(s, n)                  # → str
+core.str.reverse(s)                    # → str
+core.str.sprintf(fmt, ...)             # → str  (printf-style)
+core.str.concat(...)                   # → str  (variadic)
+core.str.comp(a, b)                    # → num  (-1, 0, 1)
 ```
+
+> **Note:** `split` and `join` are in `core.generics`, not `core.str`.
+
+---
 
 ### `core.regex`
 
 ```xf
 core.regex.test(str, pattern)              # → num (1/0)
-core.regex.test(str, pattern, flags)
-core.regex.match(str, pattern)             # → map {match, index, groups}
+core.regex.test(str, pattern, flags)       # flags: "i", "m", "im"
+core.regex.match(str, pattern)             # → map {match, index, groups[]}
+core.regex.match(str, pattern, flags)
 core.regex.groups(str, pattern)            # → arr of capture strings
-core.regex.search(str, pattern)            # → arr of all match maps
-core.regex.replace(str, pattern, rep)      # first match
-core.regex.replace_all(str, pattern, rep)  # all matches
+core.regex.search(str, pattern)            # → arr of match maps (all matches)
+core.regex.search(str, pattern, flags)
+core.regex.replace(str, pattern, rep)      # → str  (first match, \1 backrefs)
+core.regex.replace_all(str, pattern, rep)  # → str  (all matches)
 core.regex.split(str, pattern)             # → arr
+core.regex.split(str, pattern, n)          # → arr  (limit to n parts)
 ```
+
+Pattern may be a string or a regex literal (`/pattern/flags`). When using a regex literal, the literal's own flags take precedence.
+
+---
 
 ### `core.format`
 
 ```xf
-core.format.format(template, ...)          # named/positional placeholders
-core.format.pad_left(s, width)
+# String layout
+core.format.pad_left(s, width)             # right-align, space-padded
+core.format.pad_left(s, width, fill)       # right-align, custom fill char
 core.format.pad_right(s, width)
+core.format.pad_right(s, width, fill)
 core.format.pad_center(s, width)
-core.format.pad_left(s, width, fill)
-core.format.truncate(s, max_len)
+core.format.pad_center(s, width, fill)
+core.format.truncate(s, max_len)           # appends "..."
 core.format.truncate(s, max_len, ellipsis)
 core.format.wrap(s, width)                 # → arr of lines
-core.format.indent(s, n)
+core.format.indent(s, n)                   # prepend n spaces to each line
 core.format.indent(s, n, char)
-core.format.dedent(s)
-core.format.comma(n)                       # 1,234,567
-core.format.comma(n, decimals)
-core.format.fixed(n, decimals)             # 3.14
-core.format.sci(n)                         # 1.23e+04
-core.format.hex(n)                         # 0xff
-core.format.bin(n)                         # 0b1010
-core.format.percent(n, decimals)           # 42.5%
-core.format.duration(seconds)             # "1h 2m 3s"
-core.format.bytes(n)                       # "1.50 KB"
-core.format.json(value)                    # → str
-core.format.from_json(str)                 # → xf value
-core.format.csv_row(arr)
+core.format.dedent(s)                      # remove common leading indent
+
+# Template formatting
+core.format.format(template, ...)          # {}, {0}, {name} placeholders
+                                           # {{}} escapes to literal {}
+
+# Number formatters
+core.format.fixed(n, decimals)             # "3.14"
+core.format.comma(n)                       # "1,234,567"
+core.format.comma(n, decimals)             # "1,234.56"
+core.format.sci(n)                         # "1.23e+04"
+core.format.sci(n, decimals)
+core.format.hex(n)                         # "ff"  (no prefix)
+core.format.bin(n)                         # "1010"  (no prefix)
+core.format.percent(n, decimals)           # "42.5%"
+core.format.duration(seconds)             # "1h 2m 3s", "1d 1h 0m 5s"
+core.format.bytes(n)                       # "1.50 KB", "3.00 MB"
+
+# Structured data
+core.format.json(value)                    # → str (serialize any value)
+core.format.from_json(str)                 # → xf value (parse JSON)
+core.format.csv_row(arr)                   # → str (RFC 4180, auto-quotes)
 core.format.csv_row(arr, sep)
-core.format.tsv_row(arr)
-core.format.table(arr_of_maps)
+core.format.tsv_row(arr)                   # → str (tab-separated)
+core.format.table(arr_of_maps)             # → str (ASCII box table)
 core.format.table(arr_of_maps, col_order)
 ```
+
+---
+
+### `core.generics`
+
+`core.generics` provides polymorphic operations that work across multiple types.
+
+```xf
+# join — works on arr, map, set, str, num
+core.generics.join(coll, sep)        # → str
+
+# split — works on str (by separator) or arr/map (into n chunks)
+core.generics.split(str, sep)        # → arr of substrings
+core.generics.split(str, /regex/)    # → arr of substrings
+core.generics.split(arr, n)          # → arr of n sub-arrays
+core.generics.split(map, n)          # → arr of n sub-maps
+
+# strip — removes NAV/NULL elements; trims whitespace from strings
+core.generics.strip(arr)             # → arr (NAV/NULL removed, strs trimmed)
+core.generics.strip(arr, chars)      # → arr (trim custom chars from strings)
+core.generics.strip(map)             # → map (string values trimmed)
+core.generics.strip(map, chars)
+core.generics.strip(str)             # → str (trim whitespace)
+core.generics.strip(str, chars)      # → str (trim custom chars)
+core.generics.strip(set)             # → set (keys trimmed)
+
+# contains — works on str, arr, map, set
+core.generics.contains(coll, needle) # → num (1/0)
+
+# length — works on str, arr, map, set, tuple, num
+core.generics.length(coll)           # → num
+```
+
+---
 
 ### `core.os`
 
 ```xf
-core.os.run(cmd)        # execute shell command, return stdout as str
-core.os.lines(path)     # read file → arr of lines
-core.os.env(name)       # read environment variable
-core.os.time()          # unix timestamp as num
+# Time
+core.os.time()                       # → num  (Unix timestamp)
+
+# Environment
+core.os.env(name)                    # → str  (NAV if not set)
+
+# File I/O
+core.os.read(path)                   # → str  (NAV on error)
+core.os.write(path, data)            # → num  (1 on success)
+core.os.append(path, data)           # → num  (1 on success)
+core.os.lines(path)                  # → arr of lines
+
+# Streaming file I/O
+core.os.open(path)                   # → num  (handle; NAV on error)
+core.os.chunk(handle, n)             # → arr  (next n lines)
+core.os.tell(handle)                 # → num  (lines read so far)
+core.os.close(handle)                # → void
+
+# Shell
+core.os.run(cmd)                     # → str  (stdout, trimmed)
+core.os.run_lines(cmd)               # → arr  (stdout split by line)
+core.os.execute(cmd)                 # → num  (exit code)
+core.os.exec(cmd)                    # alias for execute
+
+# Process
+core.os.exit(code)                   # terminate interpreter
+core.os.free()                       # no-op (reserved)
 ```
+
+---
+
+### `core.edit`
+
+File editing and filesystem operations.
+
+```xf
+# Read / write
+core.edit.read(path)                        # → str  (full file contents)
+core.edit.write(path, data)                 # → num  (1 on success)
+
+# Line-level editing (all re-write the file in place)
+core.edit.lines(path)                       # → arr of lines
+core.edit.line_count(path)                  # → num
+core.edit.insert(path, line_idx, text)      # → num  (insert before line_idx)
+core.edit.delete_lines(path, from, to)      # → num  (delete line range inclusive)
+core.edit.replace_line(path, line_idx, text)# → num
+core.edit.replace_all(path, pattern, repl)  # → num  (str or /regex/ pattern)
+
+# Search
+core.edit.find(path, pattern)               # → arr of {line, nr, file} maps
+
+# Filesystem
+core.edit.exists(path)                      # → num  (1/0)
+core.edit.stat(path)                        # → map  {size, mtime, atime, isdir}
+core.edit.mkdir(path)                       # → num  (1 on success)
+core.edit.rename(src, dst)                  # → num  (1 on success)
+core.edit.unlink(path)                      # → num  (1 on success)
+core.edit.glob(pattern)                     # → arr of matching paths
+core.edit.diff(path_a, path_b)              # → arr of diff lines
+```
+
+---
 
 ### `core.ds`
 
+Dataset operations. A dataset (`ds`) is an `arr` of `map`s, where each map is a row.
+
 ```xf
-core.ds.column(ds, col)               # extract column as arr
-core.ds.row(ds, idx)                  # get row by index → map
-core.ds.filter(ds, col, val)          # filter rows → arr
-core.ds.sort(ds, col)                 # sort ascending → arr
-core.ds.sort(ds, col, "desc")         # sort descending → arr
-core.ds.agg(ds, group_col, val_col)   # group-by aggregate → map
-core.ds.index(ds, col)                # build index map col→row
-core.ds.keys(ds)                      # column names → arr
-core.ds.transpose(ds)                 # rows↔cols
-core.ds.merge(ds1, ds2)               # join on shared key
-core.ds.merge(ds1, ds2, key)          # join on explicit key
-core.ds.flatten(arr_of_arr)           # flatten nested arrays
+# Access
+core.ds.row(ds, idx)                         # → map  (NAV if out of bounds)
+core.ds.column(ds, col)                      # → arr  (column values)
+
+# Sorting
+core.ds.sort(ds, col)                        # → arr  (ascending)
+core.ds.sort(ds, col, "desc")               # → arr  (descending)
+
+# Filtering
+core.ds.filter(ds, fn(map row) { … })       # → arr  (fn predicate)
+core.ds.filter(ds, col)                     # → arr  (rows where col is non-empty)
+core.ds.filter(ds, col, val)                # → arr  (rows where col == val)
+
+# Aggregation
+core.ds.agg(ds, group_col)                  # → map  {group → arr of rows}
+core.ds.agg(ds, group_col, val_col)         # → map  {group → arr of values}
+core.ds.agg_parallel(ds, group_col, val_col, n_threads)
+                                            # → map  (parallel version)
+
+# Indexing / lookup
+core.ds.index(ds, col)                      # → map  {val → first matching row}
+core.ds.keys(ds)                            # → arr  (unique column names)
+core.ds.values(ds)                          # → arr  (per-row arrays of values)
+core.ds.values(ds, col)                     # → arr  (alias for column)
+
+# Shape transformations
+core.ds.transpose(ds)                       # → map  {col → arr of values}
+core.ds.expand(col_map)                     # → arr  (invert transpose)
+core.ds.merge(ds1, ds2)                     # → arr  (union / concatenation)
+core.ds.merge(ds1, ds2, key)               # → arr  (left join on key)
+core.ds.flatten(arr_of_arr)                 # → arr  (flatten nested arrays/chunks)
+
+# Parallel stream processing
+core.ds.stream(sources, fn(arr chunk) { … })
+# sources: arr of strings (file paths) or arr of arrays
+# → arr  (results collected from all sources, run in parallel)
+```
+
+---
+
+### `core.process`
+
+Low-level parallel data processing primitives.
+
+```xf
+# Split an array into n roughly equal chunks
+core.process.split(arr, n)            # → arr of sub-arrays
+
+# Build a worker descriptor map
+core.process.worker(fn, data_arr)     # → map {fn, data}
+
+# Run an array of workers in parallel, return results
+core.process.run(arr_of_workers)      # → arr of results
+
+# Transform each row map with a function
+core.process.assign(arr_of_maps)                     # → arr (passthrough)
+core.process.assign(arr_of_maps, fn(map row) { … })  # → arr (transformed)
+
+# Build an inverted index: {col → {val → arr of row ids}}
+core.process.index(arr_of_maps)                      # → map
+core.process.index(arr_of_maps, fn(map row) { … })   # → map (with transform)
+core.process.index(arr_of_maps, fn, offset)          # → map (with id offset)
+```
+
+---
+
+### `core.img`
+
+Image vectorization for machine-learning pipelines.
+
+```xf
+# Load an image file → structured pixel map
+# mode: "rgb" (default), "gray"/"grey", "rgba"
+# normalized: 1 → pixel values in [0.0, 1.0]; 0 → [0, 255]
+core.img.vectorize(path)
+core.img.vectorize(path, mode)
+core.img.vectorize(path, mode, normalized)
+# → map {width, height, channels, mode, normalized, data}
+#   data is arr of (r, g, b) tuples (always RGB, 3 channels)
+
+# Write pixel map back to a PNG file
+core.img.unvectorize(img_map, path)
+# → num (1 on success, NAV on failure)
 ```
 
 ---
@@ -712,21 +933,14 @@ pop(arr)                # remove and return last element
 shift(arr)              # remove and return first element
 unshift(arr, val)       # prepend to arr
 remove(coll, key)       # remove by index (arr) or key (map/set)
-has(coll, key)          # → 1 if key exists
+has(coll, key)          # → 1 if key/element exists
 keys(map)               # → arr of string keys
-values(map)             # → arr of values
 
 # I/O
-read(path_or_cmd)       # read file or pipe → str
-lines(path_or_cmd)      # read file or pipe → arr of lines
-write(path, str)        # write str to file
-append(path, str)       # append str to file
-close(path)             # flush and close cached file handle
-flush()                 # flush all open output handles
-flush(path)             # flush one handle
+print expr, ...         # print to stdout (space-separated, newline)
+printf fmt, ...         # printf-style formatted output
 
 # System
-system(cmd)             # run shell command, return exit code
 exit(code)              # exit with code
 
 # Threading
@@ -743,10 +957,10 @@ join(handle)            # block on thread handle, return result
 BEGIN {
     num i = 1
     while (i <= 30) {
-        if (i % 15 == 0) { print "FizzBuzz" }
-        elif (i % 3 == 0) { print "Fizz" }
-        elif (i % 5 == 0) { print "Buzz" }
-        else { print i }
+        if (i % 15 == 0)      { print "FizzBuzz" }
+        elif (i % 3 == 0)     { print "Fizz" }
+        elif (i % 5 == 0)     { print "Buzz" }
+        else                  { print i }
         i += 1
     }
 }
@@ -787,19 +1001,9 @@ BEGIN {
 ### 4 — Reverse a String
 
 ```xf
-str fn reverse_str(str s) {
-    str out = ""
-    num i = s.len - 1
-    while (i >= 0) {
-        out ..= core.str.substr(s, i, 1)
-        i -= 1
-    }
-    return out
-}
-
 BEGIN {
-    print reverse_str("hello")     # olleh
-    print reverse_str("racecar")   # racecar
+    print core.str.reverse("hello")     # olleh
+    print core.str.reverse("racecar")   # racecar
 }
 ```
 
@@ -817,14 +1021,14 @@ END { print "words:", words }
 ```xf
 BEGIN {
     num a = 1 / 0           # ERR
-    print a.state           # 1
+    print a.state           # "ERR"
 
     num b = a + 10          # ERR propagates
-    print b.state           # 1
+    print b.state           # "ERR"
 
     num c = b ?? 99         # recover
     print c                 # 99
-    print c.state           # 0 (OK)
+    print c.state           # "OK"
 }
 ```
 
@@ -834,7 +1038,7 @@ BEGIN {
 map freq = {}
 
 {
-    for (w in core.str.split($0, " ")) {
+    for (w in core.generics.split($0, " ")) {
         if (!has(freq, w)) { freq[w] = 0 }
         freq[w] += 1
     }
@@ -845,21 +1049,19 @@ END {
 }
 ```
 
-### 8 — Sorting an Array
+### 8 — Sorting an Array (Bubble Sort)
 
 ```xf
 BEGIN {
     arr nums = [5, 2, 8, 1, 9, 3]
-
-    # Bubble sort
     num n = nums.len
     num i = 0
     while (i < n - 1) {
         num j = 0
         while (j < n - i - 1) {
             if (nums[j] > nums[j + 1]) {
-                num tmp = nums[j]
-                nums[j] = nums[j + 1]
+                num tmp  = nums[j]
+                nums[j]  = nums[j + 1]
                 nums[j + 1] = tmp
             }
             j += 1
@@ -875,7 +1077,7 @@ BEGIN {
 ```xf
 BEGIN {
     str text = "Call us at 555-1234 or 800-9876"
-    arr matches = core.regex.search(text, "[0-9]{3}-[0-9]{4}")
+    arr matches = core.regex.search(text, /[0-9]{3}-[0-9]{4}/)
     matches[m] > print m["match"]
     # 555-1234
     # 800-9876
@@ -959,7 +1161,7 @@ BEGIN {
 ```xf
 str fn find_first(arr items, str prefix) {
     items[x] > {
-        if ((m := core.regex.match(x, "^" .. prefix)) != NAV) {
+        if ((m := core.regex.match(x, "^" .. prefix)).state == "OK") {
             return m["match"]
         }
     }
@@ -1009,11 +1211,10 @@ BEGIN {
 
 ```xf
 FS = ","
-
 arr headers = []
 
 NR == 1 {
-    headers = core.str.split($0, ",")
+    headers = core.generics.split($0, ",")
     next
 }
 
@@ -1061,7 +1262,7 @@ num sumsq = 0
 
 NR > 1 {
     num val = num($2)
-    if (val.state == 0) {
+    if (val.state == "OK") {
         n += 1
         sum += val
         sumsq += val * val
@@ -1083,18 +1284,18 @@ END {
 ```xf
 FS = ","
 
-num errors = 0
+num errors   = 0
 num warnings = 0
 num ok_count = 0
 
-$3 ~ /ERROR/   { errors += 1;   print "ERR:", $2 }
-$3 ~ /WARN/    { warnings += 1; print "WRN:", $2 }
-$3 ~ /OK/      { ok_count += 1 }
+$3 ~ /ERROR/ { errors   += 1; print "ERR:", $2 }
+$3 ~ /WARN/  { warnings += 1; print "WRN:", $2 }
+$3 ~ /OK/    { ok_count += 1 }
 
 END {
-    print "Errors:", errors
+    print "Errors:",   errors
     print "Warnings:", warnings
-    print "OK:", ok_count
+    print "OK:",       ok_count
 }
 ```
 
@@ -1140,18 +1341,15 @@ arr fn quicksort(arr a) {
         else               { push(greater, a[i]) }
         i += 1
     }
-    arr sorted_less = quicksort(less)
-    arr sorted_greater = quicksort(greater)
     arr result = []
-    sorted_less[x]    > push(result, x)
+    quicksort(less)[x]    > push(result, x)
     push(result, pivot)
-    sorted_greater[x] > push(result, x)
+    quicksort(greater)[x] > push(result, x)
     return result
 }
 
 BEGIN {
-    arr data = [3, 6, 8, 10, 1, 2, 1]
-    arr sorted = quicksort(data)
+    arr sorted = quicksort([3, 6, 8, 10, 1, 2, 1])
     sorted[x] > print x    # 1 1 2 3 6 8 10
 }
 ```
@@ -1159,16 +1357,12 @@ BEGIN {
 ### Merge Sort
 
 ```xf
-arr fn merge(arr left, arr right) {
+arr fn merge_sorted(arr left, arr right) {
     arr result = []
-    num i = 0
-    num j = 0
+    num i = 0; num j = 0
     while (i < left.len && j < right.len) {
-        if (left[i] <= right[j]) {
-            push(result, left[i]); i += 1
-        } else {
-            push(result, right[j]); j += 1
-        }
+        if (left[i] <= right[j]) { push(result, left[i]);  i += 1 }
+        else                     { push(result, right[j]); j += 1 }
     }
     while (i < left.len)  { push(result, left[i]);  i += 1 }
     while (j < right.len) { push(result, right[j]); j += 1 }
@@ -1178,12 +1372,11 @@ arr fn merge(arr left, arr right) {
 arr fn mergesort(arr a) {
     if (a.len <= 1) { return a }
     num mid = core.math.int(a.len / 2)
-    arr left = []
-    arr right = []
+    arr left = []; arr right = []
     num i = 0
-    while (i < mid)      { push(left,  a[i]); i += 1 }
-    while (i < a.len)    { push(right, a[i]); i += 1 }
-    return merge(mergesort(left), mergesort(right))
+    while (i < mid)   { push(left,  a[i]); i += 1 }
+    while (i < a.len) { push(right, a[i]); i += 1 }
+    return merge_sorted(mergesort(left), mergesort(right))
 }
 
 BEGIN {
@@ -1199,16 +1392,12 @@ arr fn sieve(num limit) {
     arr is_prime = []
     num i = 0
     while (i <= limit) { push(is_prime, 1); i += 1 }
-    is_prime[0] = 0
-    is_prime[1] = 0
+    is_prime[0] = 0; is_prime[1] = 0
     num p = 2
     while (p * p <= limit) {
         if (is_prime[p]) {
             num mult = p * p
-            while (mult <= limit) {
-                is_prime[mult] = 0
-                mult += p
-            }
+            while (mult <= limit) { is_prime[mult] = 0; mult += p }
         }
         p += 1
     }
@@ -1222,8 +1411,7 @@ arr fn sieve(num limit) {
 }
 
 BEGIN {
-    arr primes = sieve(50)
-    primes[p] > print p
+    sieve(50)[p] > print p
     # 2 3 5 7 11 13 17 19 23 29 31 37 41 43 47
 }
 ```
@@ -1232,23 +1420,14 @@ BEGIN {
 
 ```xf
 num fn gcd(num a, num b) {
-    while (b != 0) {
-        num t = b
-        b = a % b
-        a = t
-    }
+    while (b != 0) { num t = b; b = a % b; a = t }
     return a
 }
-
-num fn lcm(num a, num b) {
-    return (a / gcd(a, b)) * b
-}
+num fn lcm(num a, num b) { return (a / gcd(a, b)) * b }
 
 BEGIN {
-    print gcd(48, 18)       # 6
-    print gcd(100, 75)      # 25
-    print lcm(4, 6)         # 12
-    print lcm(12, 18)       # 36
+    print gcd(48, 18)    # 6
+    print lcm(4, 6)      # 12
 }
 ```
 
@@ -1262,34 +1441,26 @@ void fn hanoi(num n, str from, str to, str aux) {
     hanoi(n - 1, aux, to, from)
 }
 
-BEGIN {
-    hanoi(3, "A", "C", "B")
-}
+BEGIN { hanoi(3, "A", "C", "B") }
 ```
 
 ### Matrix Multiplication
 
 ```xf
-# Represent matrix as arr-of-arr
 arr fn mat_mul(arr A, arr B, num n) {
     arr C = []
     num i = 0
     while (i < n) {
-        arr row = []
-        num j = 0
+        arr row = []; num j = 0
         while (j < n) { push(row, 0); j += 1 }
-        push(C, row)
-        i += 1
+        push(C, row); i += 1
     }
     i = 0
     while (i < n) {
         num j = 0
         while (j < n) {
             num k = 0
-            while (k < n) {
-                C[i][j] += A[i][k] * B[k][j]
-                k += 1
-            }
+            while (k < n) { C[i][j] += A[i][k] * B[k][j]; k += 1 }
             j += 1
         }
         i += 1
@@ -1312,13 +1483,9 @@ BEGIN {
 
 ### 1 — CSV Analytics Pipeline
 
-Compute per-group statistics from a CSV file.
-
 ```xf
 # analytics.xf
 # Input: CSV with columns id,name,department,salary
-# Usage: xf -f analytics.xf employees.csv
-
 FS = ","
 
 map dept_total = {}
@@ -1326,18 +1493,17 @@ map dept_count = {}
 num grand_total = 0
 num grand_n = 0
 
-NR == 1 { next }   # skip header
+NR == 1 { next }
 
 NR > 1 {
-    str dept = $3
+    str dept   = $3
     num salary = num($4)
-    if (salary.state != 0) { next }
+    if (salary.state != "OK") { next }
 
     if (!has(dept_total, dept)) {
         dept_total[dept] = 0
         dept_count[dept] = 0
     }
-
     dept_total[dept] += salary
     dept_count[dept] += 1
     grand_total += salary
@@ -1356,25 +1522,19 @@ END {
 }
 ```
 
----
-
 ### 2 — Parallel Word Count
-
-Count word frequencies across a large file using threads.
 
 ```xf
 # parallel_wc.xf
 BEGIN {
-    str path = ARGV[1] ?? "input.txt"
-    arr file_lines = lines(path)
+    arr file_lines = core.os.lines(core.os.env("ARGV1") ?? "input.txt")
     num n = file_lines.len
-    num chunk = core.math.int(n / 4)
+    num chunk_size = core.math.int(n / 4)
 
-    num fn count_chunk(arr chunk_lines) {
+    str fn count_chunk(arr chunk_lines) {
         map freq = {}
         chunk_lines[line] > {
-            arr words = core.str.split(line, " ")
-            words[w] > {
+            core.generics.split(line, " ")[w] > {
                 str word = core.str.lower(core.str.trim(w))
                 if (word.len > 0) {
                     if (!has(freq, word)) { freq[word] = 0 }
@@ -1385,22 +1545,20 @@ BEGIN {
         return core.format.json(freq)
     }
 
-    # Split file into 4 chunks and count in parallel
-    arr t = []
+    arr tids = []
     num i = 0
     while (i < 4) {
-        num from = i * chunk
-        num to   = (i == 3) ? n : from + chunk
         arr slice = []
+        num from = i * chunk_size
+        num to   = (i == 3) ? n : from + chunk_size
         num j = from
         while (j < to) { push(slice, file_lines[j]); j += 1 }
-        push(t, spawn count_chunk(slice))
+        push(tids, spawn count_chunk(slice))
         i += 1
     }
 
-    # Merge results
     map total = {}
-    t[tid] > {
+    tids[tid] > {
         map partial = core.format.from_json(join(tid))
         partial[word, count] > {
             if (!has(total, word)) { total[word] = 0 }
@@ -1408,61 +1566,51 @@ BEGIN {
         }
     }
 
-    # Print top 20 words
+    # Top 20 words via ds.sort
     arr pairs = []
-    total[w, c] > push(pairs, (c, w))
-    arr sorted = core.ds.sort(pairs, 0, "desc")
+    total[w, c] > push(pairs, {"word": w, "count": c})
+    arr sorted = core.ds.sort(pairs, "count", "desc")
     num k = 0
     while (k < 20 && k < sorted.len) {
-        print sorted[k][1], sorted[k][0]
+        print sorted[k]["count"], sorted[k]["word"]
         k += 1
     }
 }
 ```
 
----
-
 ### 3 — Log Analyzer
-
-Parse nginx/apache access logs, report error rates and top paths.
 
 ```xf
 # log_analyzer.xf
-# Input: Combined log format
-# 127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /apache_pb.gif HTTP/1.0" 200 2326
+# Input: Combined log format access log
 
 map status_count = {}
-map path_count = {}
+map path_count   = {}
 num total = 0
 
 {
-    # Extract status code and path from log line
-    map m = core.regex.match($0, "\"(GET|POST|PUT|DELETE) ([^ ]+) HTTP/[0-9.]+ ([0-9]{3})")
-    if (m.state != 0) { next }
+    map m = core.regex.match($0,
+        /"(GET|POST|PUT|DELETE) ([^ ]+) HTTP\/[0-9.]+"\s+([0-9]{3})/)
+    if (m.state != "OK") { next }
 
-    arr groups = m["groups"]
-    str method = groups[0]
-    str path   = groups[1]
-    str status = groups[2]
+    str method = m["groups"][0]
+    str path   = m["groups"][1]
+    str status = m["groups"][2]
 
     total += 1
     if (!has(status_count, status)) { status_count[status] = 0 }
     status_count[status] += 1
-
-    if (!has(path_count, path)) { path_count[path] = 0 }
+    if (!has(path_count, path))   { path_count[path] = 0 }
     path_count[path] += 1
 }
 
 END {
     print "Total requests:", total
-    print ""
-    print "Status codes:"
+    print "\nStatus codes:"
     status_count[code, n] > {
         print " ", code, n, core.format.percent(n / total, 1)
     }
-
-    print ""
-    print "Top 10 paths:"
+    print "\nTop 10 paths:"
     arr by_hits = []
     path_count[p, c] > push(by_hits, {"path": p, "hits": c})
     arr sorted = core.ds.sort(by_hits, "hits", "desc")
@@ -1474,23 +1622,14 @@ END {
 }
 ```
 
----
-
 ### 4 — Simple Key-Value Store
-
-An in-memory KV store exposed through a REPL-like interface.
 
 ```xf
 # kv_store.xf
 BEGIN {
     map store = {}
-    map ttl   = {}
-    num now   = core.os.time()
 
-    void fn kv_set(str key, str val) {
-        store[key] = val
-        print "OK"
-    }
+    void fn kv_set(str key, str val) { store[key] = val; print "OK" }
 
     str fn kv_get(str key) {
         if (!has(store, key)) { return "(nil)" }
@@ -1498,77 +1637,48 @@ BEGIN {
     }
 
     void fn kv_del(str key) {
-        if (has(store, key)) {
-            delete store[key]
-            print "1"
-        } else {
-            print "0"
-        }
+        if (has(store, key)) { delete store[key]; print "1" }
+        else                  { print "0" }
     }
 
-    void fn kv_keys() {
-        store[k, v] > print k
-    }
-
-    arr cmds = lines("commands.txt")
-    cmds[line] > {
-        arr parts = core.str.split(core.str.trim(line), " ")
+    core.os.lines("commands.txt")[line] > {
+        arr parts = core.generics.split(core.str.trim(line), " ")
         str cmd = parts[0]
-        if (cmd == "SET") {
-            kv_set(parts[1], parts[2])
-        } elif (cmd == "GET") {
-            print kv_get(parts[1])
-        } elif (cmd == "DEL") {
-            kv_del(parts[1])
-        } elif (cmd == "KEYS") {
-            kv_keys()
-        }
+        if      (cmd == "SET")  { kv_set(parts[1], parts[2]) }
+        elif    (cmd == "GET")  { print kv_get(parts[1]) }
+        elif    (cmd == "DEL")  { kv_del(parts[1]) }
+        elif    (cmd == "KEYS") { store[k, v] > print k }
     }
 }
 ```
 
----
-
 ### 5 — Parallel Statistics on CSV
-
-Compute mean and standard deviation in parallel across a large CSV.
 
 ```xf
 # parallel_stats.xf
 FS = ","
-
-str fn compute_stats(arr rows) {
-    num n = 0
-    num sum = 0
-    num sumsq = 0
-    rows[row] > {
-        num val = num(row[2])
-        if (val.state == 0) {
-            n += 1
-            sum += val
-            sumsq += val * val
-        }
-    }
-    if (n == 0) { return core.format.json({"n": 0}) }
-    num avg = sum / n
-    num variance = (sumsq / n) - (avg * avg)
-    num stddev = core.math.sqrt(variance)
-    return core.format.json({
-        "n":      n,
-        "sum":    sum,
-        "sumsq":  sumsq,
-        "mean":   avg,
-        "stddev": stddev
-    })
-}
-
 arr all_rows = []
 
-NR > 1 {
-    push(all_rows, [$1, $2, $3])
-}
+NR > 1 { push(all_rows, [$1, $2, $3]) }
 
 END {
+    str fn compute_stats(arr rows) {
+        num n = 0; num sum = 0; num sumsq = 0
+        rows[row] > {
+            num val = num(row[2])
+            if (val.state == "OK") {
+                n += 1; sum += val; sumsq += val * val
+            }
+        }
+        if (n == 0) { return core.format.json({"n": 0}) }
+        num avg = sum / n
+        num variance = (sumsq / n) - (avg * avg)
+        return core.format.json({
+            "n": n, "sum": sum, "sumsq": sumsq,
+            "mean": avg, "stddev": core.math.sqrt(variance)
+        })
+    }
+
     num chunk_size = core.math.int(all_rows.len / 4)
     arr tids = []
     num i = 0
@@ -1578,15 +1688,11 @@ END {
         num to   = i == 3 ? all_rows.len : from + chunk_size
         num j = from
         while (j < to) { push(chunk, all_rows[j]); j += 1 }
-        num tid = spawn compute_stats(chunk)
-        push(tids, tid)
+        push(tids, spawn compute_stats(chunk))
         i += 1
     }
 
-    num total_n = 0
-    num total_sum = 0
-    num total_sumsq = 0
-
+    num total_n = 0; num total_sum = 0; num total_sumsq = 0
     tids[tid] > {
         map r = core.format.from_json(join(tid))
         if (r["n"] > 0) {
@@ -1597,20 +1703,14 @@ END {
     }
 
     num mean = total_sum / total_n
-    num variance = (total_sumsq / total_n) - (mean * mean)
-    num stddev = core.math.sqrt(variance)
-
+    num stddev = core.math.sqrt((total_sumsq / total_n) - (mean * mean))
     print "n:     ", total_n
     print "mean:  ", core.format.fixed(mean, 6)
     print "stddev:", core.format.fixed(stddev, 6)
 }
 ```
 
----
-
-### 6 — Sentiment Analyzer (Stream + Aggregation)
-
-Classify rows from a dataset by rating and compute per-group metrics — the same workload used in the IMDB validation run.
+### 6 — Sentiment Analyzer
 
 ```xf
 # sentiment.xf
@@ -1622,14 +1722,12 @@ map label_count = {}
 map label_score = {}
 num total = 0
 
-NR == 1 { next }    # header
+NR == 1 { next }
 
 NR > 1 {
     str label  = $3
     num rating = num($4)
-
-    if (rating.state != 0) { next }
-
+    if (rating.state != "OK") { next }
     total += 1
     if (!has(label_count, label)) {
         label_count[label] = 0
@@ -1642,26 +1740,19 @@ NR > 1 {
 END {
     print "label", "count", "avg_rating"
     label_count[lbl, cnt] > {
-        num avg = label_score[lbl] / cnt
-        print lbl, cnt, core.format.fixed(avg, 4)
+        print lbl, cnt, core.format.fixed(label_score[lbl] / cnt, 4)
     }
     print "total records:", total
 }
 ```
 
----
-
 ### 7 — Data Transformation Pipeline
-
-Read JSON, transform records, output CSV.
 
 ```xf
 # transform.xf
 BEGIN {
-    str raw = read("data.json")
-    arr records = core.format.from_json(raw)
+    arr records = core.format.from_json(core.os.read("data.json"))
 
-    # Normalize and tag each record
     arr out = []
     records[rec] > {
         str name  = core.str.upper(core.str.trim(rec["name"] ?? ""))
@@ -1673,10 +1764,8 @@ BEGIN {
         push(out, {"name": name, "score": score, "grade": grade})
     }
 
-    # Sort by score descending
     arr sorted = core.ds.sort(out, "score", "desc")
 
-    # Print as CSV
     print "name,score,grade"
     sorted[row] > {
         print core.format.csv_row([row["name"], str(row["score"]), row["grade"]])

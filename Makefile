@@ -2,7 +2,7 @@ CC      = /opt/homebrew/opt/llvm/bin/clang
 AR      = /opt/homebrew/opt/llvm/bin/llvm-ar
 
 WARNFLAGS    = -Wall -Wextra -Wpedantic -std=c11
-DEBUGFLAGS   = -O0 -g -fsanitize=address,leak,undefined -fno-omit-frame-pointer
+DEBUGFLAGS   = -O1 -g -fsanitize=address,leak,undefined -fno-omit-frame-pointer
 THREADFLAGS  = -O0 -g -fsanitize=thread -fno-omit-frame-pointer
 RELEASEFLAGS = -O3
 
@@ -74,9 +74,9 @@ ifeq ($(MODE),debug)
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 	LSAN_OPTIONS=verbosity=1:report_objects=1 \
 	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
-	$(BIN) -r tests/torture.xf
+	$(BIN) -r tests/chaos_test.xf
 else
-	$(BIN) -r tests/torture.xf
+	$(BIN) -r tests/chaos_test.xf
 endif
 
 $(LIBXF): $(RUNTIME_OBJS)
