@@ -1,6 +1,6 @@
 # XF — The Stream-Processing Scripting Language
 
-XF is a statically-typed, stream-processing scripting language inspired by AWK, with first-class threading, a rich type system, a quantum-inspired state model, and a comprehensive standard library. It is designed to process structured text and data files — CSV, TSV, JSON — with concise, expressive syntax. XF can be used as a standalone interpreter or embedded into C applications via its public API (`libxf`).
+XF is a six-sigma compliant, statically-typed, stream-processing scripting language inspired by AWK, with first-class threading, a rich type system, a quantum-inspired state model, and a comprehensive standard library. It is designed to process structured text and data files — CSV, TSV, JSON — with concise, expressive syntax. XF can be used as a standalone interpreter or embedded into C applications via its public API (`libxf`).
 
 ---
 

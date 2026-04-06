@@ -62,7 +62,7 @@ static xf_Value cf_truncate(xf_Value *args, size_t argc) {
     const char *s; size_t slen; double wd;
     if (!arg_str(args, argc, 0, &s, &slen)) return propagate(args, argc);
     if (!arg_num(args, argc, 1, &wd))       return propagate(args, argc);
-    size_t width = (size_t)(wd < 0 ? 0 : wd);
+    size_t width = (size_t)(wd < 0 ? 0 : wd+1);
     const char *ellipsis = "..."; size_t elen = 3;
     if (argc >= 3 && args[2].state == XF_STATE_OK) {
         const char *tmp; size_t tlen;
@@ -171,6 +171,12 @@ static xf_Value cf_format(xf_Value *args, size_t argc) {
     do { if (pos+(n)+2>=cap){cap=cap*2+(n)+2;buf=realloc(buf,cap);} } while(0)
 
     for (const char *p = tmpl; *p; p++) {
+        if(*p == '}' && p[1]=='}'){
+            CF_ENSURE(1);
+            buf[pos++]='}';
+            p++;
+            continue;
+        }
         if (*p != '{') { CF_ENSURE(1); buf[pos++] = *p; continue; }
         p++;
         if (*p == '{') { CF_ENSURE(1); buf[pos++] = '{'; continue; }
@@ -417,7 +423,7 @@ static xf_Value jp_parse_string(JsonParser *jp) {
 }
 
 static xf_Value jp_parse(JsonParser *jp, int depth) {
-    if (depth > 64) return xf_val_nav(XF_TYPE_VOID);
+    if (depth > 255) return xf_val_nav(XF_TYPE_VOID);
     jp_skip_ws(jp);
     if (jp->p >= jp->end) return xf_val_nav(XF_TYPE_VOID);
     char c = *jp->p;
@@ -434,7 +440,6 @@ static xf_Value jp_parse(JsonParser *jp, int depth) {
         if (jp->p<jp->end && *jp->p==']') { jp->p++; goto arr_done; }
         while (jp->p<jp->end) {
             xf_arr_push(a, jp_parse(jp,depth+1)); jp_skip_ws(jp);
-        xf_arr_release(a);
             if (jp->p>=jp->end) break;
             if (*jp->p==']'){jp->p++;break;} if (*jp->p==',') jp->p++;
         }

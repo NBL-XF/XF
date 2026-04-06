@@ -110,7 +110,7 @@ static xf_Value cr_build_match_map(const char *subject, regmatch_t *pm,
         if (pm[g].rm_so >= 0) {
             xf_Str *gs = xf_str_new(subject + pm[g].rm_so,
                                      (size_t)(pm[g].rm_eo - pm[g].rm_so));
-              
+
             xf_arr_push(grp_arr, xf_val_ok_str(gs)); xf_str_release(gs);
         } else {
             xf_Str *empty = xf_str_from_cstr("");
@@ -285,20 +285,22 @@ static xf_Value cr_groups(xf_Value *args, size_t argc) {
 
 /* ── cr_test ──────────────────────────────────────────────────── */
 
+
 static xf_Value cr_test(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value sv = xf_coerce_str(args[0]);
-    if (sv.state != XF_STATE_OK) xf_value_release(sv); return xf_val_ok_num(0);
+    if (sv.state != XF_STATE_OK) { xf_value_release(sv); return xf_val_ok_num(0); }
     const char *pat; int cflags;
     if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) return xf_val_ok_num(0);
-
     regex_t re; char errmsg[256];
     if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
         return xf_val_ok_num(0);
     int rc = regexec(&re, sv.data.str->data, 0, NULL, 0);
     regfree(&re);
-    return xf_val_ok_num(rc == 0 ? 1.0 : 0.0);
+    return xf_val_ok_num(rc == 0 ? 0.0 : 1.0);
 }
+
+
 /* ── cr_split ─────────────────────────────────────────────────── */
 static xf_Value cr_split(xf_Value *args, size_t argc) {
     NEED(2);

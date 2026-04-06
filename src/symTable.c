@@ -76,7 +76,7 @@ Scope *sym_pop(SymTable *st) {
     Scope *popped = st->current;
     st->current = popped->parent;
     st->depth--;
-    
+
     return popped;
 }
 /* ============================================================
@@ -188,7 +188,7 @@ bool sym_assign(SymTable *st, xf_Str *name, xf_Value val) {
     if (!sym) {
         st->had_error = true;
         snprintf(st->err_msg, sizeof(st->err_msg),
-                 "assignment to undeclared variable '%s'", name->data);
+                 "assignment to undetermined variable '%s'", name->data);
         return false;
     }
     if (sym->is_const && sym->is_defined) {

@@ -1734,13 +1734,18 @@ xf_Value interp_eval_expr(Interp *it, Expr *e) {
         xf_Value *items = n ? malloc(sizeof(xf_Value) * n) : NULL;
 
         for (size_t i = 0; i < n; i++) {
-            xf_Value v = interp_eval_expr(it, e->as.tuple_lit.items[i]);
-            if (v.state != XF_STATE_OK) {
-                for (size_t j = 0; j < i; j++) xf_value_release(items[j]);
-                free(items);
-                return v;
-            }
-            items[i] = v;
+        xf_Value v = interp_eval_expr(it, e->as.tuple_lit.items[i]);
+bool is_valid = (v.state == XF_STATE_OK   ||
+                 v.state == XF_STATE_TRUE  ||
+                 v.state == XF_STATE_FALSE ||
+                 v.state == XF_STATE_UNDET ||
+                 v.state == XF_STATE_NULL);
+if (!is_valid) {
+    for (size_t j = 0; j < i; j++) xf_value_release(items[j]);
+    free(items);
+    return v;
+}
+items[i] = v;
         }
 
         xf_tuple_t *t = xf_tuple_new(items, n);

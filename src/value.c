@@ -515,9 +515,6 @@ void xf_map_release(xf_map_t *m) {
             xf_str_release(m->slots[i].key);
             xf_value_release(m->slots[i].val);
         }
-        if (m->slots[i].val.state != XF_STATE_UNDEF) {
-    xf_value_release(m->slots[i].val);
-}
     }
     free(m->slots);
     free(m->order);

@@ -1222,7 +1222,7 @@ Stmt *parse_fn_decl(Parser *p) {
 scope_free(sym_pop(p->syms));
     Stmt *s = ast_fn_decl(ret, name, params, pc, body, loc);
     xf_str_release(name);
-    
+
     return s;
 }
 
@@ -1575,11 +1575,6 @@ Program *parse(Lexer *lex, SymTable *syms) {
         if (item) ast_program_push(prog, item);
         if (p.had_error && p.panic_mode) synchronize(&p);
     }
-
-    fprintf(stderr, "PARSE END depth=%zu current=%p global=%p\n",
-            p.syms ? p.syms->depth : 0,
-            p.syms ? (void *)p.syms->current : NULL,
-            p.syms ? (void *)p.syms->global  : NULL);
 
     return prog;
 }
