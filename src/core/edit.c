@@ -223,7 +223,7 @@ static xf_Value ce_stat(xf_Value *args, size_t argc) {
     const char *path; size_t plen; if (!arg_str(args,argc,0,&path,&plen)) return propagate(args,argc);
     struct stat st; if (stat(path,&st)!=0) return xf_val_nav(XF_TYPE_MAP);
     xf_map_t *m=xf_map_new();
-    xf_Str *k; 
+    xf_Str *k;
     k=xf_str_from_cstr("size");  xf_map_set(m,k,xf_val_ok_num((double)st.st_size));  xf_str_release(k);
     k=xf_str_from_cstr("mtime"); xf_map_set(m,k,xf_val_ok_num((double)st.st_mtime)); xf_str_release(k);
     k=xf_str_from_cstr("atime"); xf_map_set(m,k,xf_val_ok_num((double)st.st_atime)); xf_str_release(k);
@@ -283,8 +283,15 @@ static xf_Value ce_find(xf_Value *args, size_t argc) {
             xf_map_t *m=xf_map_new();
             xf_Str *kl=xf_str_from_cstr("line"),*kn=xf_str_from_cstr("nr"),*kf=xf_str_from_cstr("file");
             xf_Str *vs=xf_str_from_cstr(lines[i]),*vp=xf_str_from_cstr(path);
-            xf_map_set(m,kl,xf_val_ok_str(vs)); xf_map_set(m,kn,xf_val_ok_num((double)(i+1)));
-            xf_map_set(m,kf,xf_val_ok_str(vp));
+            xf_Value tmp_vs = xf_val_ok_str(vs);
+xf_map_set(m, kl, tmp_vs);
+xf_value_release(tmp_vs);
+
+xf_map_set(m, kn, xf_val_ok_num((double)(i + 1)));
+
+xf_Value tmp_vp = xf_val_ok_str(vp);
+xf_map_set(m, kf, tmp_vp);
+xf_value_release(tmp_vp);
             xf_str_release(kl);xf_str_release(kn);xf_str_release(kf);
             xf_str_release(vs);xf_str_release(vp);
             xf_Value rv=xf_val_ok_map(m); xf_arr_push(out,rv); xf_map_release(m);

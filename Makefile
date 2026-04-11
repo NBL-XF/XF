@@ -1,3 +1,5 @@
+.DEFAULT_GOAL := all
+
 CC      = /opt/homebrew/opt/llvm/bin/clang
 AR      = /opt/homebrew/opt/llvm/bin/llvm-ar
 
@@ -41,22 +43,22 @@ CORE_SRCS = \
 	src/core/format.c \
 	src/core/ds.c \
 	src/core/edit.c \
-	src/core/process.c\
+	src/core/process.c \
 	src/core/img.c
 
 RUNTIME_SRCS = \
 	src/ast.c \
 	src/interp.c \
-	src/gc.c \
 	src/lexer.c \
 	src/parser.c \
 	src/symTable.c \
 	src/value.c \
 	src/vm.c \
-	lib/driver.c \
-	lib/api.c \
 	$(CORE_SRCS)
 
+# Optional later:
+# lib/driver.c
+# lib/api.c
 CLI_SRCS = \
 	src/main.c \
 	src/repl.c
@@ -64,19 +66,19 @@ CLI_SRCS = \
 RUNTIME_OBJS = $(patsubst %.c,$(OBJDIR)/%.o,$(RUNTIME_SRCS))
 CLI_OBJS     = $(patsubst %.c,$(OBJDIR)/%.o,$(CLI_SRCS))
 
-# All core objects depend on the shared header
-$(patsubst %.c,$(OBJDIR)/%.o,$(CORE_SRCS)): src/core/internal.h
-
 all: $(LIBXF) $(BIN)
+
+# Keep this only if the header really exists and is required
+$(patsubst %.c,$(OBJDIR)/%.o,$(CORE_SRCS)): src/core/internal.h
 
 run: $(BIN)
 ifeq ($(MODE),debug)
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 	LSAN_OPTIONS=verbosity=1:report_objects=1 \
 	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
-	$(BIN) -r tests/chaos_test.xf
+	$(BIN) -r tests/torture.xf
 else
-	$(BIN) -r tests/chaos_test.xf
+	$(BIN) -r tests/torture.xf
 endif
 
 $(LIBXF): $(RUNTIME_OBJS)
@@ -107,6 +109,6 @@ uninstall:
 	rm -rf $(DESTDIR)$(PREFIX)/include/xf
 
 clean:
-	rm -rf obj/* bin/* lib/*.a
+	rm -rf obj/* bin/* lib/*
 
 .PHONY: all run install uninstall clean

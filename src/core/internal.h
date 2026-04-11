@@ -24,16 +24,32 @@
 #define FN(name, ret, impl) \
     xf_module_set(m, name, xf_val_native_fn(name, ret, impl))
 
-#define MATH1(c_fn) \
-    do { double x; \
-         if (!arg_num(args, argc, 0, &x)) return propagate(args, argc); \
-         return xf_val_ok_num(c_fn(x)); } while(0)
+#define MATH1(fn) do {                     \
+    xf_Value v = xf_coerce_num(args[0]);  \
+    if (v.state != XF_STATE_OK) return v; \
+    double x = v.data.num;                \
+    xf_value_release(v);                  \
+    return xf_val_ok_num(fn(x));          \
+} while (0)
 
-#define MATH2(c_fn) \
-    do { double x, y; \
-         if (!arg_num(args, argc, 0, &x)) return propagate(args, argc); \
-         if (!arg_num(args, argc, 1, &y)) return propagate(args, argc); \
-         return xf_val_ok_num(c_fn(x, y)); } while(0)
+
+#define MATH2(fn) do {                          \
+    xf_Value a = xf_coerce_num(args[0]);       \
+    xf_Value b = xf_coerce_num(args[1]);       \
+    if (a.state != XF_STATE_OK) {              \
+        xf_value_release(b);                   \
+        return a;                              \
+    }                                          \
+    if (b.state != XF_STATE_OK) {              \
+        xf_value_release(a);                   \
+        return b;                              \
+    }                                          \
+    double x = a.data.num;                     \
+    double y = b.data.num;                     \
+    xf_value_release(a);                       \
+    xf_value_release(b);                       \
+    return xf_val_ok_num(fn(x, y));            \
+} while (0)
 
 #define CR_MAX_GROUPS 32
 

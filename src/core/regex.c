@@ -99,8 +99,11 @@ static xf_Value cr_build_match_map(const char *subject, regmatch_t *pm,
     xf_Str *mkey   = xf_str_from_cstr("match");
     xf_Str *mval_s = xf_str_new(subject + pm[0].rm_so,
                                   (size_t)(pm[0].rm_eo - pm[0].rm_so));
-    xf_map_set(m, mkey, xf_val_ok_str(mval_s));
-    xf_str_release(mkey); xf_str_release(mval_s);
+                                  xf_Value tmp_str = xf_val_ok_str(mval_s);
+xf_map_set(m, mkey, tmp_str);
+xf_value_release(tmp_str);
+xf_str_release(mkey);
+xf_str_release(mval_s);
     xf_Str *ikey = xf_str_from_cstr("index");
     xf_map_set(m, ikey, xf_val_ok_num((double)pm[0].rm_so));
     xf_str_release(ikey);

@@ -531,7 +531,7 @@ static xf_Value cd_transpose(xf_Value *args, size_t argc) {
 static xf_Value cd_expand(xf_Value *args, size_t argc) {
     NEED(1);
     xf_Value src = args[0];
-    if (src.state != XF_STATE_OK) return src;
+    if (src.state != XF_STATE_OK) return xf_value_retain(src);
     if (src.type != XF_TYPE_MAP || !src.data.map) return xf_val_nav(XF_TYPE_ARR);
 
     xf_map_t *cols = src.data.map;

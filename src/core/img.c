@@ -33,7 +33,9 @@ static bool img_map_set_str(xf_map_t *m, const char *key, const char *s) {
         xf_str_release(sv);
         return false;
     }
-    xf_map_set(m, k, xf_val_ok_str(sv));
+    xf_Value tmp = xf_val_ok_str(sv);
+xf_map_set(m, k, tmp);
+xf_value_release(tmp);
     xf_str_release(k);
     xf_str_release(sv);
     return true;

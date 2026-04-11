@@ -1,1605 +1,2103 @@
+#include "../include/lexer.h"
 #include "../include/parser.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* ============================================================
- * Internal parser helpers
+ * Init
+ * ============================================================ */
+TopLevel *parse_fn_decl_top(Parser *p);
+TopLevel *parse_rule(Parser *p);
+TopLevel *parse_top_level(Parser *p);
+void parser_init(Parser *p, Lexer *lex, SymTable *syms) {
+    p->lex        = lex;
+    p->pos        = 0;
+    p->syms       = syms;
+    p->had_error  = false;
+    p->panic_mode = false;
+    memset(p->err_msg, 0, sizeof(p->err_msg));
+}
+
+/* ============================================================
+ * Token navigation
  * ============================================================ */
 
-static Token *cur(Parser *p) {
+Token *parser_current(Parser *p) {
     return &p->lex->tokens[p->pos];
 }
-static TokenKind cur_kind(Parser *p) { return cur(p)->kind; }
 
-static bool check(Parser *p, TokenKind k) { return cur_kind(p) == k; }
-static Token *peek_at(Parser *p, size_t offset) {
-    size_t idx = p->pos + offset;
-    if (idx >= p->lex->count) idx = p->lex->count - 1;
+Token *parser_previous(Parser *p) {
+    if (p->pos == 0) return NULL;
+    return &p->lex->tokens[p->pos - 1];
+}
+
+Token *parser_peek(Parser *p, size_t lookahead) {
+    size_t idx = p->pos + lookahead;
+    if (idx >= p->lex->count) {
+        return &p->lex->tokens[p->lex->count - 1];
+    }
     return &p->lex->tokens[idx];
 }
-static bool looks_like_shorthand_for(Parser *p) {
-    if (!check(p, TK_IDENT)) return false;
-    if (peek_at(p, 1)->kind != TK_LBRACKET) return false;
 
-    int depth = 0;
-    size_t i = 1;
+bool parser_is_at_end(Parser *p) {
+    return parser_current(p)->kind == TK_EOF;
+}
 
-    for (;;) {
-        TokenKind k = peek_at(p, i)->kind;
-        if (k == TK_EOF) return false;
-
-        if (k == TK_LBRACKET || k == TK_LPAREN) depth++;
-        else if (k == TK_RBRACKET || k == TK_RPAREN) depth--;
-
-        if (k == TK_RBRACKET && depth == 0) {
-            return peek_at(p, i + 1)->kind == TK_GT;
-        }
-
-        i++;
+Token *parser_advance(Parser *p) {
+    if (!parser_is_at_end(p)) {
+        p->pos++;
     }
-}
-static Token *advance(Parser *p) {
-    Token *t = cur(p);
-    if (t->kind != TK_EOF) p->pos++;
-    return t;
+    return parser_previous(p);
 }
 
-static bool match_tok(Parser *p, TokenKind k) {
-    if (!check(p, k)) return false;
-    advance(p);
+/* ============================================================
+ * Matching
+ * ============================================================ */
+
+bool parser_check(Parser *p, TokenKind kind) {
+    return parser_current(p)->kind == kind;
+}
+
+bool parser_match(Parser *p, TokenKind kind) {
+    if (!parser_check(p, kind)) return false;
+    parser_advance(p);
     return true;
 }
 
-static Token *expect(Parser *p, TokenKind k, const char *msg) {
-    if (check(p, k)) return advance(p);
-    p->had_error  = true;
-    p->err_loc    = cur(p)->loc;
-    snprintf(p->err_msg, sizeof(p->err_msg),
-             "%s — got '%s' at %s:%u:%u",
-             msg, xf_token_kind_name(cur_kind(p)),
-             cur(p)->loc.source, cur(p)->loc.line, cur(p)->loc.col);
-    return cur(p);
-}
-
-static void parser_warning(Parser *p, const char *msg) {
-    fprintf(stdout, "WARN: %s at %s:%u:%u\n",
-            msg, cur(p)->loc.source, cur(p)->loc.line, cur(p)->loc.col);
-}
-
-static void parser_error(Parser *p, const char *msg) {
-    if (p->panic_mode) return;
-    p->had_error  = true;
-    p->panic_mode = true;
-    p->err_loc    = cur(p)->loc;
-    snprintf(p->err_msg, sizeof(p->err_msg),
-             "%s at %s:%u:%u",
-             msg, cur(p)->loc.source, cur(p)->loc.line, cur(p)->loc.col);
-    fprintf(stdout, "ERR ──────────────────────────────────────────────\r\n");
-    fprintf(stdout, "  %s\r\n", p->err_msg);
-    fprintf(stdout, "──────────────────────────────────────────────\r\n");
-}
-
-/* synchronize after error — skip to next safe boundary */
-static void synchronize(Parser *p) {
-    p->panic_mode = false;
-    while (cur_kind(p) != TK_EOF) {
-        if (cur_kind(p) == TK_SEMICOLON) { advance(p); return; }
-        switch (cur_kind(p)) {
-            case TK_KW_FN:
-            case TK_KW_NUM: case TK_KW_STR: case TK_KW_MAP:
-            case TK_KW_SET: case TK_KW_ARR: case TK_KW_TUPLE:
-            case TK_KW_VOID: case TK_KW_BOOL: case TK_KW_IF: case TK_KW_WHILE:
-            case TK_KW_FOR: case TK_KW_BEGIN: case TK_KW_END:
-            case TK_KW_RETURN: case TK_KW_PRINT: case TK_LBRACE:
-                return;
-            default: advance(p); break;
+bool parser_match_any(Parser *p, const TokenKind *kinds, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        if (parser_check(p, kinds[i])) {
+            parser_advance(p);
+            return true;
         }
     }
+    return false;
 }
 
-static xf_Str *tok_to_str(Token *t) {
-    if (t->kind == TK_STR)
-        return xf_str_new(t->val.str.data, t->val.str.len);
-    return xf_str_new(t->lexeme, t->lexeme_len);
-}
-static bool loop_bind_starts(Parser *p) {
-    return check(p, TK_IDENT) || check(p, TK_LPAREN);
-}
+/* ============================================================
+ * Error handling
+ * ============================================================ */
 
-static LoopBind *parse_loop_bind(Parser *p) {
-    Loc loc = cur(p)->loc;
-
-    if (check(p, TK_IDENT)) {
-        Token *t = advance(p);
-        xf_Str *name = tok_to_str(t);
-        LoopBind *b = ast_loop_bind_name(name, loc);
-        xf_str_release(name);
-        return b;
+Token *parser_consume(Parser *p, TokenKind kind, const char *msg) {
+    if (parser_check(p, kind)) {
+        return parser_advance(p);
     }
 
-    if (match_tok(p, TK_LPAREN)) {
-        size_t cap = 4, count = 0;
-        LoopBind **items = malloc(sizeof(*items) * cap);
-
-        if (!loop_bind_starts(p)) {
-            parser_error(p, "expected loop binding");
-            free(items);
-            return NULL;
-        }
-
-        for (;;) {
-            if (count == cap) {
-                cap *= 2;
-                items = realloc(items, sizeof(*items) * cap);
-            }
-
-            LoopBind *item = parse_loop_bind(p);
-            if (!item) {
-                for (size_t i = 0; i < count; i++) ast_loop_bind_free(items[i]);
-                free(items);
-                return NULL;
-            }
-            items[count++] = item;
-
-            if (match_tok(p, TK_COMMA)) continue;
-            break;
-        }
-
-        expect(p, TK_RPAREN, "expected ')' after loop binding");
-        return ast_loop_bind_tuple(items, count, loc);
-    }
-
-    parser_error(p, "expected loop binding");
+    parser_error(p, parser_current(p), msg);
     return NULL;
 }
-/* true if current token is a type keyword */
-static bool is_type_kw(Parser *p) {
-    switch (cur_kind(p)) {
-        case TK_KW_NUM: case TK_KW_STR: case TK_KW_MAP:
-        case TK_KW_SET: case TK_KW_ARR: case TK_KW_TUPLE:
-        case TK_KW_FN:  case TK_KW_VOID: case TK_KW_BOOL: return true;
-        default: return false;
+
+void parser_error(Parser *p, Token *tok, const char *msg) {
+    if (p->panic_mode) return;
+
+    p->panic_mode = true;
+    p->had_error  = true;
+
+    snprintf(p->err_msg, sizeof(p->err_msg),
+             "%s at '%.*s'",
+             msg,
+             (int)tok->lexeme_len,
+             tok->lexeme ? tok->lexeme : "");
+
+    p->err_loc = tok->loc;
+
+    fprintf(stderr,
+            "Parse Error: %s\n"
+            "  --> %s:%u:%u\n",
+            p->err_msg,
+            tok->loc.source ? tok->loc.source : "<unknown>",
+            tok->loc.line,
+            tok->loc.col);
+}
+
+/* ============================================================
+ * Panic recovery
+ * ============================================================ */
+
+void parser_sync(Parser *p) {
+    p->panic_mode = false;
+
+    while (!parser_is_at_end(p)) {
+        if (parser_previous(p) &&
+            parser_previous(p)->kind == TK_SEMICOLON) {
+            return;
+        }
+
+        switch (parser_current(p)->kind) {
+            case TK_KW_FN:
+            case TK_KW_IF:
+            case TK_KW_FOR:
+            case TK_KW_WHILE:
+            case TK_KW_RETURN:
+            case TK_KW_PRINT:
+            case TK_KW_IMPORT:
+                return;
+
+            default:
+                break;
+        }
+
+        parser_advance(p);
     }
 }
 
-static bool is_expr_terminator_kind(TokenKind k) {
+/* ============================================================
+ * Primary expressions
+ * ============================================================ */
+static bool token_is_type_kw(TokenKind k) {
     switch (k) {
-        case TK_SEMICOLON:
-        case TK_NEWLINE:
-        case TK_EOF:
-        case TK_RBRACE:
-        case TK_RPAREN:
-        case TK_RBRACKET:
-        case TK_COMMA:
-        case TK_COLON:
+        case TK_KW_NUM:
+        case TK_KW_STR:
+        case TK_KW_MAP:
+        case TK_KW_SET:
+        case TK_KW_ARR:
+        case TK_KW_TUPLE:
+        case TK_KW_FN:
+        case TK_KW_VOID:
+        case TK_KW_BOOL:
             return true;
         default:
             return false;
     }
 }
+Expr *parse_primary(Parser *p) {
+    Token *tok = parser_current(p);
+    if (!tok) return NULL;
 
-static Expr *make_ident_cstr(const char *name, Loc loc) {
-    xf_Str *s = xf_str_from_cstr(name);
-    Expr *e = ast_ident(s, loc);
-    xf_str_release(s);
-    return e;
-}
+    switch (tok->kind) {
+        case TK_NUM:
+            parser_advance(p);
+            return parse_primary_num(p, tok);
 
-static Expr *make_member_cstr(Expr *obj, const char *field, Loc loc) {
-    xf_Str *s = xf_str_from_cstr(field);
-    Expr *e = ast_member(obj, s, loc);
-    xf_str_release(s);
-    return e;
-}
+        case TK_STR:
+            parser_advance(p);
+            return parse_primary_str(p, tok);
 
-static Expr *make_call_n(Expr *callee, Expr **args, size_t argc, Loc loc) {
-    return ast_call(callee, args, argc, loc);
-}
+        case TK_REGEX:
+            parser_advance(p);
+            return parse_primary_regex(p, tok);
 
-static Expr *make_builtin_call1(const char *name, Expr *a, Loc loc) {
-    Expr **args = malloc(sizeof(Expr *));
-    args[0] = a;
-    return make_call_n(make_ident_cstr(name, loc), args, 1, loc);
-}
+        case TK_IDENT:
+            parser_advance(p);
+            return parse_primary_ident(p, tok);
 
-static Expr *make_builtin_call2(const char *name, Expr *a, Expr *b, Loc loc) {
-    Expr **args = malloc(sizeof(Expr *) * 2);
-    args[0] = a;
-    args[1] = b;
-    return make_call_n(make_ident_cstr(name, loc), args, 2, loc);
-}
+        case TK_FIELD:
+            parser_advance(p);
+            return parse_primary_field(p, tok);
 
-static Expr *make_core_ds_call1(const char *name, Expr *a, Loc loc) {
-    Expr **args = malloc(sizeof(Expr *));
-    args[0] = a;
-    Expr *callee = make_member_cstr(make_member_cstr(make_ident_cstr("core", loc), "ds", loc), name, loc);
-    return make_call_n(callee, args, 1, loc);
-}
+        case TK_VAR_FILE:
+        case TK_VAR_MATCH:
+        case TK_VAR_CAPS:
+        case TK_VAR_ERR:
+        case TK_VAR_NR:
+        case TK_VAR_NF:
+        case TK_VAR_FNR:
+        case TK_VAR_FS:
+        case TK_VAR_RS:
+        case TK_VAR_OFS:
+        case TK_VAR_ORS:
+        case TK_VAR_OFMT:
+        case TK_KW_OK:
+        case TK_KW_ERR:
+        case TK_KW_NAV:
+        case TK_KW_NULL:
+        case TK_KW_VOID_S:
+        case TK_KW_UNDEF:
+        case TK_KW_UNDET:
+        case TK_KW_TRUE:
+        case TK_KW_FALSE:
+            parser_advance(p);
+            return parse_primary_keyword(p, tok);
 
-static Expr *make_core_ds_call2(const char *name, Expr *a, Expr *b, Loc loc) {
-    Expr **args = malloc(sizeof(Expr *) * 2);
-    args[0] = a;
-    args[1] = b;
-    Expr *callee = make_member_cstr(make_member_cstr(make_ident_cstr("core", loc), "ds", loc), name, loc);
-    return make_call_n(callee, args, 2, loc);
-}
+        case TK_LPAREN:
+            parser_advance(p);
+            return parse_primary_group(p);
+        case TK_LBRACE:
+            parser_advance(p);
+            return parse_primary_brace(p);
+        case TK_LBRACKET:
+            parser_advance(p);
+            return parse_primary_array(p);
 
-static Expr *clone_expr_min(const Expr *e) {
-    if (!e) return NULL;
-    switch (e->kind) {
-        case EXPR_IDENT:
-            return ast_ident(e->as.ident.name, e->loc);
-        case EXPR_FIELD:
-            return ast_field(e->as.field.index, e->loc);
-        case EXPR_MEMBER:
-            return ast_member(clone_expr_min(e->as.member.obj), e->as.member.field, e->loc);
-        case EXPR_SUBSCRIPT:
-            return ast_subscript(clone_expr_min(e->as.subscript.obj), clone_expr_min(e->as.subscript.key), e->loc);
-        case EXPR_NUM:
-            return ast_num(e->as.num, e->loc);
-        case EXPR_STR:
-            return ast_str(e->as.str.value, e->loc);
-        case EXPR_STATE_LIT:
-            return ast_state_lit(e->as.state_lit.state, e->loc);
         default:
+            parser_error(p, tok, "expected expression");
             return NULL;
     }
 }
 
-
-/* ============================================================
- * Type keyword → XF_TYPE_*
- * ============================================================ */
-
-uint8_t parse_type(Parser *p) {
-    switch (cur_kind(p)) {
-        case TK_KW_NUM:  advance(p); return XF_TYPE_NUM;
-        case TK_KW_STR:  advance(p); return XF_TYPE_STR;
-        case TK_KW_MAP:  advance(p); return XF_TYPE_MAP;
-        case TK_KW_SET:  advance(p); return XF_TYPE_SET;
-        case TK_KW_ARR:  advance(p); return XF_TYPE_ARR;
-        case TK_KW_TUPLE: advance(p); return XF_TYPE_TUPLE;
-        case TK_KW_FN:   advance(p); return XF_TYPE_FN;
-        case TK_KW_BOOL: advance(p); return XF_TYPE_BOOL;
-        case TK_KW_VOID: advance(p); return XF_TYPE_VOID;
-        default:
-            parser_error(p, "expected type keyword");
-            return XF_TYPE_VOID;
-    }
+Expr *parse_primary_num(Parser *p, Token *tok) {
+    (void)p;
+    if (!tok) return NULL;
+    return ast_num(tok->val.num, tok->loc);
 }
 
+Expr *parse_primary_str(Parser *p, Token *tok) {
+    (void)p;
+    if (!tok) return NULL;
 
-/* ============================================================
- * Parameter list:  (type name, type name = default, ...)
- * ============================================================ */
-static void free_param_array(Param *params, size_t count) {
-    if (!params) return;
-    for (size_t i = 0; i < count; i++) {
-        xf_str_release(params[i].name);
-        ast_expr_free(params[i].default_val);
-    }
-    free(params);
+    xf_Str *s = xf_str_new(tok->val.str.data, tok->val.str.len);
+    if (!s) return NULL;
+
+    Expr *e = ast_str(s, tok->loc);
+    xf_str_release(s);
+    return e;
 }
-Param *parse_paramlist(Parser *p, size_t *out_count) {
-    size_t cap = 4, count = 0;
-    Param *params = malloc(sizeof(Param) * cap);
-    if (!params) return NULL;
 
-    *out_count = 0;
+Expr *parse_primary_regex(Parser *p, Token *tok) {
+    (void)p;
+    if (!tok) return NULL;
 
-    if (!expect(p, TK_LPAREN, "expected '(' in parameter list")) {
-        free(params);
+    xf_Str *pat = xf_str_new(tok->val.re.pattern, tok->val.re.pattern_len);
+    if (!pat) return NULL;
+
+    Expr *e = ast_regex(pat, tok->val.re.flags, tok->loc);
+    xf_str_release(pat);
+    return e;
+}
+
+Expr *parse_primary_ident(Parser *p, Token *tok) {
+    (void)p;
+    if (!tok) return NULL;
+
+    xf_Str *name = xf_str_new(tok->lexeme, tok->lexeme_len);
+    if (!name) return NULL;
+
+    Expr *e = ast_ident(name, tok->loc);
+    xf_str_release(name);
+    return e;
+}
+
+Expr *parse_primary_field(Parser *p, Token *tok) {
+    (void)p;
+    if (!tok) return NULL;
+    return ast_field(tok->val.field_idx, tok->loc);
+}
+
+Expr *parse_primary_group(Parser *p) {
+    Loc loc = parser_previous(p) ? parser_previous(p)->loc : parser_current(p)->loc;
+
+    /* () => empty tuple */
+    if (parser_match(p, TK_RPAREN)) {
+        return ast_tuple_lit(NULL, 0, loc);
+    }
+
+    Expr *first = parse_expr(p);
+    if (!first) {
+        parser_consume(p, TK_RPAREN, "expected ')' after expression");
         return NULL;
     }
 
-    while (!check(p, TK_RPAREN) && !check(p, TK_EOF)) {
-        if (count >= cap) {
-            cap *= 2;
-            Param *tmp = realloc(params, sizeof(Param) * cap);
-            if (!tmp) {
-                free_param_array(params, count);
-                parser_error(p, "out of memory");
-                return NULL;
-            }
-            params = tmp;
-        }
-
-        Param pr = {0};
-        pr.loc  = cur(p)->loc;
-        pr.type = is_type_kw(p) ? parse_type(p) : XF_TYPE_VOID;
-
-        Token *name = expect(p, TK_IDENT, "expected parameter name");
-        if (!name || p->had_error) {
-            free_param_array(params, count);
-            return NULL;
-        }
-
-        pr.name = tok_to_str(name);
-
-        if (match_tok(p, TK_EQ)) {
-            pr.default_val = parse_expr(p);
-            if (p->had_error) {
-                xf_str_release(pr.name);
-                ast_expr_free(pr.default_val);
-                free_param_array(params, count);
-                return NULL;
-            }
-        }
-
-        params[count++] = pr;
-        if (!match_tok(p, TK_COMMA)) break;
+    /* (expr) => grouped expression */
+    if (parser_match(p, TK_RPAREN)) {
+        return first;
     }
 
-    if (!expect(p, TK_RPAREN, "expected ')' after parameter list") || p->had_error) {
-        free_param_array(params, count);
+    /* (a, b, c) => tuple literal */
+    if (!parser_match(p, TK_COMMA)) {
+        ast_expr_free(first);
+        parser_error(p, parser_current(p), "expected ')' or ',' after expression");
         return NULL;
     }
 
-    *out_count = count;
-    return params;
-}
-
-/* ============================================================
- * Argument list:  (expr, expr, ...)
- * ============================================================ */
-
-static void free_expr_array(Expr **items, size_t count) {
-    if (!items) return;
-    for (size_t i = 0; i < count; i++) {
-        if (items[i]) ast_expr_free(items[i]);
-    }
-    free(items);
-}
-
-Expr **parse_arglist(Parser *p, size_t *out_count) {
-    size_t cap = 4, count = 0;
-    Expr **args = calloc(cap, sizeof(Expr *));
-    if (!args) {
-        if (out_count) *out_count = 0;
-        parser_error(p, "out of memory");
+    size_t cap = 4;
+    size_t count = 0;
+    Expr **items = calloc(cap, sizeof(Expr *));
+    if (!items) {
+        ast_expr_free(first);
         return NULL;
     }
 
-    if (out_count) *out_count = 0;
+    items[count++] = first;
 
-    if (!check(p, TK_LPAREN)) {
-        parser_error(p, "expected '(' in argument list");
-        free(args);
-        return NULL;
-    }
-    advance(p);
-
-    while (!check(p, TK_RPAREN) && !check(p, TK_EOF)) {
+    for (;;) {
         if (count >= cap) {
             size_t new_cap = cap * 2;
-            Expr **tmp = realloc(args, sizeof(Expr *) * new_cap);
+            Expr **tmp = realloc(items, new_cap * sizeof(Expr *));
             if (!tmp) {
-                free_expr_array(args, count);
-                parser_error(p, "out of memory");
+                for (size_t i = 0; i < count; i++) ast_expr_free(items[i]);
+                free(items);
                 return NULL;
             }
-            memset(tmp + cap, 0, sizeof(Expr *) * (new_cap - cap));
+            items = tmp;
+            cap = new_cap;
+        }
+
+        if (parser_check(p, TK_RPAREN)) break;
+
+        Expr *item = parse_expr(p);
+        if (!item) {
+            for (size_t i = 0; i < count; i++) ast_expr_free(items[i]);
+            free(items);
+            parser_consume(p, TK_RPAREN, "expected ')' after tuple");
+            return NULL;
+        }
+
+        items[count++] = item;
+
+        if (!parser_match(p, TK_COMMA)) break;
+        if (parser_check(p, TK_RPAREN)) break; /* trailing comma */
+    }
+
+    parser_consume(p, TK_RPAREN, "expected ')' after tuple");
+    return ast_tuple_lit(items, count, loc);
+}
+
+Expr *parse_primary_array(Parser *p) {
+    Loc loc = parser_previous(p) ? parser_previous(p)->loc : parser_current(p)->loc;
+
+    if (parser_match(p, TK_RBRACKET)) {
+        return ast_arr_lit(NULL, 0, loc);
+    }
+
+    size_t cap = 4;
+    size_t count = 0;
+    Expr **items = calloc(cap, sizeof(Expr *));
+    if (!items) return NULL;
+
+    for (;;) {
+        if (count >= cap) {
+            size_t new_cap = cap * 2;
+            Expr **tmp = realloc(items, new_cap * sizeof(Expr *));
+            if (!tmp) {
+                for (size_t i = 0; i < count; i++) ast_expr_free(items[i]);
+                free(items);
+                return NULL;
+            }
+            items = tmp;
+            cap = new_cap;
+        }
+
+        Expr *item = parse_expr(p);
+        if (!item) {
+            for (size_t i = 0; i < count; i++) ast_expr_free(items[i]);
+            free(items);
+            parser_consume(p, TK_RBRACKET, "expected ']' after array literal");
+            return NULL;
+        }
+
+        items[count++] = item;
+
+        if (!parser_match(p, TK_COMMA)) break;
+        if (parser_check(p, TK_RBRACKET)) break; /* trailing comma */
+    }
+
+    parser_consume(p, TK_RBRACKET, "expected ']' after array literal");
+    return ast_arr_lit(items, count, loc);
+}
+
+Expr *parse_primary_keyword(Parser *p, Token *tok) {
+    (void)p;
+    if (!tok) return NULL;
+
+    switch (tok->kind) {
+        case TK_KW_TRUE:
+            return ast_state_lit(XF_STATE_TRUE, tok->loc);
+
+        case TK_KW_FALSE:
+            return ast_state_lit(XF_STATE_FALSE, tok->loc);
+
+        case TK_KW_UNDET:
+            return ast_state_lit(XF_STATE_UNDET, tok->loc);
+
+        case TK_KW_OK:
+            return ast_state_lit(XF_STATE_OK, tok->loc);
+
+        case TK_KW_ERR:
+            return ast_state_lit(XF_STATE_ERR, tok->loc);
+
+        case TK_KW_NAV:
+            return ast_state_lit(XF_STATE_NAV, tok->loc);
+
+        case TK_KW_NULL:
+            return ast_state_lit(XF_STATE_NULL, tok->loc);
+
+        case TK_KW_VOID_S:
+            return ast_state_lit(XF_STATE_VOID, tok->loc);
+
+        case TK_KW_UNDEF:
+            return ast_state_lit(XF_STATE_UNDEF, tok->loc);
+
+        case TK_VAR_FILE:
+        case TK_VAR_MATCH:
+        case TK_VAR_CAPS:
+        case TK_VAR_ERR:
+        case TK_VAR_NR:
+        case TK_VAR_NF:
+        case TK_VAR_FNR:
+        case TK_VAR_FS:
+        case TK_VAR_RS:
+        case TK_VAR_OFS:
+        case TK_VAR_ORS:
+        case TK_VAR_OFMT:
+            return ast_svar(tok->kind, tok->loc);
+
+        default:
+            parser_error(p, tok, "unexpected keyword in expression");
+            return NULL;
+    }
+}
+Expr *parse_unary(Parser *p) {
+    Token *tok = parser_current(p);
+    if (!tok) return NULL;
+
+    switch (tok->kind) {
+        case TK_MINUS: {
+            parser_advance(p);
+            Expr *operand = parse_unary(p);
+            if (!operand) return NULL;
+            return ast_unary(UNOP_NEG, operand, tok->loc);
+        }
+
+        case TK_BANG: {
+            parser_advance(p);
+            Expr *operand = parse_unary(p);
+            if (!operand) return NULL;
+            return ast_unary(UNOP_NOT, operand, tok->loc);
+        }
+
+        case TK_PLUS_PLUS: {
+            parser_advance(p);
+            Expr *operand = parse_unary(p);
+            if (!operand) return NULL;
+            return ast_unary(UNOP_PRE_INC, operand, tok->loc);
+        }
+
+        case TK_MINUS_MINUS: {
+            parser_advance(p);
+            Expr *operand = parse_unary(p);
+            if (!operand) return NULL;
+            return ast_unary(UNOP_PRE_DEC, operand, tok->loc);
+        }
+
+        case TK_KW_SPAWN: {
+            parser_advance(p);
+
+            Expr *call = parse_postfix(p);
+            if (!call) return NULL;
+
+            return ast_spawn_expr(call, tok->loc);
+        }
+
+        default:
+            return parse_postfix(p);
+    }
+}
+Expr **parse_arglist(Parser *p, size_t *out_count) {
+    size_t cap = 4;
+    size_t count = 0;
+    Expr **args = calloc(cap, sizeof(Expr *));
+    if (!args) return NULL;
+
+    if (parser_check(p, TK_RPAREN)) {
+        *out_count = 0;
+        return args;
+    }
+
+    for (;;) {
+        if (count >= cap) {
+            size_t new_cap = cap * 2;
+            Expr **tmp = realloc(args, new_cap * sizeof(Expr *));
+            if (!tmp) {
+                for (size_t i = 0; i < count; i++) ast_expr_free(args[i]);
+                free(args);
+                return NULL;
+            }
             args = tmp;
             cap = new_cap;
         }
 
         Expr *arg = parse_expr(p);
-        if (!arg || p->had_error) {
-            free_expr_array(args, count);
+        if (!arg) {
+            for (size_t i = 0; i < count; i++) ast_expr_free(args[i]);
+            free(args);
             return NULL;
         }
 
         args[count++] = arg;
 
-        if (!match_tok(p, TK_COMMA)) break;
+        if (!parser_match(p, TK_COMMA)) break;
+        if (parser_check(p, TK_RPAREN)) break; /* trailing comma */
     }
 
-    if (!check(p, TK_RPAREN)) {
-        free_expr_array(args, count);
-        parser_error(p, "expected ')' after argument list");
-        return NULL;
-    }
-    advance(p);
-
-    if (out_count) *out_count = count;
+    *out_count = count;
     return args;
 }
-/* ============================================================
- * Expression parsing — precedence climbing
- * ============================================================ */
-Expr *parse_primary(Parser *p) {
-    Token *t = cur(p);
-    Loc    loc = t->loc;
-/* array literal: [a, b, c] */
-if (t->kind == TK_LBRACKET) {
-    advance(p);  // consume '['
+Expr *parse_postfix(Parser *p) {
+    Expr *expr = parse_primary(p);
+    if (!expr) return NULL;
 
-    Expr **items = NULL;
-    size_t count = 0;
-    size_t cap = 0;
+    for (;;) {
+        /* function call: expr(...) */
+        if (parser_match(p, TK_LPAREN)) {
+            size_t argc = 0;
+            Expr **args = parse_arglist(p, &argc);
+            if (!args && argc != 0) {
+                ast_expr_free(expr);
+                return NULL;
+            }
 
-    if (!check(p, TK_RBRACKET)) {
-        for (;;) {
-            Expr *item = parse_expr(p);
-
-            if (count == cap) {
-                size_t ncap = cap ? cap * 2 : 4;
-                Expr **tmp = realloc(items, ncap * sizeof(*tmp));
-                if (!tmp) {
-                    parser_error(p, "out of memory");
-                    free(items);
-                    return ast_num(0, loc);
+            if (!parser_consume(p, TK_RPAREN, "expected ')' after arguments")) {
+                ast_expr_free(expr);
+                if (args) {
+                    for (size_t i = 0; i < argc; i++) ast_expr_free(args[i]);
+                    free(args);
                 }
-                items = tmp;
-                cap = ncap;
+                return NULL;
             }
 
-            items[count++] = item;
+            expr = ast_call(expr, args, argc, expr->loc);
+            continue;
+        }
 
-            if (match_tok(p, TK_COMMA)) {
-                if (check(p, TK_RBRACKET))
-                    break; /* allow trailing comma */
-                continue;
+        /* subscript: expr[expr] */
+        if (parser_match(p, TK_LBRACKET)) {
+            Expr *index = parse_expr(p);
+            if (!index) {
+                ast_expr_free(expr);
+                return NULL;
             }
 
+            if (!parser_consume(p, TK_RBRACKET, "expected ']' after index")) {
+                ast_expr_free(index);
+                ast_expr_free(expr);
+                return NULL;
+            }
+
+            expr = ast_subscript(expr, index, expr->loc);
+            continue;
+        }
+
+        /* introspection props: expr.len / expr.type / expr.state */
+        if (parser_match(p, TK_DOT_LEN)) {
+            expr = ast_len(expr, expr->loc);
+            continue;
+        }
+
+        if (parser_match(p, TK_DOT_TYPE)) {
+            expr = ast_type(expr, expr->loc);
+            continue;
+        }
+
+        if (parser_match(p, TK_DOT_STATE)) {
+            expr = ast_state(expr, expr->loc);
+            continue;
+        }
+                if (parser_match(p, TK_DOT)) {
+            Token *name = parser_current(p);
+            if (!name) {
+                ast_expr_free(expr);
+                return NULL;
+            }
+
+            switch (name->kind) {
+                case TK_IDENT:
+                case TK_KW_STR:
+                case TK_KW_NUM:
+                case TK_KW_MAP:
+                case TK_KW_SET:
+                case TK_KW_ARR:
+                case TK_KW_TUPLE:
+                case TK_KW_FN:
+                case TK_KW_VOID:
+                case TK_KW_BOOL:
+                    parser_advance(p);
+                    break;
+
+                default:
+                    parser_error(p, name, "expected property name after '.'");
+                    ast_expr_free(expr);
+                    return NULL;
+            }
+
+            xf_Str *field = xf_str_new(name->lexeme, name->lexeme_len);
+            if (!field) {
+                ast_expr_free(expr);
+                return NULL;
+            }
+
+            Expr *next = ast_member(expr, field, expr->loc);
+            xf_str_release(field);
+            expr = next;
+            continue;
+        }
+
+
+        /* postfix ++ */
+        if (parser_match(p, TK_PLUS_PLUS)) {
+            expr = ast_unary(UNOP_POST_INC, expr, expr->loc);
+            continue;
+        }
+
+        /* postfix -- */
+        if (parser_match(p, TK_MINUS_MINUS)) {
+            expr = ast_unary(UNOP_POST_DEC, expr, expr->loc);
+            continue;
+        }
+
+        break;
+    }
+
+    return expr;
+}
+Expr *parse_exp(Parser *p) {
+    Expr *left = parse_unary(p);
+    if (!left) return NULL;
+
+    if (parser_match(p, TK_CARET)) {
+        Token *op = parser_previous(p);
+        Expr *right = parse_exp(p);   /* right-associative */
+        if (!right) {
+            ast_expr_free(left);
+            return NULL;
+        }
+        return ast_binary(BINOP_POW, left, right, op->loc);
+    }
+
+    return left;
+}
+Expr *parse_mul(Parser *p) {
+    Expr *expr = parse_exp(p);
+    if (!expr) return NULL;
+
+    for (;;) {
+        BinOp op;
+
+        if (parser_match(p, TK_STAR)) {
+            op = BINOP_MUL;
+        } else if (parser_match(p, TK_SLASH)) {
+            op = BINOP_DIV;
+        } else if (parser_match(p, TK_PERCENT)) {
+            op = BINOP_MOD;
+        } else if (parser_match(p, TK_DOT_STAR)) {
+            op = BINOP_MMUL;
+        } else if (parser_match(p, TK_DOT_SLASH)) {
+            op = BINOP_MDIV;
+        } else {
             break;
         }
+
+        Token *op_tok = parser_previous(p);
+        Expr *right = parse_exp(p);
+        if (!right) {
+            ast_expr_free(expr);
+            return NULL;
+        }
+
+        expr = ast_binary(op, expr, right, op_tok->loc);
     }
 
-    expect(p, TK_RBRACKET, "expected ']' after array literal");
-
-    return ast_arr_lit(items, count, loc);
+    return expr;
 }
-    /* numeric literal */
-    if (t->kind == TK_NUM) {
-        advance(p);
-        return ast_num(t->val.num, loc);
+Expr *parse_add(Parser *p) {
+    Expr *expr = parse_mul(p);
+    if (!expr) return NULL;
+
+    for (;;) {
+        BinOp op;
+
+        if (parser_match(p, TK_PLUS)) {
+            op = BINOP_ADD;
+        } else if (parser_match(p, TK_MINUS)) {
+            op = BINOP_SUB;
+        } else if (parser_match(p, TK_DOT_PLUS)) {
+            op = BINOP_MADD;
+        } else if (parser_match(p, TK_DOT_MINUS)) {
+            op = BINOP_MSUB;
+        } else {
+            break;
+        }
+
+        Token *op_tok = parser_previous(p);
+        Expr *right = parse_mul(p);
+        if (!right) {
+            ast_expr_free(expr);
+            return NULL;
+        }
+
+        expr = ast_binary(op, expr, right, op_tok->loc);
     }
 
-    /* string literal */
-    if (t->kind == TK_STR) {
-        advance(p);
-        xf_Str *s = xf_str_new(t->val.str.data, t->val.str.len);
-        Expr *e = ast_str(s, loc);
-        xf_str_release(s);
-        return e;
+    return expr;
+}
+Expr *parse_expr(Parser *p) {
+    return parse_assign(p);
+}
+Expr *parse_match(Parser *p) {
+    Expr *expr = parse_equality(p);
+    if (!expr) return NULL;
+
+    for (;;) {
+        BinOp op;
+
+        if (parser_match(p, TK_TILDE)) {
+            op = BINOP_MATCH;
+        } else if (parser_match(p, TK_BANG_TILDE)) {
+            op = BINOP_NMATCH;
+        } else {
+            break;
+        }
+
+        Token *op_tok = parser_previous(p);
+        Expr *right = parse_equality(p);
+        if (!right) {
+            ast_expr_free(expr);
+            return NULL;
+        }
+
+        expr = ast_binary(op, expr, right, op_tok->loc);
     }
 
-    /* regex literal */
-    if (t->kind == TK_REGEX) {
-        advance(p);
-        xf_Str *pat = xf_str_from_cstr(t->val.re.pattern);
-        Expr *e = ast_regex(pat, t->val.re.flags, loc);
-        xf_str_release(pat);
-        return e;
+    return expr;
+}
+Expr *parse_compare(Parser *p) {
+    Expr *expr = parse_concat(p);
+    if (!expr) return NULL;
+
+    for (;;) {
+        BinOp op;
+
+        if (parser_match(p, TK_LT)) {
+            op = BINOP_LT;
+        } else if (parser_match(p, TK_GT)) {
+            op = BINOP_GT;
+        } else if (parser_match(p, TK_LT_EQ)) {
+            op = BINOP_LTE;
+        } else if (parser_match(p, TK_GT_EQ)) {
+            op = BINOP_GTE;
+        } else if (parser_match(p, TK_SPACESHIP)) {   /* <=> */
+            op = BINOP_SPACESHIP;
+        } else {
+            break;
+        }
+
+        Token *op_tok = parser_previous(p);
+        Expr *right = parse_concat(p);
+        if (!right) {
+            ast_expr_free(expr);
+            return NULL;
+        }
+
+        expr = ast_binary(op, expr, right, op_tok->loc);
     }
 
-    /* field variable: $0 $1 ... */
-    if (t->kind == TK_FIELD) {
-        advance(p);
-        return ast_field(t->val.field_idx, loc);
+    return expr;
+}
+Expr *parse_equality(Parser *p) {
+    Expr *expr = parse_compare(p);
+    if (!expr) return NULL;
+
+    for (;;) {
+        BinOp op;
+
+        if (parser_match(p, TK_EQ_EQ)) {
+            op = BINOP_EQ;
+        } else if (parser_match(p, TK_BANG_EQ)) {
+            op = BINOP_NEQ;
+        } else {
+            break;
+        }
+
+        Token *op_tok = parser_previous(p);
+        Expr *right = parse_compare(p);
+        if (!right) {
+            ast_expr_free(expr);
+            return NULL;
+        }
+
+        expr = ast_binary(op, expr, right, op_tok->loc);
     }
 
-    /* implicit vars: $file $match $captures $err */
-    if (t->kind == TK_VAR_FILE || t->kind == TK_VAR_MATCH ||
-        t->kind == TK_VAR_CAPS || t->kind == TK_VAR_ERR) {
-        advance(p);
-        return ast_svar(t->kind, loc);
+    return expr;
+}
+Expr *parse_and(Parser *p) {
+    Expr *expr = parse_match(p);
+    if (!expr) return NULL;
+
+    while (parser_match(p, TK_AMP_AMP)) {
+        Token *op_tok = parser_previous(p);
+        Expr *right = parse_match(p);
+        if (!right) {
+            ast_expr_free(expr);
+            return NULL;
+        }
+
+        expr = ast_binary(BINOP_AND, expr, right, op_tok->loc);
     }
 
-    /* built-in record vars: NR NF FNR FS RS OFS ORS OFMT */
-    if (t->kind == TK_VAR_NR  || t->kind == TK_VAR_NF  ||
-        t->kind == TK_VAR_FNR || t->kind == TK_VAR_FS  ||
-        t->kind == TK_VAR_RS  || t->kind == TK_VAR_OFS ||
-        t->kind == TK_VAR_ORS || t->kind == TK_VAR_OFMT) {
-        advance(p);
-        return ast_ivar(t->kind, loc);
+    return expr;
+}
+Expr *parse_or(Parser *p) {
+    Expr *expr = parse_and(p);
+    if (!expr) return NULL;
+
+    while (parser_match(p, TK_PIPE_PIPE)) {
+        Token *op_tok = parser_previous(p);
+        Expr *right = parse_and(p);
+        if (!right) {
+            ast_expr_free(expr);
+            return NULL;
+        }
+
+        expr = ast_binary(BINOP_OR, expr, right, op_tok->loc);
     }
 
-    /* identifier or fn call */
-    if (t->kind == TK_IDENT) {
-        advance(p);
-        xf_Str *name = tok_to_str(t);
-        Expr *e = ast_ident(name, loc);
-        xf_str_release(name);
-        return e;
+    return expr;
+}
+Expr *parse_coalesce(Parser *p) {
+    Expr *expr = parse_or(p);
+    if (!expr) return NULL;
+
+    while (parser_match(p, TK_COALESCE)) {
+        Token *op_tok = parser_previous(p);
+        Expr *right = parse_or(p);
+        if (!right) {
+            ast_expr_free(expr);
+            return NULL;
+        }
+
+        expr = ast_coalesce(expr, right, op_tok->loc);
     }
 
-    /* anonymous fn literal:  fn(params) { body } */
-    if (t->kind == TK_KW_FN) {
-        advance(p);
-        size_t pc;
-        Param *params = parse_paramlist(p, &pc);
-        Stmt  *body   = parse_block(p);
-        return ast_fn(XF_TYPE_VOID, params, pc, body, loc);
+    return expr;
+}
+Expr *parse_ternary(Parser *p) {
+    Expr *cond = parse_coalesce(p);
+    if (!cond) return NULL;
+
+    if (!parser_match(p, TK_QUESTION)) {
+        return cond;
     }
 
-    /* grouped expression */
-if (t->kind == TK_LPAREN) {
-    advance(p);
+    Expr *then_branch = parse_expr(p);
+    if (!then_branch) {
+        ast_expr_free(cond);
+        return NULL;
+    }
 
-    if (check(p, TK_RPAREN)) {
-        parser_error(p, "empty tuple/group not allowed");
-        advance(p);
-        return ast_num(0, loc);
+    if (!parser_consume(p, TK_COLON, "expected ':' in ternary expression")) {
+        ast_expr_free(cond);
+        ast_expr_free(then_branch);
+        return NULL;
+    }
+
+    Expr *else_branch = parse_ternary(p);
+    if (!else_branch) {
+        ast_expr_free(cond);
+        ast_expr_free(then_branch);
+        return NULL;
+    }
+
+    return ast_ternary(cond, then_branch, else_branch, cond->loc);
+}
+Expr *parse_pipe(Parser *p) {
+    Expr *expr = parse_ternary(p);
+    if (!expr) return NULL;
+
+    while (parser_match(p, TK_PIPE_GT)) {   /* |> */
+        Token *op_tok = parser_previous(p);
+        Expr *right = parse_ternary(p);
+        if (!right) {
+            ast_expr_free(expr);
+            return NULL;
+        }
+
+        expr = ast_pipe_fn(expr, right, op_tok->loc);
+    }
+
+    return expr;
+}
+Expr *parse_assign(Parser *p) {
+    Expr *left = parse_pipe(p);
+    if (!left) return NULL;
+
+    /* walrus :=  (only valid on an identifier target) */
+    if (parser_match(p, TK_WALRUS)) {
+        Token *op_tok = parser_previous(p);
+
+        if (left->kind != EXPR_IDENT) {
+            parser_error(p, op_tok, "left side of ':=' must be an identifier");
+            ast_expr_free(left);
+            return NULL;
+        }
+
+        Expr *value = parse_assign(p);   /* right-associative */
+        if (!value) {
+            ast_expr_free(left);
+            return NULL;
+        }
+
+        xf_Str *name = left->as.ident.name;
+        Expr *out = ast_walrus(name, XF_TYPE_VOID, value, op_tok->loc);
+        ast_expr_free(left);
+        return out;
+    }
+
+    /* regular assignment operators */
+    AssignOp op;
+    bool matched = true;
+
+    if (parser_match(p, TK_EQ)) {
+        op = ASSIGNOP_EQ;
+    } else if (parser_match(p, TK_PLUS_EQ)) {
+        op = ASSIGNOP_ADD;
+    } else if (parser_match(p, TK_MINUS_EQ)) {
+        op = ASSIGNOP_SUB;
+    } else if (parser_match(p, TK_STAR_EQ)) {
+        op = ASSIGNOP_MUL;
+    } else if (parser_match(p, TK_SLASH_EQ)) {
+        op = ASSIGNOP_DIV;
+    } else if (parser_match(p, TK_PERCENT_EQ)) {
+        op = ASSIGNOP_MOD;
+    } else if (parser_match(p, TK_DOT_DOT_EQ)) {
+        op = ASSIGNOP_CONCAT;
+    } else {
+        matched = false;
+    }
+
+    if (!matched) {
+        return left;
+    }
+
+    Expr *right = parse_assign(p);   /* right-associative */
+    if (!right) {
+        ast_expr_free(left);
+        return NULL;
+    }
+
+    return ast_assign(op, left, right, left->loc);
+}
+Expr *parse_concat(Parser *p) {
+    Expr *expr = parse_add(p);
+    if (!expr) return NULL;
+
+    while (parser_match(p, TK_DOT_DOT)) {
+        Token *op_tok = parser_previous(p);
+        Expr *right = parse_add(p);
+        if (!right) {
+            ast_expr_free(expr);
+            return NULL;
+        }
+
+        expr = ast_binary(BINOP_CONCAT, expr, right, op_tok->loc);
+    }
+
+    return expr;
+}
+Expr *parse_primary_brace(Parser *p) {
+    Loc loc = parser_previous(p) ? parser_previous(p)->loc : parser_current(p)->loc;
+
+    if (parser_match(p, TK_RBRACE)) {
+        return ast_map_lit(NULL, NULL, 0, loc);
     }
 
     Expr *first = parse_expr(p);
-
-    if (match_tok(p, TK_COMMA)) {
-        size_t cap = 4, count = 0;
-        Expr **items = malloc(sizeof(*items) * cap);
-        items[count++] = first;
-
-        if (!check(p, TK_RPAREN)) {
-            do {
-                if (count == cap) {
-                    cap *= 2;
-                    items = realloc(items, sizeof(*items) * cap);
-                }
-                items[count++] = parse_expr(p);
-            } while (match_tok(p, TK_COMMA));
-        }
-
-        expect(p, TK_RPAREN, "expected ')' after tuple literal");
-        return ast_tuple_lit(items, count, loc);
-    }
-
-    expect(p, TK_RPAREN, "expected ')' after expression");
-    return first;
-}
-    /* spread: ...x */
-    if (t->kind == TK_DOTDOTDOT || t->kind==TK_DOT_DOT) {
-        advance(p);
-        return ast_spread(parse_unary(p), loc);
-    }
-
-    /* map {k:v} / set {a,b} literal */
-    if (t->kind == TK_LBRACE) {
-        advance(p);
-        if (check(p, TK_RBRACE)) { advance(p); return ast_map_lit(NULL,NULL,0,loc); }
-        Expr *first = parse_expr(p);
-        if (check(p, TK_COLON)) {
-            advance(p); Expr *fv = parse_expr(p);
-            size_t cap=4; Expr **keys=malloc(cap*sizeof(*keys)),**vals=malloc(cap*sizeof(*vals)); size_t cnt=0;
-            keys[cnt]=first; vals[cnt]=fv; cnt++;
-            while(match_tok(p,TK_COMMA)){if(check(p,TK_RBRACE))break;if(cnt==cap){cap*=2;keys=realloc(keys,cap*sizeof(*keys));vals=realloc(vals,cap*sizeof(*vals));}keys[cnt]=parse_expr(p);expect(p,TK_COLON,"expected ':'");vals[cnt]=parse_expr(p);cnt++;}
-            expect(p,TK_RBRACE,"expected '}'"); return ast_map_lit(keys,vals,cnt,loc);
-        } else {
-            size_t cap=4; Expr **items=malloc(cap*sizeof(*items)); size_t cnt=0;
-            items[cnt++]=first;
-            while(match_tok(p,TK_COMMA)){if(check(p,TK_RBRACE))break;if(cnt==cap){cap*=2;items=realloc(items,cap*sizeof(*items));}items[cnt++]=parse_expr(p);}
-            expect(p,TK_RBRACE,"expected '}'"); return ast_set_lit(items,cnt,loc);
-        }
-    }
-    /* explicit set{...} */
-    if (t->kind == TK_KW_SET && peek_at(p,1)->kind == TK_LBRACE) {
-        advance(p); advance(p);
-        Expr **items=NULL; size_t cnt=0,cap=0;
-        if(!check(p,TK_RBRACE)){for(;;){if(cnt==cap){size_t nc=cap?cap*2:4;items=realloc(items,nc*sizeof(*items));cap=nc;}items[cnt++]=parse_expr(p);if(match_tok(p,TK_COMMA)){if(check(p,TK_RBRACE))break;continue;}break;}}
-        expect(p,TK_RBRACE,"expected '}'"); return ast_set_lit(items,cnt,loc);
-    }
-    /* type cast: num(x) str(x) arr(x) map(x) set(x) */
-    if (is_type_kw(p) && peek_at(p, 1)->kind == TK_LPAREN) {
-        uint8_t to_type = parse_type(p);
-        advance(p);
-        Expr *operand = parse_expr(p);
-        expect(p, TK_RPAREN, "expected ')' after cast expression");
-        return ast_cast(to_type, operand, loc);
-    }
-
-    /* FIX: allow join(...) as a builtin call expression.
-     * When the parser sees TK_KW_JOIN followed by '(', treat 'join'
-     * as an ordinary identifier so parse_postfix can build a call node.
-     * The statement path in parse_stmt / parse_rule only fires when
-     * join is NOT followed by '(', so the statement form is unchanged. */
-    if (t->kind == TK_KW_JOIN) {
-        advance(p);
-        xf_Str *name = xf_str_from_cstr("join");
-        Expr *e = ast_ident(name, loc);
-        xf_str_release(name);
-        return e;
-    }
-
-    /* spawn fn(args) as an expression — yields a numeric thread handle.
-     * The bare statement form (parse_spawn → STMT_SPAWN) only fires when
-     * spawn is not inside an expression context, so there's no ambiguity. */
-    if (t->kind == TK_KW_SPAWN) {
-        advance(p);
-        Expr *call = parse_postfix(p);
-        return ast_spawn_expr(call, loc);
-    }
-
-    /* state literals: OK ERR NULL NAV VOID UNDEF TRUE FALSE */
-    if (t->kind == TK_KW_OK)     { advance(p); return ast_state_lit(XF_STATE_OK,    loc); }
-    if (t->kind == TK_KW_ERR)    { advance(p); return ast_state_lit(XF_STATE_ERR,   loc); }
-    if (t->kind == TK_KW_NULL)   { advance(p); return ast_state_lit(XF_STATE_NULL,  loc); }
-    if (t->kind == TK_KW_NAV)    { advance(p); return ast_state_lit(XF_STATE_NAV,   loc); }
-    if (t->kind == TK_KW_VOID_S ||
-        t->kind == TK_KW_VOID)   { advance(p); return ast_state_lit(XF_STATE_VOID,  loc); }
-    if (t->kind == TK_KW_UNDEF)  { advance(p); return ast_state_lit(XF_STATE_UNDEF, loc); }
-    if (t->kind == TK_KW_TRUE)   { advance(p); return ast_state_lit(XF_STATE_TRUE,  loc); }
-    if (t->kind == TK_KW_FALSE)  { advance(p); return ast_state_lit(XF_STATE_FALSE, loc); }
-    if (t->kind == TK_KW_UNDET)  { advance(p); return ast_state_lit(XF_STATE_UNDET, loc); }
-    parser_error(p, "expected expression");
-    advance(p);
-    return ast_num(0, loc);
-}
-
-/* ── postfix: call, subscript, member, .state, .type, x++, x-- ── */
-Expr *parse_postfix(Parser *p) {
-    Expr *e = parse_primary(p);
-
-    for (;;) {
-        Loc loc = cur(p)->loc;
-if (check(p, TK_LPAREN)) {
-    size_t argc = 0;
-    Expr **args = parse_arglist(p, &argc);
-
-    if (!args || p->had_error) {
-        free_expr_array(args, argc);
-        ast_expr_free(e);
+    if (!first) {
+        parser_consume(p, TK_RBRACE, "expected '}' after brace literal");
         return NULL;
     }
 
-    Expr *call = ast_call(e, args, argc, loc);
-    if (!call) {
-        free_expr_array(args, argc);
-        ast_expr_free(e);
-        parser_error(p, "failed to build call expression");
-        return NULL;
-    }
-
-    e = call;
-    continue;
-}
-        if (match_tok(p, TK_LBRACKET)) {
-            Expr *key = parse_expr(p);
-            expect(p, TK_RBRACKET, "expected ']' after subscript");
-            e = ast_subscript(e, key, loc);
-            continue;
+    /* map literal */
+    if (parser_match(p, TK_COLON)) {
+        size_t cap = 4;
+        size_t count = 0;
+        Expr **keys = calloc(cap, sizeof(Expr *));
+        Expr **vals = calloc(cap, sizeof(Expr *));
+        if (!keys || !vals) {
+            free(keys);
+            free(vals);
+            ast_expr_free(first);
+            return NULL;
         }
-        if (check(p, TK_DOT_STATE)) {
-            advance(p);
-            e = ast_state(e, loc);
-            continue;
-        }
-        if (check(p, TK_DOT_TYPE)) {
-            advance(p);
-            e = ast_type(e, loc);
-            continue;
-        }
-        if (check(p, TK_DOT_LEN)) {
-            advance(p);
-            e = ast_len(e, loc);
-            continue;
-        }
-        if (match_tok(p, TK_DOT)) {
-            /* field names may be identifiers OR keywords (e.g. core.str, core.os) */
-            Token *field = cur(p);
-            if (field->kind == TK_EOF || field->lexeme_len == 0) {
-                parser_error(p, "expected field name after '.'");
-            } else {
-                advance(p);
-            }
-            xf_Str *fname = tok_to_str(field);
-            e = ast_member(e, fname, loc);
-            xf_str_release(fname);
-            continue;
-        }
-        if (check(p, TK_PLUS_PLUS)) {
-            advance(p);
-            e = ast_unary(UNOP_POST_INC, e, loc);
-            continue;
-        }
-        if (check(p, TK_MINUS_MINUS)) {
-            advance(p);
-            e = ast_unary(UNOP_POST_DEC, e, loc);
-            continue;
-        }
-        if (check(p, TK_SHIFT_ARROW)) {
-            advance(p);
-            e = make_builtin_call1("shift", e, loc);
-            continue;
-        }
-        if (check(p, TK_EXPAND_ARRAY)) {
-            advance(p);
-            e = make_core_ds_call1("expand", e, loc);
-            continue;
-        }
-        /* pipe-fn:  expr |> fn */
-        break;
-    }
-    return e;
-}
 
-/* ── unary: -x  !x  ++x  --x ─────────────────────────────── */
-Expr *parse_unary(Parser *p) {
-    Loc loc = cur(p)->loc;
-    if (match_tok(p, TK_MINUS))      return ast_unary(UNOP_NEG,     parse_unary(p), loc);
-    if (match_tok(p, TK_BANG))       return ast_unary(UNOP_NOT,     parse_unary(p), loc);
-    if (match_tok(p, TK_PLUS_PLUS))  return ast_unary(UNOP_PRE_INC, parse_unary(p), loc);
-    if (match_tok(p, TK_MINUS_MINUS))return ast_unary(UNOP_PRE_DEC, parse_unary(p), loc);
-    return parse_postfix(p);
-}
-
-/* ── exponentiation: right-associative ──────────────────────── */
-Expr *parse_exp(Parser *p) {
-    Expr *left = parse_unary(p);
-    if (match_tok(p, TK_CARET)) {
-        Loc loc = cur(p)->loc;
-        Expr *right = parse_exp(p);    /* right-associative */
-        return ast_binary(BINOP_POW, left, right, loc);
-    }
-    return left;
-}
-
-/* ── multiplicative: * / % .* ./ ───────────────────────────── */
-Expr *parse_mul(Parser *p) {
-    Expr *left = parse_exp(p);
-    for (;;) {
-        Loc loc = cur(p)->loc;
-        if (match_tok(p, TK_STAR))      { left = ast_binary(BINOP_MUL,  left, parse_exp(p), loc); continue; }
-        if (match_tok(p, TK_SLASH))     { left = ast_binary(BINOP_DIV,  left, parse_exp(p), loc); continue; }
-        if (match_tok(p, TK_PERCENT))   { left = ast_binary(BINOP_MOD,  left, parse_exp(p), loc); continue; }
-        if (match_tok(p, TK_DOT_STAR))  { left = ast_binary(BINOP_MMUL, left, parse_exp(p), loc); continue; }
-        if (match_tok(p, TK_DOT_SLASH)) { left = ast_binary(BINOP_MDIV, left, parse_exp(p), loc); continue; }
-        break;
-    }
-    return left;
-}
-
-/* ── additive: + - .+ .- ────────────────────────────────────── */
-Expr *parse_add(Parser *p) {
-    Expr *left = parse_mul(p);
-    for (;;) {
-        Loc loc = cur(p)->loc;
-        if (match_tok(p, TK_PLUS))      { left = ast_binary(BINOP_ADD,  left, parse_mul(p), loc); continue; }
-        if (match_tok(p, TK_MINUS))     { left = ast_binary(BINOP_SUB,  left, parse_mul(p), loc); continue; }
-        if (match_tok(p, TK_DOT_PLUS))  { left = ast_binary(BINOP_MADD, left, parse_mul(p), loc); continue; }
-        if (match_tok(p, TK_DOT_MINUS)) { left = ast_binary(BINOP_MSUB, left, parse_mul(p), loc); continue; }
-        break;
-    }
-    return left;
-}
-
-/* ── string concat: .. ───────────────────────────────────────── */
-Expr *parse_concat(Parser *p) {
-    Expr *left = parse_add(p);
-    for (;;) {
-        Loc loc = cur(p)->loc;
-        if (match_tok(p, TK_DOT_DOT)) { left = ast_binary(BINOP_CONCAT, left, parse_add(p), loc); continue; }
-        break;
-    }
-    return left;
-}
-
-/* ── comparison: < > <= >= <=> ───────────────────────────────── */
-Expr *parse_compare(Parser *p) {
-    Expr *left = parse_concat(p);
-    for (;;) {
-        Loc loc = cur(p)->loc;
-        if (check(p, TK_LT_EQ) && is_expr_terminator_kind(peek_at(p, 1)->kind)) {
-            advance(p);
-            left = make_builtin_call1("pop", left, loc);
-            continue;
-        }
-        if (check(p, TK_MERGE_GT)) {
-            advance(p);
-            left = make_core_ds_call2("merge", left, parse_concat(p), loc);
-            continue;
-        }
-        if (match_tok(p, TK_KW_IN))     { left = ast_binary(BINOP_IN,        left, parse_concat(p), loc);continue; }
-        if (match_tok(p, TK_LT))        { left = ast_binary(BINOP_LT,       left, parse_concat(p), loc); continue; }
-        if (match_tok(p, TK_GT))        { left = ast_binary(BINOP_GT,       left, parse_concat(p), loc); continue; }
-        if (match_tok(p, TK_LT_EQ))     { left = ast_binary(BINOP_LTE,      left, parse_concat(p), loc); continue; }
-        if (match_tok(p, TK_GT_EQ))     { left = ast_binary(BINOP_GTE,      left, parse_concat(p), loc); continue; }
-        if (match_tok(p, TK_SPACESHIP)) { left = ast_binary(BINOP_SPACESHIP, left, parse_concat(p), loc); continue; }
-        break;
-    }
-    return left;
-}
-
-/* ── equality: == != ─────────────────────────────────────────── */
-Expr *parse_equality(Parser *p) {
-    Expr *left = parse_compare(p);
-    for (;;) {
-        Loc loc = cur(p)->loc;
-        if (match_tok(p, TK_EQ_EQ))   { left = ast_binary(BINOP_EQ,  left, parse_compare(p), loc); continue; }
-        if (match_tok(p, TK_BANG_EQ)) { left = ast_binary(BINOP_NEQ, left, parse_compare(p), loc); continue; }
-        break;
-    }
-    return left;
-}
-
-/* ── regex match: ~ !~ ───────────────────────────────────────── */
-Expr *parse_match(Parser *p) {
-    Expr *left = parse_equality(p);
-    for (;;) {
-        Loc loc = cur(p)->loc;
-        if (match_tok(p, TK_TILDE))       { left = ast_binary(BINOP_MATCH,  left, parse_equality(p), loc); continue; }
-        if (match_tok(p, TK_BANG_TILDE))  { left = ast_binary(BINOP_NMATCH, left, parse_equality(p), loc); continue; }
-        break;
-    }
-    return left;
-}
-
-/* ── logical and: && ─────────────────────────────────────────── */
-Expr *parse_and(Parser *p) {
-    Expr *left = parse_match(p);
-    for (;;) {
-        Loc loc = cur(p)->loc;
-        if (match_tok(p, TK_AMP_AMP)) { left = ast_binary(BINOP_AND, left, parse_match(p), loc); continue; }
-        break;
-    }
-    return left;
-}
-
-/* ── logical or: || and pipe to command: | ──────────────────── */
-Expr *parse_or(Parser *p) {
-    Expr *left = parse_and(p);
-    for (;;) {
-        Loc loc = cur(p)->loc;
-        if (match_tok(p, TK_PIPE_PIPE)) { left = ast_binary(BINOP_OR,       left, parse_and(p), loc); continue; }
-        if (match_tok(p, TK_PIPE))      { left = ast_binary(BINOP_PIPE_CMD, left, parse_and(p), loc); continue; }
-        break;
-    }
-    return left;
-}
-/* ── pipe: left-associative |> chaining ─────────────────────── */
-static Expr *parse_pipe(Parser *p) {
-    Expr *left = parse_or(p);
-    while (check(p, TK_PIPE_GT)) {
-        Loc loc = cur(p)->loc;
-        advance(p);
-        /* parse_unary handles calls/members on the RHS but won't
-         * consume another |> — that's handled by the while loop here */
-        Expr *right = parse_unary(p);
-        left = ast_pipe_fn(left, right, loc);
-    }
-    return left;
-}
-/* ── null coalescing: ?? ─────────────────────────────────────── */
-Expr *parse_coalesce(Parser *p) {
-    Expr *left = parse_pipe(p);
-    if (check(p, TK_COALESCE)) {
-        Loc loc = cur(p)->loc;
-        advance(p);
-        Expr *right = parse_coalesce(p);   /* right-assoc */
-        return ast_coalesce(left, right, loc);
-    }
-    return left;
-}
-
-/* ── ternary: cond ? then : else ────────────────────────────── */
-Expr *parse_ternary(Parser *p) {
-    Expr *cond = parse_coalesce(p);
-    if (match_tok(p, TK_QUESTION)) {
-        Loc loc = cur(p)->loc;
-        Expr *then = parse_expr(p);
-        expect(p, TK_COLON, "expected ':' in ternary expression");
-        Expr *els = parse_ternary(p);   /* right-assoc */
-        return ast_ternary(cond, then, els, loc);
-    }
-    return cond;
-}
-
-/* ── assignment: = += -= *= /= %= ..= := ───────────────────── */
-Expr *parse_assign(Parser *p) {
-    Expr *left = parse_ternary(p);
-    if (!left) return NULL;
-
-    Loc loc = cur(p)->loc;
-
-    if (left->kind == EXPR_IDENT && check(p, TK_WALRUS)) {
-        advance(p);
-        xf_Str *name = xf_str_retain(left->as.ident.name);
-        Expr *val = parse_assign(p);
-        ast_expr_free(left);
-
+        Expr *val = parse_expr(p);
         if (!val) {
+            free(keys);
+            free(vals);
+            ast_expr_free(first);
+            parser_consume(p, TK_RBRACE, "expected '}' after map literal");
+            return NULL;
+        }
+
+        keys[count] = first;
+        vals[count] = val;
+        count++;
+
+        while (parser_match(p, TK_COMMA)) {
+            if (parser_check(p, TK_RBRACE)) break;
+
+            if (count >= cap) {
+                size_t new_cap = cap * 2;
+                Expr **new_keys = realloc(keys, new_cap * sizeof(Expr *));
+                Expr **new_vals = realloc(vals, new_cap * sizeof(Expr *));
+                if (!new_keys || !new_vals) {
+                    if (new_keys) keys = new_keys;
+                    if (new_vals) vals = new_vals;
+                    for (size_t i = 0; i < count; i++) {
+                        ast_expr_free(keys[i]);
+                        ast_expr_free(vals[i]);
+                    }
+                    free(keys);
+                    free(vals);
+                    return NULL;
+                }
+                keys = new_keys;
+                vals = new_vals;
+                cap = new_cap;
+            }
+
+            Expr *k = parse_expr(p);
+            if (!k) {
+                for (size_t i = 0; i < count; i++) {
+                    ast_expr_free(keys[i]);
+                    ast_expr_free(vals[i]);
+                }
+                free(keys);
+                free(vals);
+                parser_consume(p, TK_RBRACE, "expected '}' after map literal");
+                return NULL;
+            }
+
+            if (!parser_consume(p, TK_COLON, "expected ':' in map literal")) {
+                ast_expr_free(k);
+                for (size_t i = 0; i < count; i++) {
+                    ast_expr_free(keys[i]);
+                    ast_expr_free(vals[i]);
+                }
+                free(keys);
+                free(vals);
+                parser_consume(p, TK_RBRACE, "expected '}' after map literal");
+                return NULL;
+            }
+
+            Expr *v = parse_expr(p);
+            if (!v) {
+                ast_expr_free(k);
+                for (size_t i = 0; i < count; i++) {
+                    ast_expr_free(keys[i]);
+                    ast_expr_free(vals[i]);
+                }
+                free(keys);
+                free(vals);
+                parser_consume(p, TK_RBRACE, "expected '}' after map literal");
+                return NULL;
+            }
+
+            keys[count] = k;
+            vals[count] = v;
+            count++;
+        }
+
+        parser_consume(p, TK_RBRACE, "expected '}' after map literal");
+        return ast_map_lit(keys, vals, count, loc);
+    }
+
+    /* set literal */
+    size_t cap = 4;
+    size_t count = 0;
+    Expr **items = calloc(cap, sizeof(Expr *));
+    if (!items) {
+        ast_expr_free(first);
+        return NULL;
+    }
+
+    items[count++] = first;
+
+    while (parser_match(p, TK_COMMA)) {
+        if (parser_check(p, TK_RBRACE)) break;
+
+        if (count >= cap) {
+            size_t new_cap = cap * 2;
+            Expr **tmp = realloc(items, new_cap * sizeof(Expr *));
+            if (!tmp) {
+                for (size_t i = 0; i < count; i++) ast_expr_free(items[i]);
+                free(items);
+                return NULL;
+            }
+            items = tmp;
+            cap = new_cap;
+        }
+
+        Expr *item = parse_expr(p);
+        if (!item) {
+            for (size_t i = 0; i < count; i++) ast_expr_free(items[i]);
+            free(items);
+            parser_consume(p, TK_RBRACE, "expected '}' after set literal");
+            return NULL;
+        }
+
+        items[count++] = item;
+    }
+
+    parser_consume(p, TK_RBRACE, "expected '}' after set literal");
+    return ast_set_lit(items, count, loc);
+}
+Stmt *parse_for(Parser *p) {
+    Token *kw = parser_previous(p);
+
+    if (!parser_consume(p, TK_LPAREN, "expected '(' after 'for'")) return NULL;
+
+    LoopBind *iter_key = NULL;
+    LoopBind *iter_val = NULL;
+
+    if (parser_match(p, TK_LPAREN)) {
+        Token *a_tok = parser_consume(p, TK_IDENT,
+                                      "expected identifier in destructuring for-loop");
+        if (!a_tok) return NULL;
+
+        xf_Str *a_name = xf_str_new(a_tok->lexeme, a_tok->lexeme_len);
+        if (!a_name) return NULL;
+
+        iter_key = ast_loop_bind_name(a_name, a_tok->loc);
+        xf_str_release(a_name);
+        if (!iter_key) return NULL;
+
+        if (!parser_consume(p, TK_COMMA, "expected ',' in destructuring for-loop")) {
+            ast_loop_bind_free(iter_key);
+            return NULL;
+        }
+
+        Token *b_tok = parser_consume(p, TK_IDENT,
+                                      "expected second identifier in destructuring for-loop");
+        if (!b_tok) {
+            ast_loop_bind_free(iter_key);
+            return NULL;
+        }
+
+        xf_Str *b_name = xf_str_new(b_tok->lexeme, b_tok->lexeme_len);
+        if (!b_name) {
+            ast_loop_bind_free(iter_key);
+            return NULL;
+        }
+
+        iter_val = ast_loop_bind_name(b_name, b_tok->loc);
+        xf_str_release(b_name);
+        if (!iter_val) {
+            ast_loop_bind_free(iter_key);
+            return NULL;
+        }
+
+        if (!parser_consume(p, TK_RPAREN, "expected ')' after destructuring names")) {
+            ast_loop_bind_free(iter_key);
+            ast_loop_bind_free(iter_val);
+            return NULL;
+        }
+    } else {
+        Token *a_tok = parser_consume(p, TK_IDENT, "expected identifier after 'for ('");
+        if (!a_tok) return NULL;
+
+        xf_Str *a_name = xf_str_new(a_tok->lexeme, a_tok->lexeme_len);
+        if (!a_name) return NULL;
+
+        iter_val = ast_loop_bind_name(a_name, a_tok->loc);
+        xf_str_release(a_name);
+        if (!iter_val) return NULL;
+    }
+
+    if (!parser_consume(p, TK_KW_IN, "expected 'in' in for-loop")) {
+        ast_loop_bind_free(iter_key);
+        ast_loop_bind_free(iter_val);
+        return NULL;
+    }
+
+    Expr *iterable = parse_expr(p);
+    if (!iterable) {
+        ast_loop_bind_free(iter_key);
+        ast_loop_bind_free(iter_val);
+        return NULL;
+    }
+
+    if (!parser_consume(p, TK_RPAREN, "expected ')' after for-loop iterable")) {
+        ast_loop_bind_free(iter_key);
+        ast_loop_bind_free(iter_val);
+        ast_expr_free(iterable);
+        return NULL;
+    }
+
+    Stmt *body = parse_stmt(p);
+    if (!body) {
+        ast_loop_bind_free(iter_key);
+        ast_loop_bind_free(iter_val);
+        ast_expr_free(iterable);
+        return NULL;
+    }
+
+    return ast_for(iter_key, iter_val, iterable, body, kw->loc);
+}
+Stmt *parse_block(Parser *p) {
+    Loc loc = parser_previous(p) ? parser_previous(p)->loc : parser_current(p)->loc;
+
+    size_t cap = 8;
+    size_t count = 0;
+    Stmt **stmts = calloc(cap, sizeof(Stmt *));
+    if (!stmts) return NULL;
+
+    while (!parser_is_at_end(p) && !parser_check(p, TK_RBRACE)) {
+        if (parser_match(p, TK_NEWLINE) || parser_match(p, TK_SEMICOLON)) {
+            continue;
+        }
+
+        if (count >= cap) {
+            size_t new_cap = cap * 2;
+            Stmt **tmp = realloc(stmts, new_cap * sizeof(Stmt *));
+            if (!tmp) {
+                for (size_t i = 0; i < count; i++) ast_stmt_free(stmts[i]);
+                free(stmts);
+                return NULL;
+            }
+            stmts = tmp;
+            cap = new_cap;
+        }
+
+        Stmt *s = parse_stmt(p);
+        if (!s) {
+            for (size_t i = 0; i < count; i++) ast_stmt_free(stmts[i]);
+            free(stmts);
+            return NULL;
+        }
+
+        stmts[count++] = s;
+
+        (void)parser_match(p, TK_SEMICOLON);
+        (void)parser_match(p, TK_NEWLINE);
+    }
+
+    if (!parser_consume(p, TK_RBRACE, "expected '}' after block")) {
+        for (size_t i = 0; i < count; i++) ast_stmt_free(stmts[i]);
+        free(stmts);
+        return NULL;
+    }
+
+    return ast_block(stmts, count, loc);
+}
+Stmt *parse_return(Parser *p) {
+    Token *kw = parser_previous(p);
+    Expr *value = NULL;
+
+    if (!parser_check(p, TK_SEMICOLON) &&
+        !parser_check(p, TK_NEWLINE) &&
+        !parser_check(p, TK_RBRACE) &&
+        !parser_is_at_end(p)) {
+        value = parse_expr(p);
+        if (!value) return NULL;
+    }
+
+    return ast_return(value, kw->loc);
+}
+Stmt *parse_delete(Parser *p) {
+    Token *kw = parser_previous(p);
+
+    Expr *target = parse_expr(p);
+    if (!target) return NULL;
+
+    return ast_delete(target, kw->loc);
+}
+Stmt *parse_outfmt(Parser *p) {
+    Token *kw = parser_previous(p);
+    uint8_t mode = 0;
+
+    Token *tok = parser_current(p);
+    if (!tok) return NULL;
+
+    if (parser_match(p, TK_STR)) {
+        const char *s = tok->val.str.data;
+        size_t len = tok->val.str.len;
+
+        if (len == 3 && strncmp(s, "csv", 3) == 0) {
+            mode = 1;
+        } else if (len == 3 && strncmp(s, "tsv", 3) == 0) {
+            mode = 2;
+        } else if (len == 4 && strncmp(s, "text", 4) == 0) {
+            mode = 0;
+        } else {
+            parser_error(p, tok, "unknown outfmt mode");
+            return NULL;
+        }
+
+        return ast_outfmt(mode, kw->loc);
+    }
+
+    parser_error(p, tok, "expected outfmt mode");
+    return NULL;
+}
+Stmt *parse_import(Parser *p) {
+    Token *kw = parser_previous(p);
+    Token *path = parser_consume(p, TK_STR, "expected string after 'import'");
+    if (!path) return NULL;
+
+    xf_Str *s = xf_str_new(path->val.str.data, path->val.str.len);
+    if (!s) return NULL;
+
+    Stmt *out = ast_import(s, kw->loc);
+    xf_str_release(s);
+    return out;
+}
+Stmt *parse_join(Parser *p) {
+    Token *kw = parser_previous(p);
+    Expr *handle = NULL;
+
+    if (!parser_check(p, TK_SEMICOLON) &&
+        !parser_check(p, TK_NEWLINE) &&
+        !parser_check(p, TK_RBRACE) &&
+        !parser_is_at_end(p)) {
+        handle = parse_expr(p);
+        if (!handle) return NULL;
+    }
+
+    return ast_join(handle, kw->loc);
+}
+Stmt *parse_print(Parser *p) {
+    Token *kw = parser_previous(p);
+
+    size_t cap = 4;
+    size_t count = 0;
+    Expr **args = calloc(cap, sizeof(Expr *));
+    if (!args) return NULL;
+
+    if (parser_check(p, TK_SEMICOLON) ||
+        parser_check(p, TK_NEWLINE) ||
+        parser_check(p, TK_RBRACE) ||
+        parser_is_at_end(p)) {
+        return ast_print(args, 0, NULL, 0, kw->loc);
+    }
+
+    for (;;) {
+        if (count >= cap) {
+            size_t new_cap = cap * 2;
+            Expr **tmp = realloc(args, new_cap * sizeof(Expr *));
+            if (!tmp) {
+                for (size_t i = 0; i < count; i++) ast_expr_free(args[i]);
+                free(args);
+                return NULL;
+            }
+            args = tmp;
+            cap = new_cap;
+        }
+
+        Expr *arg = parse_expr(p);
+        if (!arg) {
+            for (size_t i = 0; i < count; i++) ast_expr_free(args[i]);
+            free(args);
+            return NULL;
+        }
+
+        args[count++] = arg;
+
+        if (!parser_match(p, TK_COMMA)) break;
+    }
+
+    return ast_print(args, count, NULL, 0, kw->loc);
+}
+Stmt *parse_var_decl(Parser *p, uint8_t type) {
+    Token *name_tok = parser_consume(p, TK_IDENT, "expected variable name");
+    if (!name_tok) return NULL;
+
+    xf_Str *name = xf_str_new(name_tok->lexeme, name_tok->lexeme_len);
+    if (!name) return NULL;
+
+    Expr *init = NULL;
+    if (parser_match(p, TK_EQ)) {
+        init = parse_expr(p);
+        if (!init) {
             xf_str_release(name);
             return NULL;
         }
-
-        Expr *e = ast_walrus(name, XF_TYPE_VOID, val, loc);
-        xf_str_release(name);
-        return e;
     }
 
-    if (check(p, TK_PUSH_ARROW)) {
-        advance(p);
-        Expr *rhs = parse_assign(p);
-        if (!rhs) {
-            ast_expr_free(left);
-            return NULL;
-        }
-        return make_builtin_call2("push", left, rhs, loc);
+    Stmt *out = ast_var_decl(type, name, init, name_tok->loc);
+    xf_str_release(name);
+    return out;
+}
+static LoopBind *make_loopbind_from_expr(Expr *e) {
+    if (!e || e->kind != EXPR_IDENT) return NULL;
+    return ast_loop_bind_name(e->as.ident.name, e->loc);
+}
+static Stmt *parse_rule_body(Parser *p);
+static Stmt *parse_stmt_body(Parser *p) {
+    if (parser_match(p, TK_LBRACE)) {
+        return parse_block(p);
     }
+    return parse_stmt(p);
+}
 
-    if (check(p, TK_UNSHIFT_ARROW)) {
-        advance(p);
-        Expr *rhs = parse_assign(p);
-        if (!rhs) {
-            ast_expr_free(left);
-            return NULL;
-        }
-        return make_builtin_call2("unshift", left, rhs, loc);
-    }
+static Stmt *parse_shorthand_while(Parser *p, Expr *cond) {
+    if (!cond) return NULL;
 
-    if (check(p, TK_FLATTEN_ASSIGN)) {
-        advance(p);
-        Expr *dup = clone_expr_min(left);
-        if (!dup) {
-            parser_error(p, "flatten shorthand requires a simple assignable target");
-            return left;
-        }
-        return ast_assign(ASSIGNOP_EQ, left, make_core_ds_call1("flatten", dup, loc), loc);
-    }
-
-    AssignOp op;
-    switch (cur_kind(p)) {
-        case TK_EQ:           op = ASSIGNOP_EQ;     break;
-        case TK_PLUS_EQ:      op = ASSIGNOP_ADD;    break;
-        case TK_MINUS_EQ:     op = ASSIGNOP_SUB;    break;
-        case TK_STAR_EQ:      op = ASSIGNOP_MUL;    break;
-        case TK_SLASH_EQ:     op = ASSIGNOP_DIV;    break;
-        case TK_PERCENT_EQ:   op = ASSIGNOP_MOD;    break;
-        case TK_DOT_DOT_EQ:   op = ASSIGNOP_CONCAT; break;
-        case TK_DOT_PLUS_EQ:  op = ASSIGNOP_MADD;   break;
-        case TK_DOT_MINUS_EQ: op = ASSIGNOP_MSUB;   break;
-        case TK_DOT_STAR_EQ:  op = ASSIGNOP_MMUL;   break;
-        case TK_DOT_SLASH_EQ: op = ASSIGNOP_MDIV;   break;
-        default:
-            return left;
-    }
-
-    advance(p);
-    Expr *value = parse_assign(p);
-    if (!value) {
-        ast_expr_free(left);
+    Token *op = parser_previous(p); /* TK_DIAMOND */
+    Stmt *body = parse_stmt_body(p);
+    if (!body) {
+        ast_expr_free(cond);
         return NULL;
     }
 
-    return ast_assign(op, left, value, loc);
+    return ast_while_short(cond, body, op->loc);
 }
-Expr *parse_expr(Parser *p) { return parse_assign(p); }
+static TopLevel *parse_pattern_rule(Parser *p, Expr *pattern) {
+    if (!pattern) return NULL;
 
-
-/* ============================================================
- * Statement parsing
- * ============================================================ */
-
-/* { stmt* } */
-Stmt *parse_block(Parser *p) {
-    Loc loc = cur(p)->loc;
-    expect(p, TK_LBRACE, "expected '{'");
-
-    size_t cap = 8, count = 0;
-    Stmt **stmts = malloc(sizeof(Stmt *) * cap);
-
-    sym_push(p->syms, SCOPE_BLOCK);
-
-    while (!check(p, TK_RBRACE) && !check(p, TK_EOF)) {
-        Stmt *s = parse_stmt(p);
-        if (!s) continue;
-        if (count >= cap) { cap *= 2; stmts = realloc(stmts, sizeof(Stmt*)*cap); }
-        stmts[count++] = s;
-        if (p->had_error && p->panic_mode) synchronize(p);
-    }
-scope_free(sym_pop(p->syms));
-    expect(p, TK_RBRACE, "expected '}'");
-    return ast_block(stmts, count, loc);
-}
-
-/* if (cond) { } elif (cond) { } else { } */
-Stmt *parse_if(Parser *p) {
-    Loc loc = cur(p)->loc;
-    advance(p);   /* consume 'if' */
-
-    size_t   cap      = 4, count = 0;
-    Branch  *branches = malloc(sizeof(Branch) * cap);
-
-    /* if branch */
-    expect(p, TK_LPAREN, "expected '(' after 'if'");
-    branches[count].cond = parse_expr(p);
-    branches[count].loc  = loc;
-    expect(p, TK_RPAREN, "expected ')' after condition");
-    branches[count].body = parse_block(p);
-    count++;
-
-    /* elif branches */
-    while (check(p, TK_KW_ELIF)) {
-        if (count >= cap) { cap *= 2; branches = realloc(branches, sizeof(Branch)*cap); }
-        Loc elif_loc = cur(p)->loc;
-        advance(p);
-        expect(p, TK_LPAREN, "expected '(' after 'elif'");
-        branches[count].cond = parse_expr(p);
-        branches[count].loc  = elif_loc;
-        expect(p, TK_RPAREN, "expected ')' after condition");
-        branches[count].body = parse_block(p);
-        count++;
+    if (!parser_consume(p, TK_LBRACE, "expected '{' to start rule body")) {
+        ast_expr_free(pattern);
+        return NULL;
     }
 
-    /* else */
-    Stmt *els = NULL;
-    if (match_tok(p, TK_KW_ELSE))
-        els = parse_block(p);
-
-    return ast_if(branches, count, els, loc);
-}
-
-/* while (cond) { body } */
-Stmt *parse_while(Parser *p) {
-    Loc loc = cur(p)->loc;
-    advance(p);
-    expect(p, TK_LPAREN, "expected '(' after 'while'");
-    Expr *cond = parse_expr(p);
-    expect(p, TK_RPAREN, "expected ')' after condition");
-    sym_push(p->syms, SCOPE_LOOP);
     Stmt *body = parse_block(p);
-scope_free(sym_pop(p->syms));
-        return ast_while(cond, body, loc);
-}
+    if (!body) {
+        ast_expr_free(pattern);
+        return NULL;
+    }
 
-/* for (iter in collection) { body } */
-Stmt *parse_for(Parser *p) {
-    Loc loc = cur(p)->loc;
-    advance(p);
-    expect(p, TK_LPAREN, "expected '(' after 'for'");
+    return ast_top_rule(pattern, body, pattern->loc);
+}
+static Stmt *parse_shorthand_for(Parser *p, Expr *head) {
+    if (!head || head->kind != EXPR_SUBSCRIPT) {
+        parser_error(p, parser_previous(p), "left side of shorthand for must be collection[binding]");
+        ast_expr_free(head);
+        return NULL;
+    }
+
+    Token *op = parser_previous(p); /* TK_GT */
+
+    Expr *iterable = head->as.subscript.obj;
+    Expr *binding  = head->as.subscript.key;
+
+    head->as.subscript.obj = NULL;
+    head->as.subscript.key = NULL;
+    ast_expr_free(head);
+    head = NULL;
 
     LoopBind *iter_key = NULL;
     LoopBind *iter_val = NULL;
 
-    if (check(p, TK_LPAREN)) {
-        /* either:
-         *   for ((x,y) in xs)
-         *   for ((i,x) in xs)
-         *   for ((i,(x,y)) in xs)
-         */
-        LoopBind *first = parse_loop_bind(p);
+    if (binding->kind == EXPR_IDENT) {
+        iter_val = make_loopbind_from_expr(binding);
+        if (!iter_val) {
+            ast_expr_free(iterable);
+            ast_expr_free(binding);
+            return NULL;
+        }
+    } else if (binding->kind == EXPR_TUPLE_LIT && binding->as.list_lit.count == 2) {
+        Expr *a = binding->as.list_lit.items[0];
+        Expr *b = binding->as.list_lit.items[1];
 
-        if (match_tok(p, TK_COMMA)) {
-            LoopBind *second = parse_loop_bind(p);
-            iter_key = first;
-            iter_val = second;
-        } else {
-            iter_val = first;
+        iter_key = make_loopbind_from_expr(a);
+        iter_val = make_loopbind_from_expr(b);
+
+        if (!iter_key || !iter_val) {
+            ast_loop_bind_free(iter_key);
+            ast_loop_bind_free(iter_val);
+            ast_expr_free(iterable);
+            ast_expr_free(binding);
+            parser_error(p, op, "tuple destructuring in shorthand for requires identifiers");
+            return NULL;
         }
     } else {
-        iter_val = parse_loop_bind(p);
+        ast_expr_free(iterable);
+        ast_expr_free(binding);
+        parser_error(p, op, "invalid binding in shorthand for");
+        return NULL;
     }
 
-    expect(p, TK_KW_IN, "expected 'in' after iterator");
-    Expr *collection = parse_expr(p);
-    expect(p, TK_RPAREN, "expected ')' after collection");
+    ast_expr_free(binding);
 
-    Stmt *body = parse_block(p);
-
-    return ast_for(iter_key, iter_val, collection, body, loc);
-}
-/* return expr? ; */
-Stmt *parse_return(Parser *p) {
-    Loc loc = cur(p)->loc;
-    advance(p);
-    Expr *value = NULL;
-    if (!check(p, TK_SEMICOLON) && !check(p, TK_NEWLINE) &&
-        !check(p, TK_RBRACE)   && !check(p, TK_EOF))
-        value = parse_expr(p);
-    match_tok(p, TK_SEMICOLON);
-    return ast_return(value, loc);
-}
-
-/* print expr, expr, ...  > redirect? ; */
-Stmt *parse_print(Parser *p) {
-    Loc loc = cur(p)->loc;
-    advance(p);   /* consume 'print' */
-
-    size_t cap = 4, count = 0;
-    Expr **args = malloc(sizeof(Expr *) * cap);
-
-    while (!check(p, TK_SEMICOLON) && !check(p, TK_NEWLINE) &&
-           !check(p, TK_GT)        && !check(p, TK_GT_GT)   &&
-           !check(p, TK_PIPE)      && !check(p, TK_EOF)) {
-        if (count >= cap) { cap *= 2; args = realloc(args, sizeof(Expr*)*cap); }
-        args[count++] = parse_expr(p);
-        if (!match_tok(p, TK_COMMA)) break;
+    Stmt *body = parse_stmt_body(p);
+    if (!body) {
+        ast_expr_free(iterable);
+        ast_loop_bind_free(iter_key);
+        ast_loop_bind_free(iter_val);
+        return NULL;
     }
 
-    /* optional redirect: > file  >> file  | cmd */
-    Expr *redirect = NULL;
-    uint8_t redirect_op = 0;
-    if      (check(p, TK_GT))     { redirect_op = 1; advance(p); redirect = parse_expr(p); }
-    else if (check(p, TK_GT_GT))  { redirect_op = 2; advance(p); redirect = parse_expr(p); }
-    else if (check(p, TK_PIPE))   { redirect_op = 3; advance(p); redirect = parse_expr(p); }
-
-    match_tok(p, TK_SEMICOLON);
-    return ast_print(args, count, redirect, redirect_op, loc);
+    return ast_for_short(iterable, iter_key, iter_val, body, op->loc);
 }
-
-/* printf fmt, arg, ... ; */
-Stmt *parse_printf(Parser *p) {
-    Loc loc = cur(p)->loc;
-    advance(p);   /* consume 'printf' */
-
-    size_t cap = 4, count = 0;
-    Expr **args = malloc(sizeof(Expr *) * cap);
-
-    while (!check(p, TK_SEMICOLON) && !check(p, TK_NEWLINE) &&
-           !check(p, TK_GT)        && !check(p, TK_GT_GT)   &&
-           !check(p, TK_PIPE)      && !check(p, TK_EOF)) {
-        if (count >= cap) { cap *= 2; args = realloc(args, sizeof(Expr*)*cap); }
-        args[count++] = parse_expr(p);
-        if (!match_tok(p, TK_COMMA)) break;
+static Expr *parse_stmt_head(Parser *p) {
+    return parse_postfix(p);
+}
+Stmt *parse_rule_body(Parser *p) {
+    if (parser_match(p, TK_LBRACE)) {
+        return parse_block(p);
     }
 
-    Expr *redirect = NULL;
-    uint8_t redirect_op = 0;
-    if      (check(p, TK_GT))     { redirect_op = 1; advance(p); redirect = parse_expr(p); }
-    else if (check(p, TK_GT_GT))  { redirect_op = 2; advance(p); redirect = parse_expr(p); }
-    else if (check(p, TK_PIPE))   { redirect_op = 3; advance(p); redirect = parse_expr(p); }
-
-    match_tok(p, TK_SEMICOLON);
-    return ast_printf_stmt(args, count, redirect, redirect_op, loc);
+    parser_error(p, parser_current(p), "expected '{' to start rule body");
+    return NULL;
 }
-
-/* outfmt "csv"|"tsv"|"json"|"text" ; */
-Stmt *parse_outfmt(Parser *p) {
-    Loc loc = cur(p)->loc;
-    advance(p);   /* consume 'outfmt' */
-
-    uint8_t mode = XF_OUTFMT_TEXT;
-    if (check(p, TK_STR)) {
-        Token *t = advance(p);
-        if      (strncmp(t->val.str.data, "csv",  3) == 0) mode = XF_OUTFMT_CSV;
-        else if (strncmp(t->val.str.data, "tsv",  3) == 0) mode = XF_OUTFMT_TSV;
-        else if (strncmp(t->val.str.data, "json", 4) == 0) mode = XF_OUTFMT_JSON;
-        else if (strncmp(t->val.str.data, "text", 4) == 0) mode = XF_OUTFMT_TEXT;
-        else parser_warning(p, "unknown outfmt mode; defaulting to 'text'");
-    } else {
-        parser_error(p, "expected string after 'outfmt'");
-    }
-
-    match_tok(p, TK_SEMICOLON);
-    return ast_outfmt(mode, loc);
-}
-
-/* spawn call ; */
-Stmt *parse_spawn(Parser *p) {
-    Loc loc = cur(p)->loc;
-    advance(p);
-    Expr *call = parse_expr(p);
-    match_tok(p, TK_SEMICOLON);
-    return ast_spawn(call, loc);
-}
-
-/* join handle ;
- * Only called when join is NOT followed by '(' — in that case
- * it is parsed as an expression (builtin call) instead. */
-Stmt *parse_join(Parser *p) {
-    Loc loc = cur(p)->loc;
-    advance(p);
-    Expr *handle = parse_expr(p);
-    match_tok(p, TK_SEMICOLON);
-    return ast_join(handle, loc);
-}
-
-/* import "path" ; */
-Stmt *parse_import(Parser *p) {
-    Loc loc = cur(p)->loc;
-    advance(p);
-    Token *path_tok = expect(p, TK_STR, "expected string path after 'import'");
-    xf_Str *path = xf_str_new(path_tok->val.str.data, path_tok->val.str.len);
-    match_tok(p, TK_SEMICOLON);
-    Stmt *s = ast_import(path, loc);
-    xf_str_release(path);
-    return s;
-}
-
-/* type fn name(params) { body } — as a statement inside a block */
-Stmt *parse_fn_decl(Parser *p) {
-    Loc loc = cur(p)->loc;
-    uint8_t ret = parse_type(p);
-    advance(p);   /* consume 'fn' */
-    Token *name_tok = expect(p, TK_IDENT, "expected function name");
-    xf_Str *name = tok_to_str(name_tok);
-
-    size_t pc;
-    Param *params = parse_paramlist(p, &pc);
-
-    /* register in current scope before parsing body (allows recursion) */
-    sym_declare(p->syms, name, SYM_FN, XF_TYPE_FN, loc);
-
-    Scope *fn_sc = sym_push(p->syms, SCOPE_FN);
-    fn_sc->fn_ret_type = ret;
-
-    /* declare params in fn scope */
-    for (size_t i = 0; i < pc; i++)
-        sym_declare(p->syms, params[i].name, SYM_PARAM, params[i].type, params[i].loc);
-
-    Stmt *body = parse_block(p);
-scope_free(sym_pop(p->syms));
-    Stmt *s = ast_fn_decl(ret, name, params, pc, body, loc);
-    xf_str_release(name);
-
-    return s;
-}
-
-/* type name = expr? ; — variable declaration */
-Stmt *parse_var_decl(Parser *p, uint8_t type) {
-    Loc     loc  = cur(p)->loc;
-    Token  *name = expect(p, TK_IDENT, "expected variable name");
-    xf_Str *n    = tok_to_str(name);
-
-    Expr *init = NULL;
-    if (match_tok(p, TK_EQ)) {
-        if (type == XF_TYPE_SET && check(p, TK_LBRACE)) {
-            Loc sloc = cur(p)->loc; advance(p);
-            Expr **items = NULL; size_t count=0, cap=0;
-            if (!check(p, TK_RBRACE)) {
-                for(;;){if(count==cap){size_t nc=cap?cap*2:4;items=realloc(items,nc*sizeof(*items));cap=nc;}items[count++]=parse_expr(p);if(match_tok(p,TK_COMMA)){if(check(p,TK_RBRACE))break;continue;}break;}
-            }
-            expect(p, TK_RBRACE, "expected '}' after set literal");
-            init = ast_set_lit(items, count, sloc);
-        } else { init = parse_expr(p); }
-    }
-
-    match_tok(p, TK_SEMICOLON);
-
-    sym_declare(p->syms, n, SYM_VAR, type, loc);
-    Stmt *s = ast_var_decl(type, n, init, loc);
-    xf_str_release(n);
-    return s;
-}
-
 Stmt *parse_stmt(Parser *p) {
-    Loc loc = cur(p)->loc;
+    if (parser_match(p, TK_LBRACE)) {
+        return parse_block(p);
+    }
 
-    /* skip stray newlines / semicolons */
-    while (check(p, TK_NEWLINE) || check(p, TK_SEMICOLON)) advance(p);
-    if (check(p, TK_EOF)) return NULL;
+    if (parser_match(p, TK_KW_BREAK)) {
+        return ast_break(parser_previous(p)->loc);
+    }
+    if (parser_match(p, TK_KW_NEXT)) {
+        return ast_next(parser_previous(p)->loc);
+    }
+    if (parser_match(p, TK_KW_EXIT)) {
+        Token *kw = parser_previous(p);
+        return ast_exit(kw->loc);
+    }
+        if (parser_match(p, TK_KW_DELETE)) {
+        return parse_delete(p);
+    }
+        if (parser_match(p, TK_KW_OUTFMT)) {
+        return parse_outfmt(p);
+    }
 
-    /* block */
-    if (check(p, TK_LBRACE)) return parse_block(p);
+    if (parser_match(p, TK_KW_FOR)) {
+        return parse_for(p);
+    }
 
-    /* fn declaration: type fn name ... */
-    if (is_type_kw(p) && peek_at(p, 1)->kind == TK_KW_FN)
-        return parse_fn_decl(p);
+    if (parser_match(p, TK_KW_WHILE)) {
+        return parse_while(p);
+    }
 
-    /* variable declaration: type name */
-    if (is_type_kw(p) && peek_at(p, 1)->kind == TK_IDENT) {
+    if (parser_match(p, TK_KW_IF)) {
+        return parse_if(p);
+    }
+
+    if (token_is_type_kw(parser_current(p)->kind)) {
         uint8_t type = parse_type(p);
+
+        if (parser_match(p, TK_KW_FN)) {
+            return parse_fn_decl(p, type);
+        }
+
         return parse_var_decl(p, type);
     }
 
-    /* type keyword before a built-in ivar (e.g. "str FS = ","") is a
-     * common mistake — FS/RS/OFS/ORS are built-ins, not user variables.
-     * Consume the type keyword and parse the rest as an expression so
-     * the ivar assignment still takes effect at runtime. */
-    if (is_type_kw(p) && (peek_at(p, 1)->kind == TK_VAR_FS  ||
-                           peek_at(p, 1)->kind == TK_VAR_RS  ||
-                           peek_at(p, 1)->kind == TK_VAR_OFS ||
-                           peek_at(p, 1)->kind == TK_VAR_ORS ||
-                           peek_at(p, 1)->kind == TK_VAR_OFMT ||
-                           peek_at(p, 1)->kind == TK_VAR_NR  ||
-                           peek_at(p, 1)->kind == TK_VAR_NF  ||
-                           peek_at(p, 1)->kind == TK_VAR_FNR)) {
-        parser_warning(p, "type keyword before built-in variable ignored; "
-                          "did you mean a bare assignment?");
-        advance(p);   /* discard the type keyword */
-        /* fall through to expr-stmt below */
+    if (parser_match(p, TK_KW_RETURN)) {
+        return parse_return(p);
     }
 
-    /* control flow */
-    if (check(p, TK_KW_IF))     return parse_if(p);
-    if (check(p, TK_KW_WHILE))  return parse_while(p);
-    if (check(p, TK_KW_FOR))    return parse_for(p);
-    if (check(p, TK_KW_RETURN)) return parse_return(p);
-    if (check(p, TK_KW_PRINT))   return parse_print(p);
-    if (check(p, TK_KW_PRINTF))  return parse_printf(p);
-    if (check(p, TK_KW_OUTFMT))  return parse_outfmt(p);
-    if (check(p, TK_KW_SPAWN))  return parse_spawn(p);
-    /* FIX: only treat 'join' as a statement when NOT followed by '('.
-     * When followed by '(', fall through to expr-stmt so it parses as
-     * a builtin call expression: r = join(tid) */
-    if (check(p, TK_KW_JOIN) && peek_at(p, 1)->kind != TK_LPAREN)
+    if (parser_match(p, TK_KW_PRINT)) {
+        return parse_print(p);
+    }
+
+    if (parser_match(p, TK_KW_PRINTF)) {
+        return parse_printf(p);
+    }
+
+    if (parser_match(p, TK_KW_IMPORT)) {
+        return parse_import(p);
+    }
+
+    if (parser_match(p, TK_KW_JOIN)) {
         return parse_join(p);
-    if (check(p, TK_KW_IMPORT)) return parse_import(p);
-
-    if (check(p, TK_KW_NEXT)) {
-        advance(p); match_tok(p, TK_SEMICOLON);
-        return ast_next(loc);
-    }
-    if (check(p, TK_KW_EXIT)) {
-        advance(p); match_tok(p, TK_SEMICOLON);
-        return ast_exit(loc);
-    }
-    if (check(p, TK_KW_BREAK)) {
-        advance(p); match_tok(p, TK_SEMICOLON);
-        return ast_break(loc);
-    }
-    if (check(p, TK_KW_DELETE)) {
-        advance(p);
-        Expr *target = parse_expr(p);
-        match_tok(p, TK_SEMICOLON);
-        return ast_delete(target, loc);
     }
 
-    /* s/pat/rep/flags */
-    if (check(p, TK_SUBST)) {
-        Token *t = advance(p);
-        xf_Str *pat = xf_str_from_cstr(t->val.re.pattern);
-        xf_Str *rep = xf_str_from_cstr(t->val.re.replacement);
-        Stmt *s = ast_subst(pat, rep, t->val.re.flags, NULL, loc);
-        xf_str_release(pat); xf_str_release(rep);
-        match_tok(p, TK_SEMICOLON);
-        return s;
-    }
+    /* ---- expression / shorthand zone ---- */
+    size_t save_pos = p->pos;
+    bool save_had_error = p->had_error;
+    bool save_panic = p->panic_mode;
+    char save_err_msg[sizeof(p->err_msg)];
+    memcpy(save_err_msg, p->err_msg, sizeof(p->err_msg));
+    Loc save_err_loc = p->err_loc;
 
-    /* y/from/to/ */
-    if (check(p, TK_TRANS)) {
-        Token *t = advance(p);
-        xf_Str *from = xf_str_from_cstr(t->val.trans.from);
-        xf_Str *to   = xf_str_from_cstr(t->val.trans.to);
-        Stmt *s = ast_trans(from, to, NULL, loc);
-        xf_str_release(from); xf_str_release(to);
-        match_tok(p, TK_SEMICOLON);
-        return s;
+    Expr *head = parse_stmt_head(p);
+    if (!head) return NULL;
+
+    if (parser_match(p, TK_DIAMOND)) {
+        return parse_shorthand_while(p, head);
     }
 
     /*
-     * Shorthand while:   expr <> stmt ;
-     * Shorthand for:     expr[ident] > stmt ;
-     * Detected after parsing the left expression.
+     * Only treat '>' as shorthand-for if the left side is actually
+     * collection[binding]. Otherwise rewind and parse as a normal expr stmt.
      */
-    /* shorthand for: collection[iter] > body
-     * Must be detected before parse_expr(), otherwise '>' is parsed
-     * as the normal comparison operator. */
-if (looks_like_shorthand_for(p)) {
-    Token *name_tok = expect(p, TK_IDENT, "expected collection name");
-    xf_Str *name = tok_to_str(name_tok);
-    Expr *collection = ast_ident(name, loc);
-    xf_str_release(name);
-
-    expect(p, TK_LBRACKET, "expected '[' in shorthand for");
-
-    LoopBind *iter_key = NULL;
-    LoopBind *iter_val = NULL;
-
-    LoopBind *first = parse_loop_bind(p);
-    if (match_tok(p, TK_COMMA)) {
-        LoopBind *second = parse_loop_bind(p);
-        iter_key = first;
-        iter_val = second;
-    } else {
-        iter_val = first;
+    if (parser_check(p, TK_GT) && head->kind == EXPR_SUBSCRIPT) {
+        parser_advance(p); /* consume '>' */
+        return parse_shorthand_for(p, head);
     }
+    /*
+     * Not shorthand.
+     * Rewind and parse a full expression statement so normal assignments,
+     * arithmetic, coalesce, pipes, comparisons, etc. all work again.
+     */
+    ast_expr_free(head);
+    p->pos = save_pos;
+    p->had_error = save_had_error;
+    p->panic_mode = save_panic;
+    memcpy(p->err_msg, save_err_msg, sizeof(p->err_msg));
+    p->err_loc = save_err_loc;
 
-    expect(p, TK_RBRACKET, "expected ']' after iterator binding");
-    expect(p, TK_GT, "expected '>' after shorthand iterator");
+    Expr *e = parse_expr(p);
+    if (!e) return NULL;
 
-    Stmt *body = check(p, TK_LBRACE) ? parse_block(p) : parse_stmt(p);
-
-    Stmt *s = ast_for_short(collection, iter_key, iter_val, body, loc);
-    match_tok(p, TK_SEMICOLON);
-    return s;
+    return ast_expr_stmt(e, e->loc);
 }
-        /* shorthand while / normal expr stmt */
-    Expr *expr = parse_expr(p);
+uint8_t parse_type(Parser *p) {
+    Token *tok = parser_current(p);
 
-    if (match_tok(p, TK_DIAMOND)) {
-        Stmt *body = check(p, TK_LBRACE)
-                         ? parse_block(p)
-                         : parse_stmt(p);
-        match_tok(p, TK_SEMICOLON);
-        return ast_while_short(expr, body, loc);
+    switch (tok->kind) {
+        case TK_KW_NUM:   parser_advance(p); return XF_TYPE_NUM;
+        case TK_KW_STR:   parser_advance(p); return XF_TYPE_STR;
+        case TK_KW_MAP:   parser_advance(p); return XF_TYPE_MAP;
+        case TK_KW_SET:   parser_advance(p); return XF_TYPE_SET;
+        case TK_KW_ARR:   parser_advance(p); return XF_TYPE_ARR;
+        case TK_KW_TUPLE: parser_advance(p); return XF_TYPE_TUPLE;
+        case TK_KW_FN:    parser_advance(p); return XF_TYPE_FN;
+        case TK_KW_VOID:  parser_advance(p); return XF_TYPE_VOID;
+        case TK_KW_BOOL:  parser_advance(p); return XF_TYPE_BOOL;
+        default:
+            parser_error(p, tok, "expected type");
+            return XF_TYPE_VOID;
     }
-
-    match_tok(p, TK_SEMICOLON);
-    return ast_expr_stmt(expr, loc);
-    }
-
-
-/* ============================================================
- * Top-level parsing
- * ============================================================ */
-
-/* type fn name(params) { body } — at top level */
+}
 TopLevel *parse_fn_decl_top(Parser *p) {
-    Loc loc = cur(p)->loc;
-    uint8_t ret = parse_type(p);
-    advance(p);   /* consume 'fn' */
-    Token *name_tok = expect(p, TK_IDENT, "expected function name");
-    xf_Str *name = tok_to_str(name_tok);
+    if (!p) return NULL;
 
-    size_t pc;
-    Param *params = parse_paramlist(p, &pc);
+    Loc loc = parser_current(p)->loc;
 
-    sym_declare(p->syms, name, SYM_FN, XF_TYPE_FN, loc);
+    uint8_t ret_type = parse_type(p);
 
-    Scope *fn_sc = sym_push(p->syms, SCOPE_FN);
-    fn_sc->fn_ret_type = ret;
-    for (size_t i = 0; i < pc; i++)
-        sym_declare(p->syms, params[i].name, SYM_PARAM, params[i].type, params[i].loc);
+    if (!parser_match(p, TK_KW_FN)) {
+        parser_error(p, parser_current(p), "expected 'fn' after return type");
+        return NULL;
+    }
+
+    Token *name_tok = parser_consume(p, TK_IDENT, "expected function name");
+    if (!name_tok) return NULL;
+
+    xf_Str *name = xf_str_new(name_tok->lexeme, name_tok->lexeme_len);
+    if (!name) return NULL;
+
+    if (!parser_consume(p, TK_LPAREN, "expected '(' after function name")) {
+        xf_str_release(name);
+        return NULL;
+    }
+
+    size_t param_count = 0;
+    Param *params = parse_paramlist(p, &param_count);
+
+    if (!parser_consume(p, TK_RPAREN, "expected ')' after parameter list")) {
+        xf_str_release(name);
+        if (params) {
+            for (size_t i = 0; i < param_count; i++) {
+                xf_str_release(params[i].name);
+                ast_expr_free(params[i].default_val);
+            }
+            free(params);
+        }
+        return NULL;
+    }
+
+    if (p->syms) {
+        sym_declare(p->syms, name, SYM_FN, XF_TYPE_FN, loc);
+        sym_push(p->syms, SCOPE_FN);
+        Scope *fn_sc = sym_fn_scope(p->syms);
+        if (fn_sc) fn_sc->fn_ret_type = ret_type;
+
+        for (size_t i = 0; i < param_count; i++) {
+            sym_declare(p->syms, params[i].name, SYM_PARAM, params[i].type, params[i].loc);
+        }
+    }
+
+    if (!parser_consume(p, TK_LBRACE, "expected '{' before function body")) {
+        if (p->syms) sym_pop(p->syms);
+        xf_str_release(name);
+        if (params) {
+            for (size_t i = 0; i < param_count; i++) {
+                xf_str_release(params[i].name);
+                ast_expr_free(params[i].default_val);
+            }
+            free(params);
+        }
+        return NULL;
+    }
 
     Stmt *body = parse_block(p);
-scope_free(sym_pop(p->syms));
-    TopLevel *t = ast_top_fn(ret, name, params, pc, body, loc);
+    if (p->syms) sym_pop(p->syms);
+    if (!body) {
+        xf_str_release(name);
+        if (params) {
+            for (size_t i = 0; i < param_count; i++) {
+                xf_str_release(params[i].name);
+                ast_expr_free(params[i].default_val);
+            }
+            free(params);
+        }
+        return NULL;
+    }
+
+    TopLevel *t = ast_top_fn(ret_type, name, params, param_count, body, loc);
     xf_str_release(name);
     return t;
 }
-
-/* pattern-action rule, bare { body }, or top-level statement */
 TopLevel *parse_rule(Parser *p) {
-    Loc loc = cur(p)->loc;
+    if (!p) return NULL;
 
-    /* bare action: { body } — no pattern */
-    if (check(p, TK_LBRACE)) {
-        sym_push(p->syms, SCOPE_PATTERN);
+    Loc loc = parser_current(p)->loc;
+
+    /* bare action: { ... } */
+    if (parser_match(p, TK_LBRACE)) {
+        if (p->syms) sym_push(p->syms, SCOPE_PATTERN);
         Stmt *body = parse_block(p);
-scope_free(sym_pop(p->syms));
-                return ast_top_rule(NULL, body, loc);
+        if (p->syms) sym_pop(p->syms);
+        if (!body) return NULL;
+        return ast_top_rule(NULL, body, loc);
     }
 
-    /* statement-starting keywords that can never be a pattern expression —
-       route directly through parse_stmt and wrap as TOP_STMT.
-       FIX: TK_KW_JOIN only routes as a statement when NOT followed by '(';
-       otherwise it falls through to expression parsing as a builtin call. */
-    if (is_type_kw(p)              ||
-        check(p, TK_KW_IF)        ||
-        check(p, TK_KW_WHILE)     ||
-        check(p, TK_KW_FOR)       ||
-        check(p, TK_KW_PRINT)     ||
-        check(p, TK_KW_PRINTF)    ||
-        check(p, TK_KW_OUTFMT)    ||
-        check(p, TK_KW_RETURN)    ||
-        check(p, TK_KW_SPAWN)     ||
-        (check(p, TK_KW_JOIN) && peek_at(p, 1)->kind != TK_LPAREN) ||
-        check(p, TK_KW_NEXT)      ||
-        check(p, TK_KW_EXIT)      ||
-        check(p, TK_KW_BREAK)     ||
-        check(p, TK_KW_DELETE)    ||
-        check(p, TK_SUBST)        ||
-        check(p, TK_TRANS))
-    {
-        Stmt *s = parse_stmt(p);
-        return ast_top_stmt(s, loc);
-    }
+    Expr *pattern = parse_expr(p);
+    if (!pattern) return NULL;
 
-    /* expression — could be:
-     *   expr { }      → pattern-action rule
-     *   expr <> stmt  → shorthand while  (TOP_STMT)
-     *   expr[k] > s   → shorthand for    (TOP_STMT)
-     *   expr ;        → bare expression  (TOP_STMT)
-     * Parse the expression first, then dispatch on what follows. */
-if (looks_like_shorthand_for(p)) {
-    Token *name_tok = expect(p, TK_IDENT, "expected collection name");
-    xf_Str *name = tok_to_str(name_tok);
-    Expr *collection = ast_ident(name, loc);
-    xf_str_release(name);
-
-    expect(p, TK_LBRACKET, "expected '[' in shorthand for");
-
-    LoopBind *iter_key = NULL;
-    LoopBind *iter_val = NULL;
-
-    LoopBind *first = parse_loop_bind(p);
-    if (match_tok(p, TK_COMMA)) {
-        LoopBind *second = parse_loop_bind(p);
-        iter_key = first;
-        iter_val = second;
-    } else {
-        iter_val = first;
-    }
-
-    expect(p, TK_RBRACKET, "expected ']' after iterator binding");
-    expect(p, TK_GT, "expected '>' after shorthand iterator");
-
-    Stmt *body = check(p, TK_LBRACE) ? parse_block(p) : parse_stmt(p);
-
-    Stmt *s = ast_for_short(collection, iter_key, iter_val, body, loc);
-    match_tok(p, TK_SEMICOLON);
-    return ast_top_stmt(s, loc);
-}
-                        Expr *pattern = parse_expr(p);
-
-    /* pattern { body } — true pattern-action rule */
-    if (check(p, TK_LBRACE)) {
-        sym_push(p->syms, SCOPE_PATTERN);
+    /* pattern { ... } */
+    if (parser_match(p, TK_LBRACE)) {
+        if (p->syms) sym_push(p->syms, SCOPE_PATTERN);
         Stmt *body = parse_block(p);
-scope_free(sym_pop(p->syms));
-                return ast_top_rule(pattern, body, loc);
+        if (p->syms) sym_pop(p->syms);
+        if (!body) {
+            ast_expr_free(pattern);
+            return NULL;
+        }
+        return ast_top_rule(pattern, body, loc);
     }
 
-    /* expr <> body — shorthand while */
-    if (match_tok(p, TK_DIAMOND)) {
-        Stmt *body = check(p, TK_LBRACE) ? parse_block(p) : parse_stmt(p);
-        match_tok(p, TK_SEMICOLON);
-        return ast_top_stmt(ast_while_short(pattern, body, loc), loc);
-    }
-
-    match_tok(p, TK_SEMICOLON);
+    /* otherwise treat as top-level stmt expression */
     return ast_top_stmt(ast_expr_stmt(pattern, loc), loc);
 }
+Stmt *parse_printf(Parser *p) {
+    Token *kw = parser_previous(p);
 
-TopLevel *parse_top(Parser *p) {
-    while (check(p, TK_NEWLINE) || check(p, TK_SEMICOLON)) advance(p);
-    if (check(p, TK_EOF)) return NULL;
+    size_t cap = 4;
+    size_t count = 0;
+    Expr **args = calloc(cap, sizeof(Expr *));
+    if (!args) return NULL;
 
-    Loc loc = cur(p)->loc;
-
-    /* BEGIN { } */
-    if (check(p, TK_KW_BEGIN)) {
-        advance(p);
-        Stmt *body = parse_block(p);
-        return ast_top_begin(body, loc);
+    if (parser_check(p, TK_SEMICOLON) ||
+        parser_check(p, TK_NEWLINE) ||
+        parser_check(p, TK_RBRACE) ||
+        parser_is_at_end(p)) {
+        return ast_printf_stmt(args, 0, NULL, 0, kw->loc);
     }
 
-    /* END { } */
-    if (check(p, TK_KW_END)) {
-        advance(p);
-        Stmt *body = parse_block(p);
-        return ast_top_end(body, loc);
+    for (;;) {
+        if (count >= cap) {
+            size_t new_cap = cap * 2;
+            Expr **tmp = realloc(args, new_cap * sizeof(Expr *));
+            if (!tmp) {
+                for (size_t i = 0; i < count; i++) ast_expr_free(args[i]);
+                free(args);
+                return NULL;
+            }
+            args = tmp;
+            cap = new_cap;
+        }
+
+        Expr *arg = parse_expr(p);
+        if (!arg) {
+            for (size_t i = 0; i < count; i++) ast_expr_free(args[i]);
+            free(args);
+            return NULL;
+        }
+
+        args[count++] = arg;
+
+        if (!parser_match(p, TK_COMMA)) break;
     }
 
-    /* function declaration: type fn name ... */
-    if (is_type_kw(p) && peek_at(p, 1)->kind == TK_KW_FN)
-        return parse_fn_decl_top(p);
-
-    /* import at top level */
-    if (check(p, TK_KW_IMPORT)) {
-        Stmt *s = parse_import(p);
-        return ast_top_stmt(s, loc);
-    }
-
-    /* pattern-action rule or bare action */
-    return parse_rule(p);
+    return ast_printf_stmt(args, count, NULL, 0, kw->loc);
 }
+TopLevel *parse_top_level(Parser *p) {
+    if (!p || parser_is_at_end(p)) return NULL;
 
+    /* BEGIN { ... } */
+    if (parser_match(p, TK_KW_BEGIN)) {
+        Token *kw = parser_previous(p);
 
-/* ============================================================
- * Public entry points
- * ============================================================ */
+        if (!parser_consume(p, TK_LBRACE, "expected '{' after BEGIN")) {
+            return NULL;
+        }
 
-Program *parse(Lexer *lex, SymTable *syms) {
-    Parser p = {0};
-    p.lex  = lex;
-    p.syms = syms;
-    p.pos  = 0;
+        Stmt *body = parse_block(p);
+        if (!body) return NULL;
 
-    Program *prog = ast_program_new(lex->source_name);
+        return ast_top_begin(body, kw->loc);
+    }
 
-    while (!check(&p, TK_EOF)) {
-        TopLevel *item = parse_top(&p);
-        if (item) ast_program_push(prog, item);
-        if (p.had_error && p.panic_mode) synchronize(&p);
+    /* END { ... } */
+    if (parser_match(p, TK_KW_END)) {
+        Token *kw = parser_previous(p);
+
+        if (!parser_consume(p, TK_LBRACE, "expected '{' after END")) {
+            return NULL;
+        }
+
+        Stmt *body = parse_block(p);
+        if (!body) return NULL;
+
+        return ast_top_end(body, kw->loc);
+    }
+
+    /*
+     * IMPORTANT:
+     * A top-level '{ ... }' is a patternless rule,
+     * not a plain statement block.
+     */
+    if (parser_check(p, TK_LBRACE)) {
+        return parse_rule(p);
+    }
+
+    /* top-level typed fn decl vs top-level typed stmt */
+    if (token_is_type_kw(parser_current(p)->kind)) {
+        size_t save_pos = p->pos;
+
+        /* consume type just to look ahead */
+        (void)parse_type(p);
+        if (parser_match(p, TK_KW_FN)) {
+            p->pos = save_pos;
+            return parse_fn_decl_top(p);
+        }
+
+        p->pos = save_pos;
+        Stmt *s = parse_stmt(p);
+        if (!s) return NULL;
+        return ast_top_stmt(s, s->loc);
+    }
+    switch (parser_current(p)->kind) {
+        case TK_KW_IF:
+        case TK_KW_WHILE:
+        case TK_KW_FOR:
+        case TK_KW_RETURN:
+        case TK_KW_PRINT:
+        case TK_KW_PRINTF:
+        case TK_KW_IMPORT:
+        case TK_KW_JOIN:
+        case TK_KW_BREAK:
+        case TK_KW_NEXT:
+        case TK_KW_EXIT:
+        case TK_KW_DELETE:
+        case TK_KW_OUTFMT: {
+            Stmt *s = parse_stmt(p);
+            if (!s) return NULL;
+            return ast_top_stmt(s, s->loc);
+        }
+        default:
+            break;
+    }
+    /*
+     * Try rule parsing first for expression-headed top-level forms,
+     * then fall back to stmt parsing.
+     */
+    {
+        size_t save_pos = p->pos;
+        bool   save_had_error = p->had_error;
+        bool   save_panic = p->panic_mode;
+        char   save_err_msg[sizeof(p->err_msg)];
+        memcpy(save_err_msg, p->err_msg, sizeof(p->err_msg));
+        Loc    save_err_loc = p->err_loc;
+
+        TopLevel *rule = parse_rule(p);
+        if (rule) return rule;
+
+        p->pos = save_pos;
+        p->had_error = save_had_error;
+        p->panic_mode = save_panic;
+        memcpy(p->err_msg, save_err_msg, sizeof(p->err_msg));
+        p->err_loc = save_err_loc;
+    }
+
+    Stmt *s = parse_stmt(p);
+    if (!s) return NULL;
+    return ast_top_stmt(s, s->loc);
+}
+Program *parse_program(Parser *p) {
+    Program *prog = ast_program_new(p->lex ? p->lex->source_name : NULL);
+    if (!prog) return NULL;
+
+    while (!parser_is_at_end(p)) {
+        while (parser_match(p, TK_NEWLINE) || parser_match(p, TK_SEMICOLON)) {
+        }
+
+        if (parser_is_at_end(p)) break;
+
+        TopLevel *tl = parse_top_level(p);
+        if (!tl) {
+            ast_program_free(prog);
+            return NULL;
+        }
+
+        ast_program_push(prog, tl);
     }
 
     return prog;
 }
-TopLevel *parse_repl_line(Lexer *lex, SymTable *syms) {
-    Parser p = {0};
-    p.lex  = lex;
-    p.syms = syms;
-    p.pos  = 0;
+Stmt *parse_if(Parser *p) {
+    Token *kw = parser_previous(p);
 
-    while (check(&p, TK_NEWLINE)) advance(&p);
-    if (check(&p, TK_EOF)) return NULL;
+    if (!parser_consume(p, TK_LPAREN, "expected '(' after 'if'")) return NULL;
 
-    return parse_top(&p);
+    Expr *cond = parse_expr(p);
+    if (!cond) return NULL;
+
+    if (!parser_consume(p, TK_RPAREN, "expected ')' after condition")) {
+        ast_expr_free(cond);
+        return NULL;
+    }
+
+    Stmt *then_branch = parse_stmt(p);
+    if (!then_branch) {
+        ast_expr_free(cond);
+        return NULL;
+    }
+
+    Branch *branches = calloc(1, sizeof(Branch));
+    if (!branches) {
+        ast_expr_free(cond);
+        ast_stmt_free(then_branch);
+        return NULL;
+    }
+
+    branches[0].cond = cond;
+    branches[0].body = then_branch;
+    branches[0].loc  = kw->loc;
+
+    Stmt *else_branch = NULL;
+
+    if (parser_match(p, TK_KW_ELIF)) {
+        else_branch = parse_if(p);
+        if (!else_branch) {
+            ast_expr_free(cond);
+            ast_stmt_free(then_branch);
+            free(branches);
+            return NULL;
+        }
+    } else if (parser_match(p, TK_KW_ELSE)) {
+        else_branch = parse_stmt(p);
+        if (!else_branch) {
+            ast_expr_free(cond);
+            ast_stmt_free(then_branch);
+            free(branches);
+            return NULL;
+        }
+    }
+
+    return ast_if(branches, 1, else_branch, kw->loc);
 }
+Stmt *parse_while(Parser *p) {
+    Token *kw = parser_previous(p);
 
-Expr *parse_expr_str(const char *src, SymTable *syms) {
-    Lexer lex;
-    xf_lex_init_cstr(&lex, src, XF_SRC_INLINE, "<expr>");
-    xf_tokenize(&lex);
+    if (!parser_consume(p, TK_LPAREN, "expected '(' after 'while'")) return NULL;
 
-    Parser p = {0};
-    p.lex  = &lex;
-    p.syms = syms;
+    Expr *cond = parse_expr(p);
+    if (!cond) return NULL;
 
-    Expr *e = parse_expr(&p);
-    xf_lex_free(&lex);
-    return e;
+    if (!parser_consume(p, TK_RPAREN, "expected ')' after condition")) {
+        ast_expr_free(cond);
+        return NULL;
+    }
+
+    Stmt *body = parse_stmt(p);
+    if (!body) {
+        ast_expr_free(cond);
+        return NULL;
+    }
+
+    return ast_while(cond, body, kw->loc);
+}
+Stmt *parse_fn_decl(Parser *p, uint8_t ret_type) {
+    Token *fn_tok = parser_previous(p);
+
+    Token *name_tok = parser_consume(p, TK_IDENT, "expected function name after 'fn'");
+    if (!name_tok) return NULL;
+
+    xf_Str *name = xf_str_new(name_tok->lexeme, name_tok->lexeme_len);
+    if (!name) return NULL;
+
+    if (!parser_consume(p, TK_LPAREN, "expected '(' after function name")) {
+        xf_str_release(name);
+        return NULL;
+    }
+
+    size_t param_count = 0;
+    Param *params = parse_paramlist(p, &param_count);
+    if (p->had_error) { /* ignore if your compiler wants p->had_error here */
+        xf_str_release(name);
+        return NULL;
+    }
+
+    if (!parser_consume(p, TK_RPAREN, "expected ')' after parameter list")) {
+        xf_str_release(name);
+        free(params);
+        return NULL;
+    }
+
+    if (!parser_consume(p, TK_LBRACE, "expected '{' before function body")) {
+        xf_str_release(name);
+        free(params);
+        return NULL;
+    }
+
+    Stmt *body = parse_block(p);
+    if (!body) {
+        xf_str_release(name);
+        free(params);
+        return NULL;
+    }
+
+    /* fn_tok here is the 'fn' token; return type should already be tracked by caller */
+    Stmt *out = ast_fn_decl(ret_type, name, params, param_count, body, fn_tok->loc);
+    xf_str_release(name);
+    return out;
+}
+Program *xf_parse_program(Lexer *lex, SymTable *syms) {
+    Parser p;
+    parser_init(&p, lex, syms);
+    return parse_program(&p);
+}
+Param *parse_paramlist(Parser *p, size_t *out_count) {
+    if (out_count) *out_count = 0;
+
+    if (parser_check(p, TK_RPAREN)) {
+        return NULL;
+    }
+
+    size_t cap = 4;
+    size_t count = 0;
+    Param *params = calloc(cap, sizeof(Param));
+    if (!params) return NULL;
+
+    for (;;) {
+        if (!token_is_type_kw(parser_current(p)->kind)) {
+            parser_error(p, parser_current(p), "expected parameter type");
+            free(params);
+            return NULL;
+        }
+
+        uint8_t type = parse_type(p);
+
+        Token *name_tok = parser_consume(p, TK_IDENT, "expected parameter name");
+        if (!name_tok) {
+            free(params);
+            return NULL;
+        }
+
+        xf_Str *name = xf_str_new(name_tok->lexeme, name_tok->lexeme_len);
+        if (!name) {
+            free(params);
+            return NULL;
+        }
+
+        if (count >= cap) {
+            size_t new_cap = cap * 2;
+            Param *tmp = realloc(params, new_cap * sizeof(Param));
+            if (!tmp) {
+                xf_str_release(name);
+                free(params);
+                return NULL;
+            }
+            params = tmp;
+            cap = new_cap;
+        }
+
+        params[count].type = type;
+        params[count].name = name;
+        params[count].default_val = NULL;
+        count++;
+
+        if (!parser_match(p, TK_COMMA)) break;
+        if (parser_check(p, TK_RPAREN)) break;
+    }
+
+    if (out_count) *out_count = count;
+    return params;
 }

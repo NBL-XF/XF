@@ -1,10 +1,3 @@
-1. ALL OF THE IMPENDING LEAKS UNDEFS AND ADDR ISSUES
-2. V 1.0.0!!!!!!!!!!!!!!!!!!!!!!!!!!!
-3. ownership
-4. copy
-5. mutation
-6. movement
-7. concurrency models
-8. SIMD aware optimization
-9. NUMA awareness
-10. out of order software scheduling
+1. "a","b" should split with OFS
+2. printf in functions
+3. print coll is printing type rather than value

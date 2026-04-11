@@ -502,6 +502,6 @@ xf_module_t *build_generics(void) {
     FN("split",    XF_TYPE_ARR, cg_split);
     FN("strip",    XF_TYPE_STR, cg_strip);
     FN("contains", XF_TYPE_NUM, cg_contains);
-    FN("length",   XF_TYPE_NUM, cg_length);
+    FN("size",   XF_TYPE_NUM, cg_length);
     return m;
 }

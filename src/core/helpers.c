@@ -17,37 +17,75 @@ bool arg_num(xf_Value *args, size_t argc, size_t i, double *out) {
     xf_value_release(c);
     return false;
 }
-bool arg_str(xf_Value *args, size_t argc, size_t i,
-             const char **out, size_t *outlen) {
-    enum { ARG_STR_SLOTS = 16 };
-    static _Thread_local xf_Value slots[ARG_STR_SLOTS];
-    static _Thread_local bool     inited    = false;
-    static _Thread_local size_t   next_slot = 0;
-    if (!inited) {
-        for (size_t k = 0; k < ARG_STR_SLOTS; k++) slots[k] = xf_val_null();
-        inited = true;
+enum { ARG_STR_SLOTS = 16 };
+
+static _Thread_local xf_Value g_arg_str_slots[ARG_STR_SLOTS];
+static _Thread_local bool     g_arg_str_inited     = false;
+static _Thread_local size_t   g_arg_str_next_slot  = 0;
+void core_arg_str_cleanup(void) {
+    if (!g_arg_str_inited) return;
+
+    for (size_t k = 0; k < ARG_STR_SLOTS; k++) {
+        xf_value_release(g_arg_str_slots[k]);
+        g_arg_str_slots[k] = xf_val_null();
     }
+
+    g_arg_str_next_slot = 0;
+    g_arg_str_inited    = false;
+}
+bool arg_str(xf_Value *args, size_t argc, size_t i,
+             const char **out, size_t *outlen)
+{
+    if (!g_arg_str_inited) {
+        for (size_t k = 0; k < ARG_STR_SLOTS; k++)
+            g_arg_str_slots[k] = xf_val_null();
+        g_arg_str_inited = true;
+    }
+
     if (out)    *out    = "";
     if (outlen) *outlen = 0;
+
     if (i >= argc) return false;
+
     xf_Value v = args[i];
     if (v.state != XF_STATE_OK) return false;
-    xf_Value c = xf_coerce_str(v);
-    if (c.state != XF_STATE_OK) return false;
-    size_t slot = next_slot;
-    next_slot = (next_slot + 1u) % ARG_STR_SLOTS;
-    xf_value_release(slots[slot]);
-    slots[slot] = c;
-    if (slots[slot].data.str) {
-        if (out)    *out    = slots[slot].data.str->data;
-        if (outlen) *outlen = slots[slot].data.str->len;
+
+    /* Fast path: already a string */
+    if (v.type == XF_TYPE_STR && v.data.str) {
+        if (out)    *out    = v.data.str->data;
+        if (outlen) *outlen = v.data.str->len;
+        return true;
     }
+
+    /* Slow path: coerce */
+    xf_Value c = xf_coerce_str(v);
+    if (c.state != XF_STATE_OK) {
+        xf_value_release(c);
+        return false;
+    }
+
+    size_t slot = g_arg_str_next_slot;
+    g_arg_str_next_slot = (g_arg_str_next_slot + 1u) % ARG_STR_SLOTS;
+
+    /* release previous value in slot */
+    xf_value_release(g_arg_str_slots[slot]);
+
+    /* store new value (takes ownership of c) */
+    g_arg_str_slots[slot] = c;
+
+    if (g_arg_str_slots[slot].data.str) {
+        if (out)    *out    = g_arg_str_slots[slot].data.str->data;
+        if (outlen) *outlen = g_arg_str_slots[slot].data.str->len;
+    }
+
     return true;
 }
 
+
+
 xf_Value propagate(xf_Value *args, size_t argc) {
     for (size_t i = 0; i < argc; i++)
-        if (args[i].state != XF_STATE_OK) return args[i];
+        if (args[i].state != XF_STATE_OK) return xf_value_retain(args[i]);
     return xf_val_nav(XF_TYPE_VOID);
 }
 

@@ -156,73 +156,144 @@ static xf_Value cf_dedent(xf_Value *args, size_t argc) {
 }
 
 /* ── format() ─────────────────────────────────────────────────── */
-
 static xf_Value cf_format(xf_Value *args, size_t argc) {
     NEED(1);
-    const char *tmpl; size_t tlen;
-    if (!arg_str(args, argc, 0, &tmpl, &tlen)) return propagate(args, argc);
+
+    if (args[0].state != XF_STATE_OK ||
+        args[0].type  != XF_TYPE_STR ||
+        !args[0].data.str) {
+        return propagate(args, argc);
+    }
+
+    const char *tmpl = args[0].data.str->data;
+    size_t tlen      = args[0].data.str->len;
+
     xf_map_t *named = NULL;
-    if (argc >= 2 && args[1].state == XF_STATE_OK && args[1].type == XF_TYPE_MAP)
+    if (argc >= 2 &&
+        args[1].state == XF_STATE_OK &&
+        args[1].type  == XF_TYPE_MAP) {
         named = args[1].data.map;
-    size_t cap = tlen * 2 + 256; char *buf = malloc(cap); size_t pos = 0;
+    }
+
+    size_t cap = tlen * 2 + 256;
+    char *buf = malloc(cap);
+    if (!buf) return xf_val_nav(XF_TYPE_STR);
+
+    size_t pos = 0;
     size_t auto_idx = 0;
 
 #define CF_ENSURE(n) \
-    do { if (pos+(n)+2>=cap){cap=cap*2+(n)+2;buf=realloc(buf,cap);} } while(0)
+    do { \
+        if (pos + (n) + 2 >= cap) { \
+            size_t new_cap = cap * 2 + (n) + 2; \
+            char *tmp_buf = realloc(buf, new_cap); \
+            if (!tmp_buf) { \
+                free(buf); \
+                return xf_val_nav(XF_TYPE_STR); \
+            } \
+            buf = tmp_buf; \
+            cap = new_cap; \
+        } \
+    } while (0)
 
     for (const char *p = tmpl; *p; p++) {
-        if(*p == '}' && p[1]=='}'){
+        if (*p == '}' && p[1] == '}') {
             CF_ENSURE(1);
-            buf[pos++]='}';
+            buf[pos++] = '}';
             p++;
             continue;
         }
-        if (*p != '{') { CF_ENSURE(1); buf[pos++] = *p; continue; }
-        p++;
-        if (*p == '{') { CF_ENSURE(1); buf[pos++] = '{'; continue; }
-        char key[128]; size_t klen = 0;
-        while (*p && *p != '}' && klen < sizeof(key)-1) key[klen++] = *p++;
-        key[klen] = '\0';
-        if (*p != '}') break;
 
-        xf_Value val = xf_val_nav(XF_TYPE_VOID); bool debug_repr = false;
-        if (klen == 0) {
-            size_t ai = auto_idx + 1; if (ai < argc) val = args[ai]; auto_idx++;
-        } else if (strcmp(key, "!r") == 0) {
-            size_t ai = auto_idx + 1; if (ai < argc) val = args[ai]; auto_idx++; debug_repr = true;
-        } else if (key[0] >= '0' && key[0] <= '9') {
-            size_t idx = (size_t)atoi(key); size_t ai = idx + 1; if (ai < argc) val = args[ai];
-        } else if (named) {
-            xf_Str *ks = xf_str_from_cstr(key); val = xf_map_get(named, ks); xf_str_release(ks);
+        if (*p != '{') {
+            CF_ENSURE(1);
+            buf[pos++] = *p;
+            continue;
         }
 
-        char tmp[1024]; size_t tmp_len = 0;
+        p++;
+        if (*p == '{') {
+            CF_ENSURE(1);
+            buf[pos++] = '{';
+            continue;
+        }
+
+        char key[128];
+        size_t klen = 0;
+        while (*p && *p != '}' && klen < sizeof(key) - 1)
+            key[klen++] = *p++;
+        key[klen] = '\0';
+
+        if (*p != '}') break;
+
+        xf_Value val = xf_val_nav(XF_TYPE_VOID);
+        bool debug_repr = false;
+
+        if (klen == 0) {
+            size_t ai = auto_idx + 1;
+            if (ai < argc) val = args[ai];
+            auto_idx++;
+        } else if (strcmp(key, "!r") == 0) {
+            size_t ai = auto_idx + 1;
+            if (ai < argc) val = args[ai];
+            auto_idx++;
+            debug_repr = true;
+        } else if (key[0] >= '0' && key[0] <= '9') {
+            size_t idx = (size_t)atoi(key);
+            size_t ai  = idx + 1;
+            if (ai < argc) val = args[ai];
+        } else if (named) {
+            xf_Str *ks = xf_str_from_cstr(key);
+            val = xf_map_get(named, ks);
+            xf_str_release(ks);
+        }
+
+        char tmp[1024];
+        size_t tmp_len = 0;
+
         if (debug_repr) {
             if (val.state != XF_STATE_OK) {
                 snprintf(tmp, sizeof(tmp), "<%s>", XF_STATE_NAMES[val.state]);
+                tmp_len = strlen(tmp);
             } else {
                 xf_Value sv = xf_coerce_str(val);
-                snprintf(tmp, sizeof(tmp), "%s(%s)", XF_TYPE_NAMES[val.type],
-                         (sv.state==XF_STATE_OK && sv.data.str) ? sv.data.str->data : "?");
+                snprintf(tmp, sizeof(tmp), "%s(%s)",
+                         XF_TYPE_NAMES[val.type],
+                         (sv.state == XF_STATE_OK && sv.data.str) ? sv.data.str->data : "?");
+                tmp_len = strlen(tmp);
+                xf_value_release(sv);
             }
-            tmp_len = strlen(tmp);
         } else if (val.state == XF_STATE_OK) {
             xf_Value sv = xf_coerce_str(val);
             if (sv.state == XF_STATE_OK && sv.data.str) {
-                tmp_len = sv.data.str->len < sizeof(tmp)-1 ? sv.data.str->len : sizeof(tmp)-1;
-                memcpy(tmp, sv.data.str->data, tmp_len); tmp[tmp_len] = '\0';
+                tmp_len = sv.data.str->len < sizeof(tmp) - 1 ? sv.data.str->len : sizeof(tmp) - 1;
+                memcpy(tmp, sv.data.str->data, tmp_len);
+                tmp[tmp_len] = '\0';
+            } else {
+                tmp[0] = '\0';
+                tmp_len = 0;
             }
+            xf_value_release(sv);
         } else {
             snprintf(tmp, sizeof(tmp), "<%s>", XF_STATE_NAMES[val.state]);
             tmp_len = strlen(tmp);
         }
-        CF_ENSURE(tmp_len); memcpy(buf+pos, tmp, tmp_len); pos += tmp_len;
-    }
-#undef CF_ENSURE
-    buf[pos] = '\0';
-    xf_Value rv = make_str_val(buf, pos); free(buf); return rv;
-}
 
+        CF_ENSURE(tmp_len);
+        memcpy(buf + pos, tmp, tmp_len);
+        pos += tmp_len;
+
+        if (named && klen > 0 && !(key[0] >= '0' && key[0] <= '9') && strcmp(key, "!r") != 0) {
+            xf_value_release(val);
+        }
+    }
+
+#undef CF_ENSURE
+
+    buf[pos] = '\0';
+    xf_Value rv = make_str_val(buf, pos);
+    free(buf);
+    return rv;
+}
 /* ── number formatters ────────────────────────────────────────── */
 
 static xf_Value cf_comma(xf_Value *args, size_t argc) {
@@ -343,36 +414,70 @@ static void jb_json_str(JsonBuf *jb, const char *s) {
 static void jb_value(JsonBuf *jb, xf_Value v, int depth) {
     if (depth > 64) { jb_str_raw(jb,"null",4); return; }
     if (v.state != XF_STATE_OK) { jb_str_raw(jb,"null",4); return; }
+
     char tmp[64];
     switch (v.type) {
         case XF_TYPE_NUM:
-            if (v.data.num != v.data.num) { jb_str_raw(jb,"null",4); }
-            else if (v.data.num == (long long)v.data.num && v.data.num < 1e15)
-                { int n = snprintf(tmp,sizeof(tmp),"%lld",(long long)v.data.num); jb_str_raw(jb,tmp,(size_t)n); }
-            else { int n = snprintf(tmp,sizeof(tmp),"%.15g",v.data.num); jb_str_raw(jb,tmp,(size_t)n); }
+            if (v.data.num != v.data.num) {
+                jb_str_raw(jb,"null",4);
+            } else if (v.data.num == (long long)v.data.num && v.data.num < 1e15) {
+                int n = snprintf(tmp,sizeof(tmp),"%lld",(long long)v.data.num);
+                jb_str_raw(jb,tmp,(size_t)n);
+            } else {
+                int n = snprintf(tmp,sizeof(tmp),"%.15g",v.data.num);
+                jb_str_raw(jb,tmp,(size_t)n);
+            }
             break;
-        case XF_TYPE_STR: jb_json_str(jb, v.data.str ? v.data.str->data : ""); break;
+
+        case XF_TYPE_STR:
+            jb_json_str(jb, v.data.str ? v.data.str->data : "");
+            break;
+
         case XF_TYPE_ARR:
             jb_char(jb,'[');
-            if (v.data.arr) for (size_t i=0;i<v.data.arr->len;i++) { if(i) jb_char(jb,','); jb_value(jb,v.data.arr->items[i],depth+1); }
-            jb_char(jb,']'); break;
+            if (v.data.arr) {
+                for (size_t i = 0; i < v.data.arr->len; i++) {
+                    if (i) jb_char(jb,',');
+                    jb_value(jb, v.data.arr->items[i], depth + 1);
+                }
+            }
+            jb_char(jb,']');
+            break;
+
         case XF_TYPE_MAP:
             jb_char(jb,'{');
-            if (v.data.map) for (size_t i=0;i<v.data.map->order_len;i++) {
-                if(i) jb_char(jb,',');
-                xf_Str *k = v.data.map->order[i];
-                jb_json_str(jb, k ? k->data : ""); jb_char(jb,':');
-                jb_value(jb, xf_map_get(v.data.map,k), depth+1);
+            if (v.data.map) {
+                for (size_t i = 0; i < v.data.map->order_len; i++) {
+                    if (i) jb_char(jb,',');
+                    xf_Str *k = v.data.map->order[i];
+                    jb_json_str(jb, k ? k->data : "");
+                    jb_char(jb,':');
+
+                    xf_Value mv = xf_map_get(v.data.map, k);
+                    jb_value(jb, mv, depth + 1);
+                    xf_value_release(mv);
+                }
             }
-            jb_char(jb,'}'); break;
+            jb_char(jb,'}');
+            break;
+
         case XF_TYPE_SET:
             jb_char(jb,'[');
-            if (v.data.map) for (size_t i=0;i<v.data.map->order_len;i++) { if(i) jb_char(jb,','); xf_Str *k=v.data.map->order[i]; jb_json_str(jb,k?k->data:""); }
-            jb_char(jb,']'); break;
-        default: jb_str_raw(jb,"null",4); break;
+            if (v.data.map) {
+                for (size_t i = 0; i < v.data.map->order_len; i++) {
+                    if (i) jb_char(jb,',');
+                    xf_Str *k = v.data.map->order[i];
+                    jb_json_str(jb, k ? k->data : "");
+                }
+            }
+            jb_char(jb,']');
+            break;
+
+        default:
+            jb_str_raw(jb,"null",4);
+            break;
     }
 }
-
 static xf_Value cf_json(xf_Value *args, size_t argc) {
     NEED(1);
     JsonBuf jb = { .buf = malloc(256), .pos = 0, .cap = 256 };
@@ -424,48 +529,115 @@ static xf_Value jp_parse_string(JsonParser *jp) {
 
 static xf_Value jp_parse(JsonParser *jp, int depth) {
     if (depth > 255) return xf_val_nav(XF_TYPE_VOID);
+
     jp_skip_ws(jp);
     if (jp->p >= jp->end) return xf_val_nav(XF_TYPE_VOID);
+
     char c = *jp->p;
+
     if (c == '"') return jp_parse_string(jp);
-    if (c == 't') { if (jp->p+3<jp->end&&memcmp(jp->p,"true",4)==0){jp->p+=4;return xf_val_ok_num(1.0);} return xf_val_nav(XF_TYPE_VOID); }
-    if (c == 'f') { if (jp->p+4<jp->end&&memcmp(jp->p,"false",5)==0){jp->p+=5;return xf_val_ok_num(0.0);} return xf_val_nav(XF_TYPE_VOID); }
-    if (c == 'n') { if (jp->p+3<jp->end&&memcmp(jp->p,"null",4)==0){jp->p+=4;return xf_val_null();} return xf_val_nav(XF_TYPE_VOID); }
-    if (c == '-' || (c>='0' && c<='9')) {
-        char *end; double n = strtod(jp->p,&end); jp->p=end; return xf_val_ok_num(n);
+
+    if (c == 't') {
+        if (jp->p + 3 < jp->end && memcmp(jp->p, "true", 4) == 0) {
+            jp->p += 4;
+            return xf_val_ok_num(1.0);
+        }
+        return xf_val_nav(XF_TYPE_VOID);
     }
+
+    if (c == 'f') {
+        if (jp->p + 4 < jp->end && memcmp(jp->p, "false", 5) == 0) {
+            jp->p += 5;
+            return xf_val_ok_num(0.0);
+        }
+        return xf_val_nav(XF_TYPE_VOID);
+    }
+
+    if (c == 'n') {
+        if (jp->p + 3 < jp->end && memcmp(jp->p, "null", 4) == 0) {
+            jp->p += 4;
+            return xf_val_null();
+        }
+        return xf_val_nav(XF_TYPE_VOID);
+    }
+
+    if (c == '-' || (c >= '0' && c <= '9')) {
+        char *end;
+        double n = strtod(jp->p, &end);
+        jp->p = end;
+        return xf_val_ok_num(n);
+    }
+
     if (c == '[') {
-        jp->p++; xf_arr_t *a = xf_arr_new();
+        jp->p++;
+        xf_arr_t *a = xf_arr_new();
+
         jp_skip_ws(jp);
-        if (jp->p<jp->end && *jp->p==']') { jp->p++; goto arr_done; }
-        while (jp->p<jp->end) {
-            xf_arr_push(a, jp_parse(jp,depth+1)); jp_skip_ws(jp);
-            if (jp->p>=jp->end) break;
-            if (*jp->p==']'){jp->p++;break;} if (*jp->p==',') jp->p++;
+        if (jp->p < jp->end && *jp->p == ']') {
+            jp->p++;
+            goto arr_done;
         }
-        arr_done:;
-        xf_Value rv = xf_val_ok_arr(a); xf_arr_release(a); return rv;
-    }
-    if (c == '{') {
-        jp->p++; xf_map_t *m = xf_map_new();
-        jp_skip_ws(jp);
-        if (jp->p<jp->end && *jp->p=='}') { jp->p++; goto map_done; }
-        while (jp->p<jp->end) {
-            jp_skip_ws(jp); if (*jp->p!='"') break;
-            xf_Value kv = jp_parse_string(jp); jp_skip_ws(jp);
-            if (jp->p<jp->end && *jp->p==':') jp->p++;
-            xf_Value val = jp_parse(jp,depth+1);
-            if (kv.state==XF_STATE_OK && kv.data.str) xf_map_set(m, kv.data.str, val);
+
+        while (jp->p < jp->end) {
+            xf_arr_push(a, jp_parse(jp, depth + 1));
             jp_skip_ws(jp);
-            if (jp->p>=jp->end) break;
-            if (*jp->p=='}'){jp->p++;break;} if (*jp->p==',') jp->p++;
+            if (jp->p >= jp->end) break;
+            if (*jp->p == ']') { jp->p++; break; }
+            if (*jp->p == ',') jp->p++;
         }
-        map_done:;
-        xf_Value tmp = xf_val_ok_map(m); xf_map_release(m); return tmp;
+
+arr_done:
+        {
+            xf_Value rv = xf_val_ok_arr(a);
+            xf_arr_release(a);
+            return rv;
+        }
     }
+
+    if (c == '{') {
+        jp->p++;
+        xf_map_t *m = xf_map_new();
+
+        jp_skip_ws(jp);
+        if (jp->p < jp->end && *jp->p == '}') {
+            jp->p++;
+            goto map_done;
+        }
+
+        while (jp->p < jp->end) {
+            jp_skip_ws(jp);
+            if (*jp->p != '"') break;
+
+            xf_Value kv = jp_parse_string(jp);
+            jp_skip_ws(jp);
+
+            if (jp->p < jp->end && *jp->p == ':') jp->p++;
+
+            xf_Value val = jp_parse(jp, depth + 1);
+
+            if (kv.state == XF_STATE_OK && kv.data.str) {
+                xf_map_set(m, kv.data.str, val);
+            }
+
+            xf_value_release(kv);
+            xf_value_release(val);
+
+            jp_skip_ws(jp);
+            if (jp->p >= jp->end) break;
+            if (*jp->p == '}') { jp->p++; break; }
+            if (*jp->p == ',') jp->p++;
+        }
+
+map_done:
+        {
+            xf_Value tmp = xf_val_ok_map(m);
+            xf_map_release(m);
+            return tmp;
+        }
+    }
+
     return xf_val_nav(XF_TYPE_VOID);
 }
-
 static xf_Value cf_from_json(xf_Value *args, size_t argc) {
     NEED(1);
     const char *s; size_t slen;
@@ -517,94 +689,241 @@ static xf_Value cf_tsv_row(xf_Value *args, size_t argc) {
 }
 
 /* ── table ────────────────────────────────────────────────────── */
-
 static xf_Value cf_table(xf_Value *args, size_t argc) {
     NEED(1);
-    if (args[0].state!=XF_STATE_OK||args[0].type!=XF_TYPE_ARR||!args[0].data.arr)
+
+    if (args[0].state != XF_STATE_OK ||
+        args[0].type  != XF_TYPE_ARR ||
+        !args[0].data.arr) {
         return propagate(args, argc);
+    }
+
     xf_arr_t *rows = args[0].data.arr;
     if (rows->len == 0) return make_str_val("", 0);
 
-    xf_arr_t *cols_arr = NULL; bool free_cols = false;
-    if (argc>=2 && args[1].state==XF_STATE_OK && args[1].type==XF_TYPE_ARR && args[1].data.arr) {
+    xf_arr_t *cols_arr = NULL;
+    bool free_cols = false;
+
+    if (argc >= 2 &&
+        args[1].state == XF_STATE_OK &&
+        args[1].type  == XF_TYPE_ARR &&
+        args[1].data.arr) {
         cols_arr = args[1].data.arr;
     } else {
-        cols_arr = xf_arr_new(); free_cols = true;
+        cols_arr = xf_arr_new();
+        if (!cols_arr) return xf_val_nav(XF_TYPE_STR);
+        free_cols = true;
+
         xf_Value r0 = rows->items[0];
-        if (r0.state==XF_STATE_OK && r0.type==XF_TYPE_MAP && r0.data.map) {
+        if (r0.state == XF_STATE_OK &&
+            r0.type  == XF_TYPE_MAP &&
+            r0.data.map) {
             xf_map_t *m = r0.data.map;
-            for (size_t i=0;i<m->order_len;i++) xf_arr_push(cols_arr, xf_val_ok_str(m->order[i]));
+            for (size_t i = 0; i < m->order_len; i++) {
+                xf_arr_push(cols_arr, xf_val_ok_str(m->order[i]));
+            }
         }
     }
+
     size_t ncols = cols_arr->len;
-    if (ncols == 0) { if (free_cols) xf_arr_release(cols_arr); return make_str_val("",0); }
+    if (ncols == 0) {
+        if (free_cols) xf_arr_release(cols_arr);
+        return make_str_val("", 0);
+    }
 
     size_t *widths = calloc(ncols, sizeof(size_t));
-    for (size_t c=0;c<ncols;c++) {
-        xf_Value cv=xf_coerce_str(cols_arr->items[c]);
-        if (cv.state==XF_STATE_OK&&cv.data.str) widths[c]=cv.data.str->len;
+    if (!widths) {
+        if (free_cols) xf_arr_release(cols_arr);
+        return xf_val_nav(XF_TYPE_STR);
     }
-    for (size_t r=0;r<rows->len;r++) {
-        xf_Value row=rows->items[r];
-        if (row.state!=XF_STATE_OK||row.type!=XF_TYPE_MAP||!row.data.map) continue;
-        for (size_t c=0;c<ncols;c++) {
-            xf_Value colname=xf_coerce_str(cols_arr->items[c]);
-            if (colname.state!=XF_STATE_OK||!colname.data.str) continue;
-            xf_Value cell=xf_map_get(row.data.map, colname.data.str);
-            xf_Value cs=xf_coerce_str(cell);
-            if (cs.state==XF_STATE_OK&&cs.data.str&&cs.data.str->len>widths[c]) widths[c]=cs.data.str->len;
+
+    /* header widths */
+    for (size_t c = 0; c < ncols; c++) {
+        xf_Value cv = xf_coerce_str(cols_arr->items[c]);
+        if (cv.state == XF_STATE_OK && cv.data.str) {
+            widths[c] = cv.data.str->len;
+        }
+        xf_value_release(cv);
+    }
+
+    /* cell widths */
+    for (size_t r = 0; r < rows->len; r++) {
+        xf_Value row = rows->items[r];
+        if (row.state != XF_STATE_OK ||
+            row.type  != XF_TYPE_MAP ||
+            !row.data.map) {
+            continue;
+        }
+
+        for (size_t c = 0; c < ncols; c++) {
+            xf_Value colname = xf_coerce_str(cols_arr->items[c]);
+            if (colname.state != XF_STATE_OK || !colname.data.str) {
+                xf_value_release(colname);
+                continue;
+            }
+
+            xf_Value cell = xf_map_get(row.data.map, colname.data.str);
+            xf_Value cs   = xf_coerce_str(cell);
+
+            if (cs.state == XF_STATE_OK &&
+                cs.data.str &&
+                cs.data.str->len > widths[c]) {
+                widths[c] = cs.data.str->len;
+            }
+
+            xf_value_release(cs);
+            xf_value_release(cell);
+            xf_value_release(colname);
         }
     }
 
     size_t row_width = 1;
-    for (size_t c=0;c<ncols;c++) row_width += widths[c]+3;
-    size_t cap = (row_width+2)*(rows->len+4)+8;
-    char *buf = malloc(cap); size_t pos = 0;
+    for (size_t c = 0; c < ncols; c++) row_width += widths[c] + 3;
 
-#define TB_CHAR(ch) buf[pos++]=(ch)
-#define TB_STR(s,l) do{memcpy(buf+pos,s,l);pos+=(l);}while(0)
-#define TB_PAD(n)   do{memset(buf+pos,' ',n);pos+=(n);}while(0)
+    size_t cap = (row_width + 2) * (rows->len + 4) + 8;
+    char *buf = malloc(cap);
+    if (!buf) {
+        free(widths);
+        if (free_cols) xf_arr_release(cols_arr);
+        return xf_val_nav(XF_TYPE_STR);
+    }
+
+    size_t pos = 0;
+
+#define TB_ENSURE(n) \
+    do { \
+        if (pos + (n) + 1 >= cap) { \
+            size_t new_cap = cap * 2 + (n) + 64; \
+            char *tmp = realloc(buf, new_cap); \
+            if (!tmp) { \
+                free(buf); \
+                free(widths); \
+                if (free_cols) xf_arr_release(cols_arr); \
+                return xf_val_nav(XF_TYPE_STR); \
+            } \
+            buf = tmp; \
+            cap = new_cap; \
+        } \
+    } while (0)
+
+#define TB_CHAR(ch) \
+    do { \
+        TB_ENSURE(1); \
+        buf[pos++] = (ch); \
+    } while (0)
+
+#define TB_STR(s,l) \
+    do { \
+        TB_ENSURE(l); \
+        memcpy(buf + pos, (s), (l)); \
+        pos += (l); \
+    } while (0)
+
+#define TB_PAD(n) \
+    do { \
+        TB_ENSURE(n); \
+        memset(buf + pos, ' ', (n)); \
+        pos += (n); \
+    } while (0)
+
 #define TB_SEP() \
-    do { for (size_t _c=0;_c<ncols;_c++){TB_CHAR('+');memset(buf+pos,'-',widths[_c]+2);pos+=widths[_c]+2;} \
-         TB_CHAR('+'); TB_CHAR('\n'); } while(0)
+    do { \
+        for (size_t _c = 0; _c < ncols; _c++) { \
+            TB_CHAR('+'); \
+            TB_ENSURE(widths[_c] + 2); \
+            memset(buf + pos, '-', widths[_c] + 2); \
+            pos += widths[_c] + 2; \
+        } \
+        TB_CHAR('+'); \
+        TB_CHAR('\n'); \
+    } while (0)
 
+    /* top separator */
     TB_SEP();
-    for (size_t c=0;c<ncols;c++) {
-        TB_CHAR('|'); TB_CHAR(' ');
-        xf_Value cv=xf_coerce_str(cols_arr->items[c]);
-        const char *hdr=(cv.state==XF_STATE_OK&&cv.data.str)?cv.data.str->data:"";
-        size_t hlen=strlen(hdr); TB_STR(hdr,hlen); TB_PAD(widths[c]-hlen+1);
+
+    /* header row */
+    for (size_t c = 0; c < ncols; c++) {
+        TB_CHAR('|');
+        TB_CHAR(' ');
+
+        xf_Value cv = xf_coerce_str(cols_arr->items[c]);
+        const char *hdr = (cv.state == XF_STATE_OK && cv.data.str)
+                        ? cv.data.str->data
+                        : "";
+        size_t hlen = strlen(hdr);
+
+        TB_STR(hdr, hlen);
+        TB_PAD(widths[c] - hlen + 1);
+
+        xf_value_release(cv);
     }
-    TB_CHAR('|'); TB_CHAR('\n');
+    TB_CHAR('|');
+    TB_CHAR('\n');
+
+    /* middle separator */
     TB_SEP();
 
-    for (size_t r=0;r<rows->len;r++) {
-        xf_Value row=rows->items[r];
-        for (size_t c=0;c<ncols;c++) {
-            TB_CHAR('|'); TB_CHAR(' ');
-            const char *cell=""; size_t clen=0;
-            if (row.state==XF_STATE_OK&&row.type==XF_TYPE_MAP&&row.data.map) {
-                xf_Value colname=xf_coerce_str(cols_arr->items[c]);
-                if (colname.state==XF_STATE_OK&&colname.data.str) {
-                    xf_Value cv=xf_map_get(row.data.map,colname.data.str);
-                    xf_Value cs=xf_coerce_str(cv);
-                    if (cs.state==XF_STATE_OK&&cs.data.str){cell=cs.data.str->data;clen=cs.data.str->len;}
+    /* data rows */
+    for (size_t r = 0; r < rows->len; r++) {
+        xf_Value row = rows->items[r];
+
+        for (size_t c = 0; c < ncols; c++) {
+            TB_CHAR('|');
+            TB_CHAR(' ');
+
+            const char *cell = "";
+            size_t clen = 0;
+
+            if (row.state == XF_STATE_OK &&
+                row.type  == XF_TYPE_MAP &&
+                row.data.map) {
+                xf_Value colname = xf_coerce_str(cols_arr->items[c]);
+                if (colname.state == XF_STATE_OK && colname.data.str) {
+                    xf_Value cv = xf_map_get(row.data.map, colname.data.str);
+                    xf_Value cs = xf_coerce_str(cv);
+
+                    if (cs.state == XF_STATE_OK && cs.data.str) {
+                        cell = cs.data.str->data;
+                        clen = cs.data.str->len;
+                    }
+
+                    TB_STR(cell, clen);
+                    TB_PAD(widths[c] - clen + 1);
+
+                    xf_value_release(cs);
+                    xf_value_release(cv);
+                } else {
+                    TB_STR(cell, clen);
+                    TB_PAD(widths[c] - clen + 1);
                 }
+                xf_value_release(colname);
+            } else {
+                TB_STR(cell, clen);
+                TB_PAD(widths[c] - clen + 1);
             }
-            TB_STR(cell,clen); TB_PAD(widths[c]-clen+1);
         }
-        TB_CHAR('|'); TB_CHAR('\n');
+
+        TB_CHAR('|');
+        TB_CHAR('\n');
     }
+
+    /* bottom separator */
     TB_SEP();
 
+#undef TB_ENSURE
 #undef TB_CHAR
 #undef TB_STR
 #undef TB_PAD
 #undef TB_SEP
 
-    buf[pos]='\0';
-    xf_Value rv=make_str_val(buf,pos); free(buf); free(widths);
+    buf[pos] = '\0';
+
+    xf_Value rv = make_str_val(buf, pos);
+
+    free(buf);
+    free(widths);
     if (free_cols) xf_arr_release(cols_arr);
+
     return rv;
 }
 

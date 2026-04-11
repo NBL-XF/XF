@@ -1,131 +1,39 @@
 #ifndef XF_INTERP_H
 #define XF_INTERP_H
 
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include "value.h"
 #include "ast.h"
-#include "symTable.h"
 #include "vm.h"
+#include "symTable.h"
 
-/* ============================================================
- * xf interpreter
- *
- * Two modes:
- *
- *   Tree-walk (interp_eval_*):
- *     Directly evaluates AST nodes against a SymTable.
- *     Used by the REPL for fast turn-around — no compile step.
- *
- *   Compiler (interp_compile_*):
- *     Walks the AST and emits bytecode into a Chunk.
- *     Used for scripts and hot pattern-action rules.
- *     The VM then executes the Chunk.
- *
- * The REPL uses tree-walk for top-level expressions and
- * switches to compiled mode inside fn bodies that are called
- * more than once (future optimisation — stub for now).
- * ============================================================ */
-
-
-/* ------------------------------------------------------------
- * Interpreter context
- * ------------------------------------------------------------ */
-
-typedef struct {
-    SymTable *syms;
+typedef struct Interp {
     VM       *vm;
+    SymTable *syms;
     bool      had_error;
-    char      err_msg[512];
 
-    /* current function return value (for tree-walk) */
     bool      returning;
+    bool      breaking;
+    bool      continuing;
+
     xf_Value  return_val;
-
-    /* nexting / exiting / breaking */
-    bool      nexting;
-    bool      exiting;
-    bool      breaking;   /* break — exit innermost loop only */
-
-    /* implicit vars: $err, populated by interp_error */
-    xf_Value  last_err;   /* XF_STATE_NULL when no error has occurred */
-
-    /* imported program ASTs — kept alive so fn bodies remain valid.
-     * freed in interp_free(). */
-    Program **imp_progs;
-    size_t    imp_prog_count;
-    size_t    imp_prog_cap;
-
-    /* per-thread record context snapshot (set by worker threads).
-     * When use_rec_snap is true, all $N/$0/NR/NF/FS/OFS/ORS reads
-     * and writes go through rec_snap instead of vm->rec, so worker
-     * threads never race with the main thread's split_record. */
-    bool       use_rec_snap;
-    RecordCtx  rec_snap;
-    bool is_worker;
+    xf_Value  last_err;
 } Interp;
+/* global binding / compiler */
+uint32_t interp_bind_global_name(Interp *it, xf_Str *name);
+uint32_t interp_bind_global_cstr(Interp *it, const char *name);
+void     interp_reset_global_bindings(void);
 
-/* Route record context reads/writes through snapshot when in worker thread */
-#define IT_REC(it) ((it)->use_rec_snap ? &(it)->rec_snap : &(it)->vm->rec)
-
-
-/* ------------------------------------------------------------
- * Init / free
- * ------------------------------------------------------------ */
-
-void interp_init(Interp *it, SymTable *syms, VM *vm);
-void interp_free(Interp *it);
-
-
-/* ------------------------------------------------------------
- * Tree-walk evaluation (REPL / one-shot)
- * ------------------------------------------------------------ */
-
-/* evaluate a full program in tree-walk mode */
-int  interp_run_program(Interp *it, Program *prog);
-void interp_run_end(Interp *it, Program *prog);
-
-/* feed one input record through all TOP_RULE items.
- * Call this once per input line, between run_program's BEGIN and END phases. */
-void interp_print_record(Interp *it);
-void interp_feed_record(Interp *it, Program *prog,
-                        const char *rec, size_t len);
-
-/* evaluate one top-level item */
-xf_Value interp_eval_top(Interp *it, TopLevel *top);
-
-/* evaluate a statement; returns last value or NULL state */
-xf_Value interp_eval_stmt(Interp *it, Stmt *s);
-
-/* evaluate an expression */
+/* compiler entry */
+bool     interp_compile_program(Interp *it, Program *prog);
+void     interp_init(Interp *it, SymTable *syms, VM *vm);
+void     interp_free(Interp *it);
 xf_Value interp_eval_expr(Interp *it, Expr *e);
-
-
-/* ------------------------------------------------------------
- * Compiler (AST → Chunk)
- * ------------------------------------------------------------ */
-
-/* compile a full program into vm->rules / begin_chunk / end_chunk */
-bool interp_compile_program(Interp *it, Program *prog);
-
-/* compile a single expression into a fresh Chunk */
-Chunk *interp_compile_expr(Interp *it, Expr *e, const char *name);
-
-/* compile a statement block into a Chunk */
-Chunk *interp_compile_stmt(Interp *it, Stmt *s, const char *name);
-
-
-/* ------------------------------------------------------------
- * Built-in function dispatch
- * ------------------------------------------------------------ */
-
-xf_Value interp_call_builtin(Interp *it, const char *name,
-                              xf_Value *args, size_t argc);
-
-
-/* ------------------------------------------------------------
- * Error helpers
- * ------------------------------------------------------------ */
-
-void interp_error(Interp *it, Loc loc, const char *fmt, ...);
-void interp_type_err(Interp *it, Loc loc,
-                     const char *op, uint8_t got, uint8_t expected);
-
+xf_Value interp_eval_stmt(Interp *it, Stmt *s);
+bool     interp_run_program(Interp *it, Program *prog);
+xf_Value interp_exec_xf_fn_bridge(void *vm_ptr, void *syms_ptr,
+                                  xf_fn_t *fn, xf_Value *args, size_t argc);
 #endif /* XF_INTERP_H */

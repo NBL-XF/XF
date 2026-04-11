@@ -51,7 +51,7 @@ void core_register(SymTable *st);
  * ---------------------------------------------------------------- */
 typedef xf_Value (*xf_fn_caller_t)(void *vm, void *syms, xf_fn_t *fn,
                                     xf_Value *args, size_t argc);
-
+void core_arg_str_cleanup(void);
 void core_set_fn_caller(void *vm, void *syms, xf_fn_caller_t caller);
 
 #endif /* XF_CORE_H */

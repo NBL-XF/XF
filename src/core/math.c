@@ -19,14 +19,19 @@ static xf_Value cm_int(xf_Value *args, size_t argc)   { NEED(1); MATH1(trunc); }
 
 static xf_Value cm_ln(xf_Value *args, size_t argc) {
     NEED(1);
+
     xf_Value v = xf_coerce_num(args[0]);
     if (v.state != XF_STATE_OK) return v;
-    if (v.data.num <= 0.0)
-        return xf_val_err(xf_err_new("ln domain error", "<core.math>", 0, 0),
-                          XF_TYPE_NUM);
+
+    if (v.data.num <= 0.0) {
+        xf_err_t *e = xf_err_new("ln domain error", "<core.math>", 0, 0);
+        xf_Value out = xf_val_err(e, XF_TYPE_NUM);
+        xf_err_release(e);
+        return out;
+    }
+
     return xf_val_ok_num(log(v.data.num));
 }
-
 static xf_Value cm_atan2(xf_Value *args, size_t argc) { NEED(2); MATH2(atan2); }
 static xf_Value cm_pow(xf_Value *args, size_t argc)   { NEED(2); MATH2(pow);   }
 
@@ -90,10 +95,26 @@ xf_module_t *build_math(void) {
     FN("clamp", XF_TYPE_NUM,  cm_clamp);
     FN("rand",  XF_TYPE_NUM,  cm_rand);
     FN("srand", XF_TYPE_VOID, cm_srand);
-    xf_module_set(m, "i",   xf_val_ok_complex(0.0, 1.0));
-    xf_module_set(m, "pi",  xf_val_ok_num(M_PI));
-    xf_module_set(m, "e",   xf_val_ok_num(M_E));
-    xf_module_set(m, "INF", xf_val_ok_num(INFINITY));
-    xf_module_set(m, "NAN", xf_val_ok_num(NAN));
+    xf_Value v;
+
+v = xf_val_ok_complex(0.0, 1.0);
+xf_module_set(m, "i", v);
+xf_value_release(v);
+
+v = xf_val_ok_num(M_PI);
+xf_module_set(m, "pi", v);
+xf_value_release(v);
+
+v = xf_val_ok_num(M_E);
+xf_module_set(m, "e", v);
+xf_value_release(v);
+
+v = xf_val_ok_num(INFINITY);
+xf_module_set(m, "INF", v);
+xf_value_release(v);
+
+v = xf_val_ok_num(NAN);
+xf_module_set(m, "NAN", v);
+xf_value_release(v);
     return m;
 }

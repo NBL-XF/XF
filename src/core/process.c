@@ -169,26 +169,39 @@ static xf_Value cp_index(xf_Value *args, size_t argc) {
             xf_Value cell_s = xf_coerce_str(cell);
             if (cell_s.state != XF_STATE_OK || !cell_s.data.str) continue;
             xf_Str *val_str = cell_s.data.str;
+xf_Value col_val = xf_map_get(index, col_key);
+xf_map_t *col_map = NULL;
 
-            xf_Value col_val = xf_map_get(index, col_key);
-            xf_map_t *col_map;
-            if (col_val.state != XF_STATE_OK || col_val.type != XF_TYPE_MAP || !col_val.data.map) {
-                col_map = xf_map_new();
-                xf_map_set(index, col_key, xf_val_ok_map(col_map));
-                xf_map_release(col_map);
-                col_map = xf_map_get(index, col_key).data.map;
-            } else { col_map = col_val.data.map; }
+if (col_val.state != XF_STATE_OK || col_val.type != XF_TYPE_MAP || !col_val.data.map) {
+    xf_map_t *new_col_map = xf_map_new();
+    xf_Value tmp = xf_val_ok_map(new_col_map);
+    xf_map_set(index, col_key, tmp);
+    xf_value_release(tmp);
+    col_map = new_col_map;   // keep the raw owned pointer from new()
+} else {
+    col_map = xf_map_retain(col_val.data.map);
+}
+xf_value_release(col_val);
 
-            xf_Value id_val = xf_map_get(col_map, val_str);
-            xf_arr_t *id_arr;
-            if (id_val.state != XF_STATE_OK || id_val.type != XF_TYPE_ARR || !id_val.data.arr) {
-                id_arr = xf_arr_new();
-                xf_map_set(col_map, val_str, xf_val_ok_arr(id_arr));
-                xf_arr_release(id_arr);
-                id_arr = xf_map_get(col_map, val_str).data.arr;
-            } else { id_arr = id_val.data.arr; }
+xf_Value id_val = xf_map_get(col_map, val_str);
+xf_arr_t *id_arr = NULL;
 
-            xf_arr_push(id_arr, xf_val_ok_num(gid));
+if (id_val.state != XF_STATE_OK || id_val.type != XF_TYPE_ARR || !id_val.data.arr) {
+    xf_arr_t *new_id_arr = xf_arr_new();
+    xf_Value tmp = xf_val_ok_arr(new_id_arr);
+    xf_map_set(col_map, val_str, tmp);
+    xf_value_release(tmp);
+    id_arr = new_id_arr;   // keep the raw owned pointer from new()
+} else {
+    id_arr = xf_arr_retain(id_val.data.arr);
+}
+xf_value_release(id_val);
+
+xf_Value tmp = xf_val_ok_num(gid);
+xf_arr_push(id_arr, tmp);
+xf_value_release(tmp);
+xf_arr_release(id_arr);
+xf_map_release(col_map);
             xf_value_release(cell_s);
         }
         xf_value_release(fn_out);
@@ -246,7 +259,7 @@ static xf_Value cp_run(xf_Value *args, size_t argc) {
             ctxs[i].done = true;
             continue;
         }
-        
+
                         pthread_attr_t attr; pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
         if (pthread_create(&tids[i], &attr, cp_thread_fn, &ctxs[i]) != 0) {

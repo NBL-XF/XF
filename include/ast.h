@@ -1,6 +1,9 @@
 #ifndef XF_AST_H
 #define XF_AST_H
 
+#include <stddef.h>
+#include <stdint.h>
+
 #include "lexer.h"
 #include "value.h"
 
@@ -9,17 +12,18 @@
  *
  * Every node carries a Loc for error reporting.
  * Nodes are heap-allocated and owned by the tree.
- * ast_free(node) recursively frees a subtree.
  *
- * Node kinds split into two families:
- *   Stmt  — things that execute for effect
- *   Expr  — things that evaluate to a Value
+ * Ownership rules:
+ *   - AST constructors take ownership of child Expr, Stmt, and TopLevel
+*     pointers and of heap arrays passed to them.
+ *   - Constructors taking xf_Str* retain those strings unless the
+ *     implementation explicitly documents transfer-of-ownership.
+ *   - ast_*_free() recursively frees owned children.
  *
- * A program is a list of TopLevel items:
- *   - pattern-action rules
- *   - BEGIN / END blocks
- *   - function declarations
- *   - bare statements (inline / REPL)
+ * Program source:
+ *   - Program.source is borrowed unless ast_program_new() chooses
+ *     to duplicate it internally. Keep that behavior explicit in
+ *     ast.c and consistent everywhere.
  * ============================================================ */
 
 
@@ -32,6 +36,8 @@ typedef struct Stmt      Stmt;
 typedef struct Param     Param;
 typedef struct Branch    Branch;
 typedef struct LoopBind  LoopBind;
+typedef struct TopLevel  TopLevel;
+typedef struct Program   Program;
 
 
 /* ============================================================
@@ -39,113 +45,137 @@ typedef struct LoopBind  LoopBind;
  * ============================================================ */
 
 typedef enum {
-    /* ── literals ─────────────────────────────────────────── */
-    EXPR_NUM,         /* 42  3.14                               */
-    EXPR_STR,         /* "hello"                                */
-    EXPR_REGEX,       /* /pattern/flags                         */
+    /* literals */
+    EXPR_NUM,
+    EXPR_STR,
+    EXPR_REGEX,
     EXPR_ARR_LIT,
     EXPR_MAP_LIT,
     EXPR_SET_LIT,
     EXPR_TUPLE_LIT,
+    EXPR_STATE_LIT,
 
-    /* ── variables ────────────────────────────────────────── */
-    EXPR_IDENT,       /* foo                                    */
-    EXPR_FIELD,       /* $0  $1  $n                             */
-    EXPR_IVAR,        /* NR NF FNR FS RS OFS ORS                */
-    EXPR_SVAR,        /* $file $match $captures $err            */
+    /* variables / references */
+    EXPR_IDENT,
+    EXPR_FIELD,
+    EXPR_IVAR,
+    EXPR_SVAR,
+    EXPR_VALUE,
 
-    /* ── operations ───────────────────────────────────────── */
-    EXPR_UNARY,       /* -x  !x  ++x  x++                       */
-    EXPR_BINARY,      /* x + y  x == y  x ~ /re/  etc.          */
-    EXPR_TERNARY,     /* cond ? then : else                     */
-    EXPR_COALESCE,    /* x ?? y  (null/NAV coalescing)          */
+    /* operations */
+    EXPR_UNARY,
+    EXPR_BINARY,
+    EXPR_TERNARY,
+    EXPR_COALESCE,
 
-    /* ── assignment ───────────────────────────────────────── */
-    EXPR_ASSIGN,      /* x = y   x += y  x ..= y  etc.          */
-    EXPR_WALRUS,      /* x := y  (declare + assign)             */
+    /* assignment */
+    EXPR_ASSIGN,
+    EXPR_WALRUS,
 
-    /* ── call / access ────────────────────────────────────── */
-    EXPR_CALL,        /* f(a, b)                                */
-    EXPR_SUBSCRIPT,   /* a[k]                                   */
-    EXPR_MEMBER,      /* obj.field                              */
+    /* call / access */
+    EXPR_CALL,
+    EXPR_SUBSCRIPT,
+    EXPR_MEMBER,
 
-    /* ── state / type introspection ───────────────────────── */
-    EXPR_STATE,       /* x.state                                */
-    EXPR_TYPE,        /* x.type                                 */
-    EXPR_LEN,         /* x.len / x.length  (str/arr/map/set)    */
+    /* introspection */
+    EXPR_STATE,
+    EXPR_TYPE,
+    EXPR_LEN,
 
-    /* ── type cast ────────────────────────────────────────── */
-    EXPR_CAST,        /* num(x)  str(x)  arr(x)  map(x)  set(x) */
+    /* cast */
+    EXPR_CAST,
 
-    /* ── pipeline ─────────────────────────────────────────── */
-    EXPR_PIPE,        /* cmd | cmd                              */
-    EXPR_PIPE_FN,     /* expr |> fn                             */
+    /* pipelines */
+    EXPR_PIPE_FN,
 
-    /* ── spread / variadic ────────────────────────────────── */
-    EXPR_SPREAD,      /* ...x                                   */
+    /* spread / variadic */
+    EXPR_SPREAD,
 
-    /* ── anonymous function ───────────────────────────────── */
-    EXPR_FN,          /* fn(params) { body }                    */
-    EXPR_SPAWN,       /* spawn fn(args)  — expr yielding handle */
-
-    /* ── state literal ────────────────────────────────────── */
-    EXPR_STATE_LIT,   /* OK ERR NULL NAV VOID UNDEF TRUE FALSE  */
-
+    /* function literal / spawn expression */
+    EXPR_FN,
+    EXPR_SPAWN,
 } ExprKind;
 
 
-/* ── unary operator ─────────────────────────────────────── */
+/* ------------------------------------------------------------
+ * Operators
+ * ------------------------------------------------------------ */
+
 typedef enum {
-    UNOP_NEG,         /* -x                                     */
-    UNOP_NOT,         /* !x                                     */
-    UNOP_PRE_INC,     /* ++x                                    */
-    UNOP_PRE_DEC,     /* --x                                    */
-    UNOP_POST_INC,    /* x++                                    */
-    UNOP_POST_DEC,    /* x--                                    */
+    UNOP_NEG,
+    UNOP_NOT,
+    UNOP_PRE_INC,
+    UNOP_PRE_DEC,
+    UNOP_POST_INC,
+    UNOP_POST_DEC,
 } UnOp;
 
-/* ── binary operator ────────────────────────────────────── */
 typedef enum {
-    BINOP_ADD, BINOP_SUB, BINOP_MUL, BINOP_DIV, BINOP_MOD, BINOP_POW,
-    BINOP_MADD, BINOP_MSUB, BINOP_MMUL, BINOP_MDIV,
-    BINOP_PIPE_CMD,  /* expr | "shell cmd" */
-    BINOP_PIPE_IN,   /* "shell cmd" | expr  (read from cmd) */
-    BINOP_EQ, BINOP_NEQ, BINOP_LT, BINOP_GT, BINOP_LTE, BINOP_GTE,
-    BINOP_SPACESHIP,   /* <=>                                   */
+    BINOP_ADD,
+    BINOP_SUB,
+    BINOP_MUL,
+    BINOP_DIV,
+    BINOP_MOD,
+    BINOP_POW,
+
+    BINOP_MADD,
+    BINOP_MSUB,
+    BINOP_MMUL,
+    BINOP_MDIV,
+
+    BINOP_EQ,
+    BINOP_NEQ,
+    BINOP_LT,
+    BINOP_GT,
+    BINOP_LTE,
+    BINOP_GTE,
+    BINOP_SPACESHIP,
     BINOP_IN,
-    BINOP_AND, BINOP_OR,
-    BINOP_MATCH,       /* ~   regex match                       */
-    BINOP_NMATCH,      /* !~  regex no-match                    */
-    BINOP_CONCAT,      /* ..  string concat                     */
-    BINOP_PIPE,        /* |   command pipe                      */
+
+    BINOP_AND,
+    BINOP_OR,
+
+    BINOP_MATCH,
+    BINOP_NMATCH,
+
+    BINOP_CONCAT,
+
+    /* shell pipe semantics */
+    BINOP_PIPE_CMD,  /* expr | "shell cmd" */
+    BINOP_PIPE_IN,   /* "shell cmd" | expr */
 } BinOp;
 
-/* ── assignment operator ────────────────────────────────── */
 typedef enum {
-    ASSIGNOP_EQ,       /* =                                     */
-    ASSIGNOP_ADD,      /* +=                                    */
-    ASSIGNOP_SUB,      /* -=                                    */
-    ASSIGNOP_MUL,      /* *=                                    */
-    ASSIGNOP_DIV,      /* /=                                    */
-    ASSIGNOP_MOD,      /* %=                                    */
-    ASSIGNOP_CONCAT,   /* ..=                                   */
-    ASSIGNOP_MADD,   /* .+= */
-    ASSIGNOP_MSUB,   /* .-= */
-    ASSIGNOP_MMUL,   /* .*= */
-    ASSIGNOP_MDIV,   /* ./= */
+    ASSIGNOP_EQ,
+    ASSIGNOP_ADD,
+    ASSIGNOP_SUB,
+    ASSIGNOP_MUL,
+    ASSIGNOP_DIV,
+    ASSIGNOP_MOD,
+    ASSIGNOP_CONCAT,
+    ASSIGNOP_MADD,
+    ASSIGNOP_MSUB,
+    ASSIGNOP_MMUL,
+    ASSIGNOP_MDIV,
 } AssignOp;
 
 
-/* ── parameter (for fn literals) ────────────────────────── */
+/* ------------------------------------------------------------
+ * Parameter
+ * ------------------------------------------------------------ */
+
 struct Param {
-    xf_Str *name;
-    uint8_t type;        /* XF_TYPE_*                          */
-    Expr   *default_val; /* NULL if no default                 */
+    xf_Str *name;         /* retained */
+    uint8_t type;         /* XF_TYPE_* */
+    Expr   *default_val;  /* owned, NULL if absent */
     Loc     loc;
 };
 
 
-/* ── loop binding (for destructuring in for-loops) ──────── */
+/* ------------------------------------------------------------
+ * Loop binding
+ * ------------------------------------------------------------ */
+
 typedef enum {
     LOOP_BIND_NAME,
     LOOP_BIND_TUPLE
@@ -156,160 +186,168 @@ struct LoopBind {
     Loc          loc;
 
     union {
-        xf_Str *name;
+        xf_Str *name;     /* retained */
         struct {
-            LoopBind **items;
+            LoopBind **items; /* owned */
             size_t     count;
         } tuple;
     } as;
 };
 
 
+/* ------------------------------------------------------------
+ * Expr node
+ * ------------------------------------------------------------ */
+
 struct Expr {
     ExprKind kind;
     Loc      loc;
-    uint8_t  type_hint;   /* inferred or annotated type         */
+    uint8_t  type_hint;   /* optional annotation / inferred hint */
 
     union {
         /* EXPR_NUM */
         double num;
 
         /* EXPR_STR */
-        struct { xf_Str *value; } str;
+        struct {
+            xf_Str *value; /* retained */
+        } str;
 
         /* EXPR_REGEX */
         struct {
-            xf_Str  *pattern;
-            uint32_t flags;    /* XF_RE_*                       */
+            xf_Str  *pattern; /* retained */
+            uint32_t flags;
         } regex;
-
-        /* EXPR_ARR_LIT */
+        /* EXPR_VALUE */
         struct {
-            Expr   **items;
-            size_t   count;
-        } arr_lit;
-
-        /* EXPR_TUPLE_LIT */
+            xf_value_t value;
+        } value;
+        /* EXPR_ARR_LIT / EXPR_SET_LIT / EXPR_TUPLE_LIT */
         struct {
-            Expr   **items;
+            Expr   **items; /* owned */
             size_t   count;
-        } tuple_lit;
+        } list_lit;
 
         /* EXPR_MAP_LIT */
         struct {
-            Expr   **keys;
-            Expr   **vals;
+            Expr   **keys;  /* owned */
+            Expr   **vals;  /* owned */
             size_t   count;
         } map_lit;
 
-        /* EXPR_SET_LIT */
-        struct {
-            Expr   **items;
-            size_t   count;
-        } set_lit;
-
         /* EXPR_IDENT */
-        struct { xf_Str *name; } ident;
+        struct {
+            xf_Str *name; /* retained */
+        } ident;
 
         /* EXPR_FIELD */
-        struct { int index; } field;    /* $0=0, $1=1 ...       */
+        struct {
+            int index;
+        } field;
 
-        /* EXPR_IVAR — implicit variable */
-        struct { TokenKind var; } ivar; /* TK_VAR_NR etc.       */
-
-        /* EXPR_SVAR — $ implicit variable */
-        struct { TokenKind var; } svar; /* TK_VAR_FILE etc.     */
+        /* EXPR_IVAR / EXPR_SVAR */
+        struct {
+            TokenKind var;
+        } var_ref;
 
         /* EXPR_UNARY */
         struct {
             UnOp  op;
-            Expr *operand;
+            Expr *operand; /* owned */
         } unary;
 
         /* EXPR_BINARY */
         struct {
             BinOp  op;
-            Expr  *left;
-            Expr  *right;
+            Expr  *left;   /* owned */
+            Expr  *right;  /* owned */
         } binary;
 
         /* EXPR_TERNARY */
         struct {
-            Expr *cond;
-            Expr *then;
-            Expr *els;
+            Expr *cond; /* owned */
+            Expr *then_branch; /* owned */
+            Expr *else_branch; /* owned */
         } ternary;
 
         /* EXPR_COALESCE */
         struct {
-            Expr *left;
-            Expr *right;
+            Expr *left;  /* owned */
+            Expr *right; /* owned */
         } coalesce;
 
         /* EXPR_ASSIGN */
         struct {
-            AssignOp  op;
-            Expr     *target;
-            Expr     *value;
+            AssignOp op;
+            Expr    *target; /* owned */
+            Expr    *value;  /* owned */
         } assign;
 
         /* EXPR_WALRUS */
         struct {
-            xf_Str *name;
-            uint8_t type;     /* declared type, XF_TYPE_VOID = inferred */
-            Expr   *value;
+            xf_Str *name; /* retained */
+            uint8_t type; /* XF_TYPE_VOID = inferred */
+            Expr   *value; /* owned */
         } walrus;
 
         /* EXPR_CALL */
         struct {
-            Expr   *callee;
-            Expr  **args;
+            Expr   *callee; /* owned */
+            Expr  **args;   /* owned */
             size_t  argc;
         } call;
 
         /* EXPR_SUBSCRIPT */
         struct {
-            Expr *obj;
-            Expr *key;
+            Expr *obj; /* owned */
+            Expr *key; /* owned */
         } subscript;
 
         /* EXPR_MEMBER */
         struct {
-            Expr   *obj;
-            xf_Str *field;
+            Expr   *obj;   /* owned */
+            xf_Str *field; /* retained */
         } member;
 
-        /* EXPR_STATE / EXPR_TYPE / EXPR_LEN — operand only */
-        struct { Expr *operand; } introspect;
-
-        /* EXPR_CAST — type(expr) */
+        /* EXPR_STATE / EXPR_TYPE / EXPR_LEN */
         struct {
-            uint8_t to_type;   /* XF_TYPE_* target              */
-            Expr   *operand;
+            Expr *operand; /* owned */
+        } introspect;
+
+        /* EXPR_CAST */
+        struct {
+            uint8_t to_type; /* XF_TYPE_* */
+            Expr   *operand; /* owned */
         } cast;
 
         /* EXPR_PIPE_FN */
         struct {
-            Expr *left;
-            Expr *right;
+            Expr *left;  /* owned */
+            Expr *right; /* owned */
         } pipe_fn;
 
         /* EXPR_SPREAD */
-        struct { Expr *operand; } spread;
+        struct {
+            Expr *operand; /* owned */
+        } spread;
 
-        /* EXPR_FN — anonymous function literal */
+        /* EXPR_FN */
         struct {
             uint8_t  return_type;
-            Param   *params;
+            Param   *params;      /* owned */
             size_t   param_count;
-            Stmt    *body;        /* STMT_BLOCK                 */
+            Stmt    *body;        /* owned, usually STMT_BLOCK */
         } fn;
 
-        /* EXPR_SPAWN — spawn fn(args), evaluates to numeric handle */
-        struct { Expr *call; } spawn_expr;
+        /* EXPR_SPAWN */
+        struct {
+            Expr *call; /* owned; expected to be EXPR_CALL */
+        } spawn_expr;
 
-        /* EXPR_STATE_LIT — state keyword used as a value */
-        struct { uint8_t state; } state_lit;
+        /* EXPR_STATE_LIT */
+        struct {
+            uint8_t state; /* XF_STATE_* */
+        } state_lit;
 
     } as;
 };
@@ -320,56 +358,52 @@ struct Expr {
  * ============================================================ */
 
 typedef enum {
-    /* ── block ────────────────────────────────────────────── */
-    STMT_BLOCK,       /* { stmt* }                              */
+    STMT_BLOCK,
+    STMT_EXPR,
 
-    /* ── expression statement ─────────────────────────────── */
-    STMT_EXPR,        /* expr ;                                 */
+    STMT_VAR_DECL,
+    STMT_FN_DECL,
 
-    /* ── declaration ──────────────────────────────────────── */
-    STMT_VAR_DECL,    /* type name = expr ;                     */
-    STMT_FN_DECL,     /* type fn name(params) { body }          */
+    STMT_IF,
+    STMT_WHILE,
+    STMT_FOR,
 
-    /* ── control flow ─────────────────────────────────────── */
-    STMT_IF,          /* if / elif / else                       */
-    STMT_WHILE,       /* while (cond) { body }                  */
-    STMT_FOR,         /* for (x in collection) { body }         */
+    STMT_WHILE_SHORT,
+    STMT_FOR_SHORT,
 
-    /* ── shorthand loops ──────────────────────────────────── */
-    STMT_WHILE_SHORT, /* cond <> body ;                         */
-    STMT_FOR_SHORT,   /* set[iter] > body ;                     */
+    STMT_RETURN,
+    STMT_NEXT,
+    STMT_EXIT,
+    STMT_BREAK,
 
-    /* ── transfer ─────────────────────────────────────────── */
-    STMT_RETURN,      /* return expr ;                          */
-    STMT_NEXT,        /* next ;   (advance to next record)      */
-    STMT_EXIT,        /* exit ;   (exit program)                */
-    STMT_BREAK,       /* break ;  (exit innermost loop)         */
+    STMT_PRINT,
+    STMT_PRINTF,
+    STMT_OUTFMT,
+    STMT_IMPORT,
+    STMT_DELETE,
 
-    /* ── I/O ──────────────────────────────────────────────── */
-    STMT_PRINT,       /* print expr, expr, ... ;                */
-    STMT_PRINTF,      /* printf fmt, arg, ... ;                 */
-    STMT_OUTFMT,      /* outfmt "csv"|"tsv"|"json"|"text" ;     */
-    STMT_IMPORT,      /* import "file.xf" ;                     */
-    STMT_DELETE,      /* delete map[key] ;                      */
+    STMT_SPAWN,
+    STMT_JOIN,
 
-    /* ── concurrency ──────────────────────────────────────── */
-    STMT_SPAWN,       /* spawn fn(args) ;                       */
-    STMT_JOIN,        /* join handle ;                          */
-
-    /* ── substitution / transliteration ──────────────────── */
-    STMT_SUBST,       /* s/pat/rep/flags                        */
-    STMT_TRANS,       /* y/from/to/                             */
-
+    STMT_SUBST,
+    STMT_TRANS,
 } StmtKind;
 
 
-/* ── if/elif/else branch ────────────────────────────────── */
+/* ------------------------------------------------------------
+ * Branch
+ * ------------------------------------------------------------ */
+
 struct Branch {
-    Expr *cond;     /* NULL for final else                     */
-    Stmt *body;
+    Expr *cond; /* owned, NULL for else-like branch */
+    Stmt *body; /* owned */
     Loc   loc;
 };
 
+
+/* ------------------------------------------------------------
+ * Stmt node
+ * ------------------------------------------------------------ */
 
 struct Stmt {
     StmtKind kind;
@@ -378,113 +412,117 @@ struct Stmt {
     union {
         /* STMT_BLOCK */
         struct {
-            Stmt  **stmts;
+            Stmt  **stmts; /* owned */
             size_t  count;
         } block;
 
         /* STMT_EXPR */
-        struct { Expr *expr; } expr;
+        struct {
+            Expr *expr; /* owned */
+        } expr;
 
         /* STMT_VAR_DECL */
         struct {
-            uint8_t type;     /* XF_TYPE_*                       */
-            xf_Str *name;
-            Expr   *init;     /* NULL = UNDETERMINED             */
+            uint8_t type;   /* XF_TYPE_* */
+            xf_Str *name;   /* retained */
+            Expr   *init;   /* owned, NULL = unresolved */
         } var_decl;
 
         /* STMT_FN_DECL */
         struct {
             uint8_t return_type;
-            xf_Str *name;
-            Param  *params;
+            xf_Str *name;    /* retained */
+            Param  *params;  /* owned */
             size_t  param_count;
-            Stmt   *body;
+            Stmt   *body;    /* owned */
         } fn_decl;
 
         /* STMT_IF */
         struct {
-            Branch *branches;  /* if + elif*                     */
+            Branch *branches; /* owned */
             size_t  count;
-            Stmt   *els;       /* else block, or NULL            */
+            Stmt   *els;      /* owned, NULL if absent */
         } if_stmt;
 
         /* STMT_WHILE */
         struct {
-            Expr *cond;
-            Stmt *body;
+            Expr *cond; /* owned */
+            Stmt *body; /* owned */
         } while_stmt;
 
         /* STMT_FOR */
         struct {
-            LoopBind *iter_key;   /* optional */
-            LoopBind *iter_val;   /* required */
-            Expr     *collection;
-            Stmt     *body;
+            LoopBind *iter_key;   /* owned, optional */
+            LoopBind *iter_val;   /* owned, required */
+            Expr     *collection; /* owned */
+            Stmt     *body;       /* owned */
         } for_stmt;
 
-        /* STMT_WHILE_SHORT: cond <> body */
+        /* STMT_WHILE_SHORT */
         struct {
-            Expr *cond;
-            Stmt *body;
+            Expr *cond; /* owned */
+            Stmt *body; /* owned */
         } while_short;
 
-        /* STMT_FOR_SHORT: collection[iter] > body */
+        /* STMT_FOR_SHORT */
         struct {
-            Expr     *collection;
-            LoopBind *iter_key;   /* optional */
-            LoopBind *iter_val;   /* required */
-            Stmt     *body;
+            Expr     *collection; /* owned */
+            LoopBind *iter_key;   /* owned, optional */
+            LoopBind *iter_val;   /* owned, required */
+            Stmt     *body;       /* owned */
         } for_short;
 
         /* STMT_RETURN */
-        struct { Expr *value; } ret;  /* NULL = void return      */
-
-        /* STMT_PRINT */
         struct {
-            Expr   **args;
-            size_t   count;
-            Expr    *redirect;    /* target — NULL = stdout               */
-            uint8_t  redirect_op; /* 0=none 1=>file 2=>>append 3=|pipe    */
-        } print;
+            Expr *value; /* owned, NULL = void return */
+        } ret;
 
-        /* STMT_PRINTF */
+        /* STMT_PRINT / STMT_PRINTF */
         struct {
-            Expr   **args;
+            Expr   **args;       /* owned */
             size_t   count;
-            Expr    *redirect;
-            uint8_t  redirect_op;
-        } printf_stmt;
+            Expr    *redirect;   /* owned, NULL = stdout */
+            uint8_t  redirect_op;/* 0 none, 1 >file, 2 >>append, 3 |pipe */
+        } io;
 
         /* STMT_OUTFMT */
         struct {
-            uint8_t mode;   /* XF_OUTFMT_* constant              */
+            uint8_t mode; /* XF_OUTFMT_* */
         } outfmt;
 
         /* STMT_IMPORT */
-        struct { xf_Str *path; } import;
+        struct {
+            xf_Str *path; /* retained */
+        } import_stmt;
 
         /* STMT_DELETE */
-        struct { Expr *target; } delete;
+        struct {
+            Expr *target; /* owned */
+        } delete_stmt;
 
         /* STMT_SPAWN */
-        struct { Expr *call; } spawn;   /* call must be EXPR_CALL */
+        struct {
+            Expr *call; /* owned; expected EXPR_CALL */
+        } spawn;
 
         /* STMT_JOIN */
-        struct { Expr *handle; } join;
+        struct {
+            Expr *handle; /* owned */
+        } join;
 
         /* STMT_SUBST */
         struct {
-            xf_Str  *pattern;
-            xf_Str  *replacement;
+            xf_Str  *pattern;     /* retained */
+            xf_Str  *replacement; /* retained */
             uint32_t flags;
-            Expr    *target;   /* NULL = $0                      */
+            Expr    *target;      /* owned, NULL = $0 */
         } subst;
 
         /* STMT_TRANS */
         struct {
-            xf_Str *from;
-            xf_Str *to;
-            Expr   *target;    /* NULL = $0                      */
+            xf_Str *from;   /* retained */
+            xf_Str *to;     /* retained */
+            Expr   *target; /* owned, NULL = $0 */
         } trans;
 
     } as;
@@ -492,104 +530,117 @@ struct Stmt {
 
 
 /* ============================================================
- * TopLevel — program-level items
+ * Top-level items
  * ============================================================ */
 
 typedef enum {
-    TOP_BEGIN,        /* BEGIN { body }                         */
-    TOP_END,          /* END   { body }                         */
-    TOP_RULE,         /* pattern { body }   or  { body }        */
-    TOP_FN,           /* type fn name(params) { body }          */
-    TOP_STMT,         /* bare statement (inline / REPL)         */
+    TOP_BEGIN,
+    TOP_END,
+    TOP_RULE,
+    TOP_FN,
+    TOP_STMT,
 } TopKind;
 
-
-typedef struct {
+struct TopLevel {
     TopKind kind;
     Loc     loc;
 
     union {
         /* TOP_BEGIN / TOP_END */
-        struct { Stmt *body; } begin_end;
+        struct {
+            Stmt *body; /* owned */
+        } begin_end;
 
         /* TOP_RULE */
         struct {
-            Expr *pattern;    /* NULL = match every record       */
-            Stmt *body;
+            Expr *pattern; /* owned, NULL = match all */
+            Stmt *body;    /* owned */
         } rule;
 
         /* TOP_FN */
         struct {
             uint8_t return_type;
-            xf_Str *name;
-            Param  *params;
+            xf_Str *name;    /* retained */
+            Param  *params;  /* owned */
             size_t  param_count;
-            Stmt   *body;
+            Stmt   *body;    /* owned */
         } fn;
 
         /* TOP_STMT */
-        struct { Stmt *stmt; } stmt;
+        struct {
+            Stmt *stmt; /* owned */
+        } stmt;
 
     } as;
-
-} TopLevel;
+};
 
 
 /* ============================================================
- * Program — root of the AST
+ * Program
  * ============================================================ */
 
-typedef struct {
-    TopLevel   **items;
+struct Program {
+    TopLevel   **items;    /* owned */
     size_t       count;
     size_t       capacity;
-    const char  *source;   /* filename or "<inline>" or "<repl>" */
-} Program;
+    const char  *source;   /* borrowed */
+};
 
 
 /* ============================================================
- * AST allocation / free
+ * Output format modes
  * ============================================================ */
 
-/* expression constructors */
-Expr *ast_arr_lit(Expr **items, size_t count, Loc loc);
-Expr *ast_map_lit(Expr **keys, Expr **vals, size_t count, Loc loc);
-Expr *ast_set_lit(Expr **items, size_t count, Loc loc);
-Expr *ast_tuple_lit(Expr **items, size_t count, Loc loc);
-Expr *ast_num(double value, Loc loc);
-Expr *ast_str(xf_Str *value, Loc loc);
-Expr *ast_regex(xf_Str *pattern, uint32_t flags, Loc loc);
-Expr *ast_ident(xf_Str *name, Loc loc);
-Expr *ast_field(int index, Loc loc);
-Expr *ast_ivar(TokenKind var, Loc loc);
-Expr *ast_svar(TokenKind var, Loc loc);
-Expr *ast_unary(UnOp op, Expr *operand, Loc loc);
-Expr *ast_binary(BinOp op, Expr *left, Expr *right, Loc loc);
-Expr *ast_ternary(Expr *cond, Expr *then, Expr *els, Loc loc);
-Expr *ast_coalesce(Expr *left, Expr *right, Loc loc);
-Expr *ast_assign(AssignOp op, Expr *target, Expr *value, Loc loc);
-Expr *ast_walrus(xf_Str *name, uint8_t type, Expr *value, Loc loc);
-Expr *ast_call(Expr *callee, Expr **args, size_t argc, Loc loc);
-Expr *ast_subscript(Expr *obj, Expr *key, Loc loc);
-
-/* output format modes for STMT_OUTFMT / RecordCtx.out_mode */
 #define XF_OUTFMT_TEXT  0
 #define XF_OUTFMT_CSV   1
 #define XF_OUTFMT_TSV   2
 #define XF_OUTFMT_JSON  3
 
+
+/* ============================================================
+ * Constructors
+ * ============================================================ */
+
+/* expression constructors */
+Expr *ast_num(double value, Loc loc);
+Expr *ast_str(xf_Str *value, Loc loc);
+Expr *ast_regex(xf_Str *pattern, uint32_t flags, Loc loc);
+
+Expr *ast_arr_lit(Expr **items, size_t count, Loc loc);
+Expr *ast_map_lit(Expr **keys, Expr **vals, size_t count, Loc loc);
+Expr *ast_set_lit(Expr **items, size_t count, Loc loc);
+Expr *ast_tuple_lit(Expr **items, size_t count, Loc loc);
+
+Expr *ast_ident(xf_Str *name, Loc loc);
+Expr *ast_field(int index, Loc loc);
+Expr *ast_ivar(TokenKind var, Loc loc);
+Expr *ast_svar(TokenKind var, Loc loc);
+
+Expr *ast_unary(UnOp op, Expr *operand, Loc loc);
+Expr *ast_binary(BinOp op, Expr *left, Expr *right, Loc loc);
+Expr *ast_ternary(Expr *cond, Expr *then_branch, Expr *else_branch, Loc loc);
+Expr *ast_coalesce(Expr *left, Expr *right, Loc loc);
+
+Expr *ast_assign(AssignOp op, Expr *target, Expr *value, Loc loc);
+Expr *ast_walrus(xf_Str *name, uint8_t type, Expr *value, Loc loc);
+
+Expr *ast_call(Expr *callee, Expr **args, size_t argc, Loc loc);
+Expr *ast_subscript(Expr *obj, Expr *key, Loc loc);
 Expr *ast_member(Expr *obj, xf_Str *field, Loc loc);
+
 Expr *ast_state(Expr *operand, Loc loc);
 Expr *ast_type(Expr *operand, Loc loc);
 Expr *ast_len(Expr *operand, Loc loc);
+
 Expr *ast_cast(uint8_t to_type, Expr *operand, Loc loc);
 Expr *ast_pipe_fn(Expr *left, Expr *right, Loc loc);
 Expr *ast_spread(Expr *operand, Loc loc);
-Expr *ast_fn(uint8_t ret, Param *params, size_t pc, Stmt *body, Loc loc);
+
+Expr *ast_fn(uint8_t ret_type, Param *params, size_t param_count, Stmt *body, Loc loc);
 Expr *ast_spawn_expr(Expr *call, Loc loc);
 Expr *ast_state_lit(uint8_t state, Loc loc);
 
-/* loop binding constructors */
+/* loop binding */
 LoopBind *ast_loop_bind_name(xf_Str *name, Loc loc);
 LoopBind *ast_loop_bind_tuple(LoopBind **items, size_t count, Loc loc);
 void      ast_loop_bind_free(LoopBind *b);
@@ -598,37 +649,44 @@ void      ast_loop_bind_print(const LoopBind *b, int indent);
 /* statement constructors */
 Stmt *ast_block(Stmt **stmts, size_t count, Loc loc);
 Stmt *ast_expr_stmt(Expr *expr, Loc loc);
+
 Stmt *ast_var_decl(uint8_t type, xf_Str *name, Expr *init, Loc loc);
-Stmt *ast_fn_decl(uint8_t ret, xf_Str *name,
-                  Param *params, size_t pc, Stmt *body, Loc loc);
+Stmt *ast_fn_decl(uint8_t ret_type, xf_Str *name,
+                  Param *params, size_t param_count, Stmt *body, Loc loc);
+
 Stmt *ast_if(Branch *branches, size_t count, Stmt *els, Loc loc);
 Stmt *ast_while(Expr *cond, Stmt *body, Loc loc);
 Stmt *ast_for(LoopBind *iter_key, LoopBind *iter_val,
               Expr *collection, Stmt *body, Loc loc);
+
 Stmt *ast_while_short(Expr *cond, Stmt *body, Loc loc);
-Stmt *ast_for_short(Expr *collection,
-                    LoopBind *iter_key, LoopBind *iter_val,
-                    Stmt *body, Loc loc);
+Stmt *ast_for_short(Expr *collection, LoopBind *iter_key,
+                    LoopBind *iter_val, Stmt *body, Loc loc);
+
 Stmt *ast_return(Expr *value, Loc loc);
 Stmt *ast_next(Loc loc);
 Stmt *ast_exit(Loc loc);
 Stmt *ast_break(Loc loc);
+
 Stmt *ast_print(Expr **args, size_t count, Expr *redirect, uint8_t redirect_op, Loc loc);
 Stmt *ast_printf_stmt(Expr **args, size_t count, Expr *redirect, uint8_t redirect_op, Loc loc);
 Stmt *ast_outfmt(uint8_t mode, Loc loc);
 Stmt *ast_import(xf_Str *path, Loc loc);
 Stmt *ast_delete(Expr *target, Loc loc);
+
 Stmt *ast_spawn(Expr *call, Loc loc);
 Stmt *ast_join(Expr *handle, Loc loc);
-Stmt *ast_subst(xf_Str *pat, xf_Str *rep, uint32_t flags, Expr *tgt, Loc loc);
+
+Stmt *ast_subst(xf_Str *pattern, xf_Str *replacement,
+                uint32_t flags, Expr *target, Loc loc);
 Stmt *ast_trans(xf_Str *from, xf_Str *to, Expr *target, Loc loc);
 
 /* top-level constructors */
 TopLevel *ast_top_begin(Stmt *body, Loc loc);
 TopLevel *ast_top_end(Stmt *body, Loc loc);
 TopLevel *ast_top_rule(Expr *pattern, Stmt *body, Loc loc);
-TopLevel *ast_top_fn(uint8_t ret, xf_Str *name,
-                     Param *params, size_t pc, Stmt *body, Loc loc);
+TopLevel *ast_top_fn(uint8_t ret_type, xf_Str *name,
+                     Param *params, size_t param_count, Stmt *body, Loc loc);
 TopLevel *ast_top_stmt(Stmt *stmt, Loc loc);
 
 /* program */
@@ -637,13 +695,13 @@ void     ast_program_push(Program *p, TopLevel *item);
 void     ast_program_free(Program *p);
 
 /* recursive free */
-void     ast_expr_free(Expr *e);
-void     ast_stmt_free(Stmt *s);
-void     ast_top_free(TopLevel *t);
+void ast_expr_free(Expr *e);
+void ast_stmt_free(Stmt *s);
+void ast_top_free(TopLevel *t);
 
-/* debug print (indented) */
-void     ast_expr_print(const Expr *e, int indent);
-void     ast_stmt_print(const Stmt *s, int indent);
-void     ast_program_print(const Program *p);
-
+/* debug print */
+void ast_expr_print(const Expr *e, int indent);
+void ast_stmt_print(const Stmt *s, int indent);
+void ast_program_print(const Program *p);
+TopLevel *ast_top_rule(Expr *pattern, Stmt *body, Loc loc);
 #endif /* XF_AST_H */

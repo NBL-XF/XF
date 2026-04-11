@@ -1,445 +1,525 @@
-#if defined(__linux__) || defined(__CYGWIN__)
-#define _GNU_SOURCE
-#endif
 #include "../include/interp.h"
+#include "../include/ast.h"
+#include "../include/symTable.h"
+#include "../include/vm.h"
 #include "../include/parser.h"
-#include "../include/core.h"
-#include "../include/gc.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
-#include <math.h>
-#include <stdarg.h>
-#include <ctype.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <regex.h>
-#include <strings.h>
-#include <pthread.h>
-/* ============================================================
- * Spawn thread infrastructure
- *
- * Each `spawn fn(args)` statement launches a pthread.
- * The pthread receives a SpawnCtx containing:
- *   - a pre-evaluated xf_Value fn value (owned ref)
- *   - pre-evaluated arg values (owned refs)
- *   - a fresh SymTable/Interp that shares the parent VM
- * A global mutex protects VM state mutations (record context,
- * globals, redir cache) during concurrent execution.
- * The join handle is a uint32 thread id mapping into g_spawn[].
- * ============================================================ */
-
-#define XF_SPAWN_MAX 256
+static size_t emit_jump(Chunk *c, OpCode op, uint32_t line);
+static void patch_jump_here(Chunk *c, size_t jump_pos);
+static bool compile_if_stmt(Interp *it, Chunk *c, Stmt *s);
+static bool compile_while_stmt(Interp *it, Chunk *c, Stmt *s);
+static bool compile_for_stmt(Interp *it, Chunk *c, Stmt *s);
+static bool compile_for_short_stmt(Interp *it, Chunk *c, Stmt *s);
+static bool compile_stmt(Interp *it, Chunk *c, Stmt *s);
+static bool compile_expr(Interp *it, Chunk *c, Expr *e);
+static bool compile_print_stmt(Interp *it, Chunk *c, Stmt *s);
+static bool compile_block_stmt(Interp *it, Chunk *c, Stmt *s);
+static bool compile_if_stmt(Interp *it, Chunk *c, Stmt *s);
+static bool compile_while_stmt(Interp *it, Chunk *c, Stmt *s);
+static bool compile_for_stmt(Interp *it, Chunk *c, Stmt *s);
+static bool compile_rule_pattern(Interp *it, Chunk *c, Expr *pattern);
+static uint32_t compile_global_name(Interp *it, xf_Str *name);
+typedef struct {
+    xf_Str  *name;
+    uint32_t slot;
+} GlobalBinding;
+typedef struct {
+    xf_Str  *name;
+    uint8_t  type;
+    uint8_t  slot;
+} LocalBinding;
 
 typedef struct {
-    pthread_t   tid;
-    uint32_t    id;          /* handle value returned to XF code */
-    bool        started;     /* thread has actually been launched */
-    bool        done;        /* thread finished */
-    bool        joined;      /* join already consumed */
-    xf_Value    result;
-    xf_Value    fn_val;      /* owned ref to the fn being called */
-    xf_Value    args[64];
-    size_t      argc;
-    VM         *vm;          /* shared VM — access guarded by g_spawn_mu */
-    SymTable   *parent_syms; /* borrowed — fallback only */
-    SymTable    snap_syms;   /* owned snapshot */
-    bool        snap_ready;
-} SpawnCtx;
-static pthread_mutex_t g_spawn_mu    = PTHREAD_MUTEX_INITIALIZER;
-static SpawnCtx        g_spawn[XF_SPAWN_MAX];
-static size_t          g_spawn_live  = 0;   /* number of occupied slots */
-static uint32_t        g_spawn_next  = 1;  /* 0 reserved for "no handle" */
-static void copy_globals_from(SymTable *dst, SymTable *src);
-static void *spawn_thread_fn(void *arg);
-static xf_Value interp_exec_xf_fn(void *vm_ptr, void *syms_ptr,
-                                  xf_fn_t *fn, xf_Value *args, size_t argc);
-static xf_Value mat_mul(xf_Value a, xf_Value b);
-static xf_Value arr_broadcast(xf_Value a, xf_Value b, int op);
-static xf_Value val_concat(xf_Value a, xf_Value b);
-static xf_Value eval_in(xf_Value needle, xf_Value haystack) {
-    if (needle.state != XF_STATE_OK)   return xf_value_retain(needle);
-    if (haystack.state != XF_STATE_OK) return xf_value_retain(haystack);
+    LocalBinding locals[256];
+    size_t       count;
+    uint8_t      return_type;
+} FnCompileCtx;
+static int g_compile_depth = 0;
+static FnCompileCtx *g_fn_ctx = NULL;
+static int fn_local_find(xf_Str *name) {
+    if (!g_fn_ctx || !name) return -1;
 
-    /* substring in string */
-    if (haystack.type == XF_TYPE_STR && haystack.data.str) {
-        xf_Value ns = xf_coerce_str(needle);
-        if (ns.state != XF_STATE_OK || !ns.data.str) {
-            if (ns.state == XF_STATE_OK) xf_value_release(ns);
-            return xf_val_false();
+    for (size_t i = 0; i < g_fn_ctx->count; i++) {
+        if (g_fn_ctx->locals[i].name &&
+            strcmp(g_fn_ctx->locals[i].name->data, name->data) == 0) {
+            return (int)g_fn_ctx->locals[i].slot;
+        }
+    }
+    return -1;
+}
+
+static int fn_local_add(xf_Str *name, uint8_t type) {
+    if (!g_fn_ctx || !name) return -1;
+    if (g_fn_ctx->count >= 256) return -1;
+
+    int found = fn_local_find(name);
+    if (found >= 0) return found;
+
+    uint8_t slot = (uint8_t)g_fn_ctx->count;
+    g_fn_ctx->locals[g_fn_ctx->count].name = xf_str_retain(name);
+    g_fn_ctx->locals[g_fn_ctx->count].type = type;
+    g_fn_ctx->locals[g_fn_ctx->count].slot = slot;
+    g_fn_ctx->count++;
+    return slot;
+}
+
+static void fn_ctx_cleanup(FnCompileCtx *ctx) {
+    if (!ctx) return;
+    for (size_t i = 0; i < ctx->count; i++) {
+        xf_str_release(ctx->locals[i].name);
+        ctx->locals[i].name = NULL;
+    }
+    ctx->count = 0;
+}
+static xf_fn_t *build_compiled_fn(xf_Str *name,
+                                  uint8_t return_type,
+                                  Param *params,
+                                  size_t param_count,
+                                  Chunk *body_chunk) {
+    xf_fn_t *f = calloc(1, sizeof(xf_fn_t));
+    if (!f) return NULL;
+
+    atomic_store(&f->refcount, 1);
+    f->name        = xf_str_retain(name);
+    f->return_type = return_type;
+    f->param_count = param_count;
+    f->is_native   = false;
+    f->body        = body_chunk;
+
+    if (param_count > 0) {
+        f->params = calloc(param_count, sizeof(xf_param_t));
+        if (!f->params) {
+            xf_str_release(f->name);
+            free(f);
+            return NULL;
         }
 
-        bool found = strstr(haystack.data.str->data, ns.data.str->data) != NULL;
-        xf_value_release(ns);
-        return found ? xf_val_true() : xf_val_false();
+        for (size_t i = 0; i < param_count; i++) {
+            f->params[i].name        = xf_str_retain(params[i].name);
+            f->params[i].type        = params[i].type;
+            f->params[i].has_default = false;
+            f->params[i].default_val = NULL;
+        }
     }
 
-    /* element in array (stringified comparison for now) */
-    if (haystack.type == XF_TYPE_ARR && haystack.data.arr) {
-        xf_Value ns = xf_coerce_str(needle);
-        if (ns.state != XF_STATE_OK || !ns.data.str) {
-            if (ns.state == XF_STATE_OK) xf_value_release(ns);
-            return xf_val_false();
+    return f;
+}
+static GlobalBinding *g_compiler_globals = NULL;
+static size_t g_compiler_globals_count = 0;
+static size_t g_compiler_globals_cap   = 0;
+static const char *stmt_kind_name(StmtKind k) {
+    switch (k) {
+        case STMT_BLOCK: return "STMT_BLOCK";
+        case STMT_EXPR: return "STMT_EXPR";
+        case STMT_VAR_DECL: return "STMT_VAR_DECL";
+        case STMT_FN_DECL: return "STMT_FN_DECL";
+        case STMT_IF: return "STMT_IF";
+        case STMT_WHILE: return "STMT_WHILE";
+        case STMT_FOR: return "STMT_FOR";
+        case STMT_WHILE_SHORT: return "STMT_WHILE_SHORT";
+        case STMT_FOR_SHORT: return "STMT_FOR_SHORT";
+        case STMT_RETURN: return "STMT_RETURN";
+        case STMT_NEXT: return "STMT_NEXT";
+        case STMT_EXIT: return "STMT_EXIT";
+        case STMT_BREAK: return "STMT_BREAK";
+        case STMT_PRINT: return "STMT_PRINT";
+        case STMT_PRINTF: return "STMT_PRINTF";
+        case STMT_OUTFMT: return "STMT_OUTFMT";
+        case STMT_IMPORT: return "STMT_IMPORT";
+        case STMT_DELETE: return "STMT_DELETE";
+        case STMT_SPAWN: return "STMT_SPAWN";
+        case STMT_JOIN: return "STMT_JOIN";
+        case STMT_SUBST: return "STMT_SUBST";
+        case STMT_TRANS: return "STMT_TRANS";
+        default: return "STMT_UNKNOWN";
+    }
+}
+
+static const char *expr_kind_name(ExprKind k) {
+    switch (k) {
+        case EXPR_NUM: return "EXPR_NUM";
+        case EXPR_STR: return "EXPR_STR";
+        case EXPR_REGEX: return "EXPR_REGEX";
+        case EXPR_ARR_LIT: return "EXPR_ARR_LIT";
+        case EXPR_MAP_LIT: return "EXPR_MAP_LIT";
+        case EXPR_SET_LIT: return "EXPR_SET_LIT";
+        case EXPR_TUPLE_LIT: return "EXPR_TUPLE_LIT";
+        case EXPR_STATE_LIT: return "EXPR_STATE_LIT";
+        case EXPR_IDENT: return "EXPR_IDENT";
+        case EXPR_FIELD: return "EXPR_FIELD";
+        case EXPR_IVAR: return "EXPR_IVAR";
+        case EXPR_SVAR: return "EXPR_SVAR";
+        case EXPR_VALUE: return "EXPR_VALUE";
+        case EXPR_UNARY: return "EXPR_UNARY";
+        case EXPR_BINARY: return "EXPR_BINARY";
+        case EXPR_TERNARY: return "EXPR_TERNARY";
+        case EXPR_COALESCE: return "EXPR_COALESCE";
+        case EXPR_ASSIGN: return "EXPR_ASSIGN";
+        case EXPR_WALRUS: return "EXPR_WALRUS";
+        case EXPR_CALL: return "EXPR_CALL";
+        case EXPR_SUBSCRIPT: return "EXPR_SUBSCRIPT";
+        case EXPR_MEMBER: return "EXPR_MEMBER";
+        case EXPR_STATE: return "EXPR_STATE";
+        case EXPR_TYPE: return "EXPR_TYPE";
+        case EXPR_LEN: return "EXPR_LEN";
+        case EXPR_CAST: return "EXPR_CAST";
+        case EXPR_PIPE_FN: return "EXPR_PIPE_FN";
+        case EXPR_SPREAD: return "EXPR_SPREAD";
+        case EXPR_FN: return "EXPR_FN";
+        case EXPR_SPAWN: return "EXPR_SPAWN";
+        default: return "EXPR_UNKNOWN";
+    }
+}
+static xf_fn_t *compile_named_function(Interp *it,
+                                       xf_Str *name,
+                                       uint8_t return_type,
+                                       Param *params,
+                                       size_t param_count,
+                                       Stmt *body,
+                                       Loc loc) {
+    (void)loc;
+
+    Chunk *fn_chunk = calloc(1, sizeof(Chunk));
+    if (!fn_chunk) return NULL;
+    chunk_init(fn_chunk, name ? name->data : "<fn>");
+
+    FnCompileCtx fnctx = {0};
+    fnctx.return_type = return_type;
+
+    FnCompileCtx *saved_ctx = g_fn_ctx;
+    g_fn_ctx = &fnctx;
+
+    for (size_t i = 0; i < param_count; i++) {
+        if (fn_local_add(params[i].name, params[i].type) < 0) {
+            g_fn_ctx = saved_ctx;
+            fn_ctx_cleanup(&fnctx);
+            chunk_free(fn_chunk);
+            free(fn_chunk);
+            return NULL;
+        }
+    }
+
+    bool ok = compile_stmt(it, fn_chunk, body);
+    if (!ok) {
+        g_fn_ctx = saved_ctx;
+        fn_ctx_cleanup(&fnctx);
+        chunk_free(fn_chunk);
+        free(fn_chunk);
+        return NULL;
+    }
+
+    chunk_write(fn_chunk, OP_RETURN_NULL, 0);
+
+    g_fn_ctx = saved_ctx;
+    fn_ctx_cleanup(&fnctx);
+
+    return build_compiled_fn(name, return_type, params, param_count, fn_chunk);
+}
+static int compiler_global_find_str(xf_Str *name) {
+    if (!name) return -1;
+
+    for (size_t i = 0; i < g_compiler_globals_count; i++) {
+        if (g_compiler_globals[i].name &&
+            strcmp(g_compiler_globals[i].name->data, name->data) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+static uint32_t g_hidden_counter = 0;
+
+static uint32_t bind_hidden_global(Interp *it, const char *prefix) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "__xf_%s_%u", prefix, (unsigned)g_hidden_counter++);
+    return interp_bind_global_cstr(it, buf);
+}
+
+static void emit_loop_back_jump(Chunk *c, size_t target, uint32_t line) {
+    chunk_write(c, OP_JUMP, line);
+    int32_t delta = (int32_t)target - (int32_t)(c->len + 2);
+    chunk_write_u16(c, (uint16_t)(int16_t)delta, line);
+}
+static int compiler_global_find_cstr(const char *name) {
+    if (!name) return -1;
+
+    for (size_t i = 0; i < g_compiler_globals_count; i++) {
+        if (g_compiler_globals[i].name &&
+            strcmp(g_compiler_globals[i].name->data, name) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+uint32_t interp_bind_global_name(Interp *it, xf_Str *name) {
+    if (!it || !it->vm || !name) return UINT32_MAX;
+
+    int found = compiler_global_find_str(name);
+    if (found >= 0) {
+        return g_compiler_globals[(size_t)found].slot;
+    }
+
+    if (g_compiler_globals_count >= g_compiler_globals_cap) {
+        size_t new_cap = g_compiler_globals_cap ? g_compiler_globals_cap * 2 : 16;
+        GlobalBinding *tmp = realloc(g_compiler_globals, new_cap * sizeof(GlobalBinding));
+        if (!tmp) return UINT32_MAX;
+        g_compiler_globals = tmp;
+        g_compiler_globals_cap = new_cap;
+    }
+
+    xf_Str *copy = xf_str_retain(name);
+    if (!copy) return UINT32_MAX;
+
+    xf_Value init = xf_val_undef(XF_TYPE_VOID);
+
+    if (it->syms) {
+        Symbol *sym = sym_lookup_str(it->syms, name);
+        if (sym && sym->is_defined) {
+            xf_value_release(init);
+            init = xf_value_retain(sym->value);
+        }
+    }
+
+    uint32_t slot = vm_alloc_global(it->vm, init);
+    xf_value_release(init);
+
+    g_compiler_globals[g_compiler_globals_count].name = copy;
+    g_compiler_globals[g_compiler_globals_count].slot = slot;
+    g_compiler_globals_count++;
+
+    return slot;
+}
+
+uint32_t interp_bind_global_cstr(Interp *it, const char *name) {
+    if (!it || !it->vm || !name) return UINT32_MAX;
+
+    int found = compiler_global_find_cstr(name);
+    if (found >= 0) {
+        return g_compiler_globals[(size_t)found].slot;
+    }
+
+    if (g_compiler_globals_count >= g_compiler_globals_cap) {
+        size_t new_cap = g_compiler_globals_cap ? g_compiler_globals_cap * 2 : 16;
+        GlobalBinding *tmp = realloc(g_compiler_globals, new_cap * sizeof(GlobalBinding));
+        if (!tmp) return UINT32_MAX;
+        g_compiler_globals = tmp;
+        g_compiler_globals_cap = new_cap;
+    }
+
+    xf_Str *copy = xf_str_from_cstr(name);
+    if (!copy) return UINT32_MAX;
+
+    xf_Value init = xf_val_undef(XF_TYPE_VOID);
+    uint32_t slot = vm_alloc_global(it->vm, init);
+
+    g_compiler_globals[g_compiler_globals_count].name = copy;
+    g_compiler_globals[g_compiler_globals_count].slot = slot;
+    g_compiler_globals_count++;
+
+    return slot;
+}
+static uint32_t compile_global_name(Interp *it, xf_Str *name) {
+    return interp_bind_global_name(it, name);
+}
+static size_t emit_jump(Chunk *c, OpCode op, uint32_t line) {
+    chunk_write(c, op, line);
+    size_t pos = c->len;
+    chunk_write_u16(c, 0, line);   /* placeholder */
+    return pos;
+}
+static uint8_t infer_expr_type(Interp *it, Expr *e) {
+    if (!e) return XF_TYPE_VOID;
+
+    switch (e->kind) {
+        case EXPR_ARR_LIT:   return XF_TYPE_ARR;
+        case EXPR_TUPLE_LIT: return XF_TYPE_TUPLE;
+        case EXPR_MAP_LIT:   return XF_TYPE_MAP;
+        case EXPR_SET_LIT:   return XF_TYPE_SET;
+        case EXPR_STR:       return XF_TYPE_STR;
+
+        case EXPR_IDENT: {
+            if (!it || !it->syms || !e->as.ident.name) return XF_TYPE_VOID;
+            Symbol *sym = sym_lookup_str(it->syms, e->as.ident.name);
+            return sym ? sym->type : XF_TYPE_VOID;
         }
 
-        xf_arr_t *a = haystack.data.arr;
-        for (size_t i = 0; i < a->len; i++) {
-            xf_Value es = xf_coerce_str(a->items[i]);
-            bool match = (es.state == XF_STATE_OK &&
-                          es.data.str &&
-                          strcmp(es.data.str->data, ns.data.str->data) == 0);
-            xf_value_release(es);
+        default:
+            return XF_TYPE_VOID;
+    }
+}
+void interp_reset_global_bindings(void) {
+    for (size_t i = 0; i < g_compiler_globals_count; i++) {
+        xf_str_release(g_compiler_globals[i].name);
+    }
+    free(g_compiler_globals);
+    g_compiler_globals = NULL;
+    g_compiler_globals_count = 0;
+    g_compiler_globals_cap = 0;
+}
+static void patch_jump_here(Chunk *c, size_t jump_pos) {
+    size_t after = c->len;
+    int32_t delta = (int32_t)after - (int32_t)(jump_pos + 2);
+    chunk_patch_jump(c, jump_pos, (int16_t)delta);
+}
+bool interp_compile_program(Interp *it, Program *prog) {
+    if (!it || !it->vm || !prog) return false;
 
-            if (match) {
-                xf_value_release(ns);
-                return xf_val_true();
+    bool ok = false;
+    bool top_level_compile = (g_compile_depth == 0);
+    if (top_level_compile) {
+        interp_reset_global_bindings();
+    }
+    g_compile_depth++;
+
+    VM *vm = it->vm;
+
+    size_t rule_count = 0;
+    for (size_t i = 0; i < prog->count; i++) {
+        if (prog->items[i]->kind == TOP_RULE) rule_count++;
+    }
+
+    /* only allocate these once per top-level compile pass */
+    if (top_level_compile) {
+        vm->rules = calloc(rule_count, sizeof(Chunk *));
+        vm->patterns = calloc(rule_count, sizeof(xf_Value));
+        vm->rule_count = rule_count;
+
+        if ((rule_count && !vm->rules) || (rule_count && !vm->patterns)) {
+            goto done;
+        }
+    }
+
+    size_t rule_idx = 0;
+    if (!top_level_compile) {
+        /* append imported rules after existing ones if imports contain rules */
+        rule_idx = vm->rule_count;
+        if (rule_count > 0) {
+            size_t new_count = vm->rule_count + rule_count;
+
+            Chunk **new_rules = realloc(vm->rules, new_count * sizeof(Chunk *));
+            if (!new_rules) goto done;
+            vm->rules = new_rules;
+
+            xf_Value *new_patterns = realloc(vm->patterns, new_count * sizeof(xf_Value));
+            if (!new_patterns) goto done;
+            vm->patterns = new_patterns;
+
+            /* zero/init appended region */
+            for (size_t i = vm->rule_count; i < new_count; i++) {
+                vm->rules[i] = NULL;
+                vm->patterns[i] = xf_val_null();
             }
-        }
 
-        xf_value_release(ns);
-        return xf_val_false();
-    }
-
-    /* key in map/set */
-    if ((haystack.type == XF_TYPE_MAP || haystack.type == XF_TYPE_SET) && haystack.data.map) {
-        xf_Value ks = xf_coerce_str(needle);
-        if (ks.state != XF_STATE_OK || !ks.data.str) {
-            if (ks.state == XF_STATE_OK) xf_value_release(ks);
-            return xf_val_false();
-        }
-xf_Value got = xf_map_get(haystack.data.map, ks.data.str);
-bool found = (got.state == XF_STATE_OK);
-xf_value_release(got);
-xf_value_release(ks);
-return found ? xf_val_true() : xf_val_false();
-    }
-
-    return xf_val_false();
-}
-static inline void maybe_auto_gc(Interp *it) {
-    if (!it) return;
-    xf_gc_maybe_collect(it->vm, it->syms, it);
-}
-static SpawnCtx *find_spawn_ctx_by_id(uint32_t hid) {
-    if (hid == 0) return NULL;
-    for (size_t i = 0; i < XF_SPAWN_MAX; i++) {
-        if (g_spawn[i].id == hid) return &g_spawn[i];
-    }
-    return NULL;
-}
-
-static SpawnCtx *alloc_spawn_ctx(void) {
-    if (g_spawn_live >= XF_SPAWN_MAX) return NULL;
-    for (size_t i = 0; i < XF_SPAWN_MAX; i++) {
-        if (g_spawn[i].id == 0) {
-            memset(&g_spawn[i], 0, sizeof(g_spawn[i]));
-            g_spawn_live++;
-            return &g_spawn[i];
+            vm->rule_count = new_count;
         }
     }
-    return NULL;
-}
 
-static void free_spawn_ctx_slot(SpawnCtx *ctx) {
-    if (!ctx || ctx->id == 0) return;
-    if (ctx->snap_ready) {
-        sym_free(&ctx->snap_syms);
-        ctx->snap_ready = false;
-    }
-    xf_value_release(ctx->result);
-    xf_value_release(ctx->fn_val);
-    for (size_t i = 0; i < ctx->argc && i < 64; i++) xf_value_release(ctx->args[i]);
-    memset(ctx, 0, sizeof(*ctx));
-    if (g_spawn_live > 0) g_spawn_live--;
-}
+    for (size_t i = 0; i < prog->count; i++) {
+        TopLevel *tl = prog->items[i];
 
-static bool start_spawn_ctx(SpawnCtx *ctx) {
-    if (!ctx) return false;
-    if (ctx->started) return true;
+        switch (tl->kind) {
+            case TOP_FN: {
+                xf_fn_t *fn = compile_named_function(it,
+                                                     tl->as.fn.name,
+                                                     tl->as.fn.return_type,
+                                                     tl->as.fn.params,
+                                                     tl->as.fn.param_count,
+                                                     tl->as.fn.body,
+                                                     tl->loc);
+                if (!fn) goto done;
 
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+                xf_Value fv = xf_val_ok_fn(fn);
+                xf_fn_release(fn);
 
-    int rc = pthread_create(&ctx->tid, &attr, spawn_thread_fn, ctx);
-
-    pthread_attr_destroy(&attr);
-
-    if (rc != 0) {
-        ctx->tid = (pthread_t)0;
-        ctx->started = false;
-        return false;
-    }
-
-    ctx->started = true;
-    return true;
-}
-static void *spawn_thread_fn(void *arg) {
-    SpawnCtx *ctx = (SpawnCtx *)arg;
-
-    SymTable syms;
-    sym_init(&syms);
-
-    /* copy globals exactly once */
-    if (ctx->snap_ready) {
-        copy_globals_from(&syms, &ctx->snap_syms);
-    } else if (ctx->parent_syms) {
-        copy_globals_from(&syms, ctx->parent_syms);
-    }
-
-    Interp it;
-    memset(&it, 0, sizeof(it));
-    it.is_worker = true;
-    it.syms      = &syms;
-    it.vm        = ctx->vm;
-    it.last_err  = xf_val_null();
-
-    core_set_fn_caller(ctx->vm, &syms, interp_exec_xf_fn);
-
-    vm_rec_snapshot(ctx->vm, &it.rec_snap);
-    it.use_rec_snap = true;
-
-    if (ctx->fn_val.state == XF_STATE_OK &&
-        ctx->fn_val.type  == XF_TYPE_FN  &&
-        ctx->fn_val.data.fn) {
-        xf_Fn *fn = ctx->fn_val.data.fn;
-
-        if (!fn->is_native) {
-            Scope *fn_sc = sym_push(&syms, SCOPE_FN);
-            fn_sc->fn_ret_type = fn->return_type;
-
-            for (size_t i = 0; i < fn->param_count; i++) {
-                xf_Value av = i < ctx->argc ? ctx->args[i]
-                                            : xf_val_undef(fn->params[i].type);
-                Symbol *ps = sym_declare(&syms,
-                                         fn->params[i].name,
-                                         SYM_PARAM,
-                                         fn->params[i].type,
-                                         (Loc){.source="<spawn>", .line=0, .col=0});
-                if (ps) {
-                    xf_value_release(ps->value);
-                    ps->value = xf_value_retain(av);
-                    ps->state = av.state;
-                    ps->is_defined = true;
+                uint32_t slot = compile_global_name(it, tl->as.fn.name);
+                if (slot == UINT32_MAX) {
+                    xf_value_release(fv);
+                    goto done;
                 }
+
+                vm_set_global(vm, slot, fv);
+                xf_value_release(fv);
+                break;
             }
 
-            it.returning = false;
-            interp_eval_stmt(&it, (Stmt *)fn->body);
-xf_Value ret0 = it.returning ? xf_value_retain(it.return_val) : xf_val_null();
-ctx->result = ret0;
-it.returning = false;
-
-scope_free(sym_pop(&syms));
-                } else if (fn->native_v) {
-            ctx->result = fn->native_v(ctx->args, ctx->argc);
-        }
-}
-    interp_free(&it);
-    vm_rec_snapshot_free(&it.rec_snap);
-    sym_free(&syms);
-
-    pthread_mutex_lock(&g_spawn_mu);
-    ctx->done = true;
-    pthread_mutex_unlock(&g_spawn_mu);
-    return NULL;
-}
-static inline xf_Value propagate_err(xf_Value v) { return v; }
-
-/* ── copy_globals_from ───────────────────────────────────────────
- * Copy all symbols from src's global scope into dst's global scope,
- * retaining each value.  Called before executing an XF fn in a
- * worker thread so that core.*, user-defined globals, etc. are
- * visible without sharing the parent SymTable struct.
- * dst must have been freshly sym_init'd (empty global scope).
- * This is a shallow copy: values are ref-counted, no double-free risk.
- * Caller must hold no lock — this reads parent globals which are
- * stable (not mutated) during parallel worker execution.
- * ---------------------------------------------------------------- */
-static void copy_globals_from(SymTable *dst, SymTable *src) {
-    if (!src || !src->global) return;
-    Scope *sg = src->global;
-    for (size_t i = 0; i < sg->capacity; i++) {
-        Symbol *s = &sg->entries[i];
-        if (!s->name) continue;   /* empty slot */
-        Symbol *ds = sym_declare(dst, s->name, s->kind, s->type, s->decl_loc);
-if (ds) {
-    xf_value_release(ds->value);
-    ds->value      = xf_value_retain(s->value);
-    ds->state      = s->state;
-    ds->is_const   = s->is_const;
-    ds->is_defined = s->is_defined;
-}
-    }
-}
-static xf_Value interp_call_xf_fn(Interp *it, xf_fn_t *fn, xf_Value *args, size_t argc, Loc loc) {
-    Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
-    fn_sc->fn_ret_type = fn->return_type;
-
-    for (size_t i = 0; i < fn->param_count; i++) {
-        xf_Value av = (i < argc) ? args[i] : xf_val_undef(fn->params[i].type);
-        Symbol *ps = sym_declare(it->syms, fn->params[i].name,
-                                 SYM_PARAM, fn->params[i].type, loc);
-        if (ps) {
-            xf_value_release(ps->value);
-            ps->value      = xf_value_retain(av);
-            ps->state      = av.state;
-            ps->is_defined = true;
-        }
-    }
-
-    bool saved_returning = it->returning;
-    xf_Value saved_ret   = it->return_val;
-
-    it->returning = false;
-    it->return_val = xf_val_null();
-
-    interp_eval_stmt(it, (Stmt *)fn->body);
-
-    xf_Value result = it->returning ? xf_value_retain(it->return_val) : xf_val_null();
-
-    xf_value_release(it->return_val);
-    it->return_val = saved_ret;
-    it->returning  = saved_returning;
-
-    scope_free(sym_pop(it->syms));
-    return result;
-}
-/* ── interp_exec_xf_fn ───────────────────────────────────────────
- * Executes an XF-language (or native) fn in the calling thread.
- * Creates a private SymTable+Interp that shares only the VM pointer.
- * Parent globals are COPIED into the private table so that core.*,
- * user-defined functions and variables are visible to the worker.
- * All mutations (local vars, fn scope) stay private — no races.
- * ---------------------------------------------------------------- */
-static xf_Value interp_exec_xf_fn(void *vm_ptr, void *syms_ptr,
-                                   xf_fn_t *fn, xf_Value *args, size_t argc) {
-    if (!fn) return xf_val_null();
-    if (fn->is_native && fn->native_v) return fn->native_v(args, argc);
-    if (!fn->body) return xf_val_null();
-
-    VM       *vm         = (VM *)vm_ptr;
-    SymTable *parent_st  = (SymTable *)syms_ptr;
-
-    /* private symbol table — copy parent globals in, no shared state */
-    SymTable syms;
-    sym_init(&syms);
-    if (parent_st) copy_globals_from(&syms, parent_st);
-
-    /* Bind a thread-local callback context for this private interpreter.
-     * core_set_fn_caller() now uses thread-local overrides, so this worker
-     * can safely point core.* callback paths at its private SymTable
-     * without clobbering sibling threads. */
-    Interp it;
-    memset(&it, 0, sizeof(it));
-    it.syms     = &syms;
-    it.vm       = vm;
-    it.last_err = xf_val_null();
-
-    core_set_fn_caller(vm, parent_st, interp_exec_xf_fn);
-
-    /* Snapshot record context — worker sees the record at call time */
-    vm_rec_snapshot(vm, &it.rec_snap);
-    it.use_rec_snap = true;
-
-    /* push fn scope and bind parameters — all private */
-    Scope *fn_sc = sym_push(&syms, SCOPE_FN);
-    fn_sc->fn_ret_type = fn->return_type;
-    for (size_t i = 0; i < fn->param_count; i++) {
-        xf_Value av = (i < argc) ? args[i]
-                                 : xf_val_undef(fn->params[i].type);
-        Symbol *ps = sym_declare(&syms, fn->params[i].name,
-                                  SYM_PARAM, fn->params[i].type,
-                                  (Loc){.source="<worker>",.line=0,.col=0});
-                                  if (ps) {
-    xf_value_release(ps->value);
-    ps->value      = xf_value_retain(av);
-    ps->state      = av.state;
-    ps->is_defined = true;
-}
-    }
-
-    it.returning = false;
-    interp_eval_stmt(&it, (Stmt *)fn->body);
-    xf_Value result = it.returning ? xf_value_retain(it.return_val) : xf_val_null();
-    if (it.returning) xf_value_release(it.return_val);  // ← add: drop the original ref
-it.returning = false;
-
-scope_free(sym_pop(&syms));
-    interp_free(&it);
-    vm_rec_snapshot_free(&it.rec_snap);
-    sym_free(&syms);
-    return result;
-}
-
-static bool bind_loop_value(Interp *it, LoopBind *bind, xf_Value v, Loc loc);
-static bool is_complex_like(xf_Value v) {
-    return v.state == XF_STATE_OK &&
-           (v.type == XF_TYPE_COMPLEX || v.type == XF_TYPE_NUM);
-}
-
-static xf_complex_t to_complex(xf_Value v) {
-    xf_complex_t z = {0.0, 0.0};
-    if (v.state != XF_STATE_OK) return z;
-    if (v.type == XF_TYPE_COMPLEX) return v.data.complex;
-    if (v.type == XF_TYPE_NUM) {
-        z.re = v.data.num;
-        z.im = 0.0;
-    }
-    return z;
-}
-
-static xf_Value apply_binary_op(Interp *it,BinOp op, xf_Value a, xf_Value b, Loc loc) {
-    if (a.state == XF_STATE_UNDEF || b.state == XF_STATE_UNDEF) {
-        interp_error(it, loc, "undefined value used in operation");
-        xf_err_t *e = xf_err_new("undefined value used in operation",
-                                 loc.source, loc.line, loc.col);
-        xf_Value out = xf_val_err(e, XF_TYPE_VOID);
-        xf_err_release(e);
-        return out;
-    }
-
-    if (a.state == XF_STATE_UNDET || b.state == XF_STATE_UNDET) {
-        interp_error(it, loc, "undetermined value used in operation");
-        xf_err_t *e = xf_err_new("undetermined value used in operation",
-                                 loc.source, loc.line, loc.col);
-        xf_Value out = xf_val_err(e, XF_TYPE_VOID);
-        xf_err_release(e);
-        return out;
-    }
-    if (is_complex_like(a) && is_complex_like(b) &&
-        (a.type == XF_TYPE_COMPLEX || b.type == XF_TYPE_COMPLEX)) {
-        xf_complex_t x = to_complex(a);
-        xf_complex_t y = to_complex(b);
-
-        switch (op) {
-            case BINOP_ADD:
-                return xf_val_ok_complex(x.re + y.re, x.im + y.im);
-
-            case BINOP_SUB:
-                return xf_val_ok_complex(x.re - y.re, x.im - y.im);
-
-            case BINOP_MUL:
-                return xf_val_ok_complex(
-                    x.re * y.re - x.im * y.im,
-                    x.re * y.im + x.im * y.re
-                );
-
-            case BINOP_DIV: {
-                double d = y.re * y.re + y.im * y.im;
-                if (d == 0.0) {
-                    return xf_val_err(
-                        xf_err_new("complex division by zero",
-                                   loc.source ? loc.source : "<unknown>",
-                                   loc.line, loc.col),
-                        XF_TYPE_COMPLEX
-                    );
+            case TOP_BEGIN: {
+                if (!vm->begin_chunk) {
+                    vm->begin_chunk = calloc(1, sizeof(Chunk));
+                    if (!vm->begin_chunk) goto done;
+                    chunk_init(vm->begin_chunk, "<begin>");
                 }
-                return xf_val_ok_complex(
-                    (x.re * y.re + x.im * y.im) / d,
-                    (x.im * y.re - x.re * y.im) / d
-                );
+
+                if (!compile_stmt(it, vm->begin_chunk, tl->as.begin_end.body)) {
+                    goto done;
+                }
+                break;
+            }
+
+            case TOP_END: {
+                if (!vm->end_chunk) {
+                    vm->end_chunk = calloc(1, sizeof(Chunk));
+                    if (!vm->end_chunk) goto done;
+                    chunk_init(vm->end_chunk, "<end>");
+                }
+
+                if (!compile_stmt(it, vm->end_chunk, tl->as.begin_end.body)) {
+                    goto done;
+                }
+                break;
+            }
+
+            case TOP_RULE: {
+                Chunk *rule = calloc(1, sizeof(Chunk));
+                if (!rule) goto done;
+                chunk_init(rule, "<rule>");
+
+                if (tl->as.rule.pattern) {
+                    if (!compile_expr(it, rule, tl->as.rule.pattern)) {
+                        chunk_free(rule);
+                        free(rule);
+                        goto done;
+                    }
+
+                    size_t skip_body = emit_jump(rule, OP_JUMP_NOT, tl->loc.line);
+
+                    if (!compile_stmt(it, rule, tl->as.rule.body)) {
+                        chunk_free(rule);
+                        free(rule);
+                        goto done;
+                    }
+
+                    patch_jump_here(rule, skip_body);
+                } else {
+                    if (!compile_stmt(it, rule, tl->as.rule.body)) {
+                        chunk_free(rule);
+                        free(rule);
+                        goto done;
+                    }
+                }
+
+                chunk_write(rule, OP_HALT, tl->loc.line);
+
+                if (rule_idx >= vm->rule_count) {
+                    chunk_free(rule);
+                    free(rule);
+                    goto done;
+                }
+
+                vm->rules[rule_idx] = rule;
+                vm->patterns[rule_idx] = xf_val_null();
+                rule_idx++;
+                break;
+            }
+
+            case TOP_STMT: {
+                if (!vm->begin_chunk) {
+                    vm->begin_chunk = calloc(1, sizeof(Chunk));
+                    if (!vm->begin_chunk) goto done;
+                    chunk_init(vm->begin_chunk, "<begin>");
+                }
+
+                if (!compile_stmt(it, vm->begin_chunk, tl->as.stmt.stmt)) {
+                    goto done;
+                }
+                break;
             }
 
             default:
@@ -447,3240 +527,966 @@ static xf_Value apply_binary_op(Interp *it,BinOp op, xf_Value a, xf_Value b, Loc
         }
     }
 
-    switch (op) {
-        case BINOP_ADD:
-            if ((a.state == XF_STATE_OK && a.type == XF_TYPE_ARR) ||
-                (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR))
-                return arr_broadcast(a, b, 0);
-            {
-                xf_Value na = xf_coerce_num(a);
-                if (na.state != XF_STATE_OK) return na;
+    if (top_level_compile) {
+        if (vm->begin_chunk) {
+            chunk_write(vm->begin_chunk, OP_HALT, 0);
+        }
 
-                xf_Value nb = xf_coerce_num(b);
-                if (nb.state != XF_STATE_OK) {
-                    xf_value_release(na);
-                    return nb;
-                }
-
-                xf_Value out = xf_val_ok_num(na.data.num + nb.data.num);
-                xf_value_release(na);
-                xf_value_release(nb);
-                return out;
-            }
-
-        case BINOP_SUB:
-            if ((a.state == XF_STATE_OK && a.type == XF_TYPE_ARR) ||
-                (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR))
-                return arr_broadcast(a, b, 1);
-            {
-                xf_Value na = xf_coerce_num(a);
-                if (na.state != XF_STATE_OK) return na;
-
-                xf_Value nb = xf_coerce_num(b);
-                if (nb.state != XF_STATE_OK) {
-                    xf_value_release(na);
-                    return nb;
-                }
-
-                xf_Value out = xf_val_ok_num(na.data.num - nb.data.num);
-                xf_value_release(na);
-                xf_value_release(nb);
-                return out;
-            }
-
-        case BINOP_MUL:
-            if ((a.state == XF_STATE_OK && a.type == XF_TYPE_ARR) ||
-                (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR))
-                return arr_broadcast(a, b, 2);
-            {
-                xf_Value na = xf_coerce_num(a);
-                if (na.state != XF_STATE_OK) return na;
-
-                xf_Value nb = xf_coerce_num(b);
-                if (nb.state != XF_STATE_OK) {
-                    xf_value_release(na);
-                    return nb;
-                }
-
-                xf_Value out = xf_val_ok_num(na.data.num * nb.data.num);
-                xf_value_release(na);
-                xf_value_release(nb);
-                return out;
-            }
-
-        case BINOP_DIV:
-            if ((a.state == XF_STATE_OK && a.type == XF_TYPE_ARR) ||
-                (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR))
-                return arr_broadcast(a, b, 3);
-            {
-                xf_Value na = xf_coerce_num(a);
-                if (na.state != XF_STATE_OK) return na;
-
-                xf_Value nb = xf_coerce_num(b);
-                if (nb.state != XF_STATE_OK) {
-                    xf_value_release(na);
-                    return nb;
-                }
-
-                if (nb.data.num == 0.0) {
-                    xf_value_release(na);
-                    xf_value_release(nb);
-                    return xf_val_err(
-                        xf_err_new("division by zero",
-                                   loc.source ? loc.source : "<unknown>",
-                                   loc.line, loc.col),
-                        XF_TYPE_NUM
-                    );
-                }
-
-                xf_Value out = xf_val_ok_num(na.data.num / nb.data.num);
-                xf_value_release(na);
-                xf_value_release(nb);
-                return out;
-            }
-
-        case BINOP_MOD:
-            if ((a.state == XF_STATE_OK && a.type == XF_TYPE_ARR) ||
-                (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR))
-                return arr_broadcast(a, b, 4);
-            {
-                xf_Value na = xf_coerce_num(a);
-                if (na.state != XF_STATE_OK) return na;
-
-                xf_Value nb = xf_coerce_num(b);
-                if (nb.state != XF_STATE_OK) {
-                    xf_value_release(na);
-                    return nb;
-                }
-
-                if (nb.data.num == 0.0) {
-                    xf_value_release(na);
-                    xf_value_release(nb);
-                    return xf_val_err(
-                        xf_err_new("modulo by zero",
-                                   loc.source ? loc.source : "<unknown>",
-                                   loc.line, loc.col),
-                        XF_TYPE_NUM
-                    );
-                }
-
-                xf_Value out = xf_val_ok_num(fmod(na.data.num, nb.data.num));
-                xf_value_release(na);
-                xf_value_release(nb);
-                return out;
-            }
-
-        case BINOP_CONCAT:
-            return val_concat(a, b);
-
-        case BINOP_MADD:
-            return arr_broadcast(a, b, 0);
-
-        case BINOP_MSUB:
-            return arr_broadcast(a, b, 1);
-
-        case BINOP_MMUL:
-            return mat_mul(a, b);
-
-        case BINOP_MDIV:
-            return arr_broadcast(a, b, 3);
-
-        default:
-            return xf_val_nav(XF_TYPE_VOID);
+        if (vm->end_chunk) {
+            chunk_write(vm->end_chunk, OP_HALT, 0);
+        }
     }
+
+    ok = true;
+
+done:
+    g_compile_depth--;
+    return ok;
 }
+static bool compile_block_stmt(Interp *it, Chunk *c, Stmt *s) {
+    (void)it;
+    if (!s) return false;
 
-static bool bind_loop_tuple(Interp *it, LoopBind *bind, xf_Value v, Loc loc) {
-    if (!bind) return true;
-    if (bind->kind != LOOP_BIND_TUPLE) {
-        interp_error(it, loc, "internal error: expected tuple loop binding");
-        return false;
+    for (size_t i = 0; i < s->as.block.count; i++) {
+        if (!compile_stmt(it, c, s->as.block.stmts[i])) return false;
     }
-
-    if (v.state != XF_STATE_OK || v.type != XF_TYPE_TUPLE || !v.data.tuple) {
-        interp_error(it, loc, "cannot destructure non-tuple value");
-        return false;
-    }
-
-    size_t need = bind->as.tuple.count;
-    size_t have = xf_tuple_len(v.data.tuple);
-
-    if (have != need) {
-        interp_error(it, loc, "tuple destructuring arity mismatch: expected %zu values, got %zu",
-                     need, have);
-        return false;
-    }
-
-    for (size_t i = 0; i < need; i++) {
-        xf_Value elem = xf_tuple_get(v.data.tuple, i);
-        if (!bind_loop_value(it, bind->as.tuple.items[i], elem, loc))
-            return false;
-    }
-
     return true;
 }
 
-static bool bind_loop_value(Interp *it, LoopBind *bind, xf_Value v, Loc loc) {
-    if (!bind) return true;
+static bool compile_print_stmt(Interp *it, Chunk *c, Stmt *s) {
+    if (!s) return false;
 
-    switch (bind->kind) {
-        case LOOP_BIND_NAME: {
-            Symbol *sym = sym_declare(it->syms, bind->as.name,
-                                      SYM_VAR, XF_TYPE_VOID, loc);
-            if (!sym) {
-                interp_error(it, loc, "failed to bind loop variable '%s'",
-                             ((bind->as.name && bind->as.name->data) ? bind->as.name->data : "<null>"));
-                return false;
+    size_t argc = s->as.io.count;
+    for (size_t i = 0; i < argc; i++) {
+        if (!compile_expr(it, c, s->as.io.args[i])) return false;
+    }
+
+    chunk_write(c, OP_PRINT, s->loc.line);
+    chunk_write(c, (uint8_t)argc, s->loc.line);
+    return true;
+}
+static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
+    if (!s) return false;
+
+    switch (s->kind) {
+        case STMT_BLOCK:
+            for (size_t i = 0; i < s->as.block.count; i++) {
+                if (!compile_stmt(it, c, s->as.block.stmts[i])) return false;
+            }
+            return true;
+
+        case STMT_EXPR:
+            if (!compile_expr(it, c, s->as.expr.expr)) return false;
+            chunk_write(c, OP_POP, s->loc.line);
+            return true;
+                    case STMT_PRINT: {
+            size_t argc = s->as.io.count;
+
+            for (size_t i = 0; i < argc; i++) {
+                if (!compile_expr(it, c, s->as.io.args[i])) return false;
             }
 
-            xf_value_release(sym->value);
-            sym->value = xf_value_retain(v);
-            sym->state = v.state;
+            chunk_write(c, OP_PRINT, s->loc.line);
+            chunk_write(c, (uint8_t)argc, s->loc.line);
+            return true;
+        }
+                case STMT_OUTFMT: {
+            const char *sep = " ";
+
+            switch (s->as.outfmt.mode) {
+                case 0: /* text */
+                    sep = " ";
+                    break;
+                case 1: /* csv */
+                    sep = ",";
+                    break;
+                case 2: /* tsv */
+                    sep = "\t";
+                    break;
+                default:
+                    fprintf(stderr, "compile_stmt: unknown outfmt mode at %u:%u\n",
+                            s->loc.line, s->loc.col);
+                    return false;
+            }
+
+            xf_Str *str = xf_str_from_cstr(sep);
+            if (!str) return false;
+
+            xf_Value v = xf_val_ok_str(str);
+            uint32_t idx = chunk_add_const(c, v);
+
+            xf_value_release(v);
+            xf_str_release(str);
+
+            chunk_write(c, OP_PUSH_STR, s->loc.line);
+            chunk_write_u32(c, idx, s->loc.line);
+
+            /* keep assignment semantics consistent with FS/OFS/ORS handling */
+            chunk_write(c, OP_DUP, s->loc.line);
+            chunk_write(c, OP_STORE_OFS, s->loc.line);
+            chunk_write(c, OP_POP, s->loc.line);
+
+            return true;
+        }
+                case STMT_PRINTF: {
+            size_t argc = s->as.io.count;
+
+            for (size_t i = 0; i < argc; i++) {
+                if (!compile_expr(it, c, s->as.io.args[i])) return false;
+            }
+
+            chunk_write(c, OP_PRINTF, s->loc.line);
+            chunk_write(c, (uint8_t)argc, s->loc.line);
+            return true;
+        }
+
+        case STMT_NEXT:
+    chunk_write(c, OP_NEXT_RECORD, s->loc.line);
+    return true;
+        case STMT_VAR_DECL: {
+    if (it->syms) {
+        Symbol *sym = sym_lookup_local_str(it->syms, s->as.var_decl.name);
+        if (!sym) {
+            sym = sym_declare(it->syms,
+                              s->as.var_decl.name,
+                              SYM_VAR,
+                              s->as.var_decl.type,
+                              s->loc);
+        }
+        if (sym) {
+            sym->type = s->as.var_decl.type;
             sym->is_defined = true;
-            return true;
-        }
-
-        case LOOP_BIND_TUPLE:
-            return bind_loop_tuple(it, bind, v, loc);
-
-        default:
-            interp_error(it, loc, "invalid loop binding");
-            return false;
-    }
-}
-
-static bool bind_loop_index_value(Interp *it,
-                                  LoopBind *key_bind,
-                                  LoopBind *val_bind,
-                                  xf_Value keyv,
-                                  xf_Value valv,
-                                  Loc loc) {
-    if (key_bind) {
-        if (!bind_loop_value(it, key_bind, keyv, loc)) return false;
-    }
-    if (val_bind) {
-        if (!bind_loop_value(it, val_bind, valv, loc)) return false;
-    }
-    return true;
-}
-void interp_init(Interp *it, SymTable *syms, VM *vm) {
-    memset(it, 0, sizeof(*it));
-    it->syms     = syms;
-    it->vm       = vm;
-    it->last_err = xf_val_null();
-    if (vm) core_set_fn_caller(vm, syms, interp_exec_xf_fn);
-}
-void interp_free(Interp *it) {
-    //xf_value_release(it->return_val);   // ← add
-   // xf_value_release(it->last_err);     // ← add (works once ERR state is handled above)
-    it->return_val = xf_val_null();
-    it->last_err   = xf_val_null();
-   xf_value_release(it->return_val);   // ← add
-   xf_value_release(it->last_err);     // ← add (works once ERR state is handled above)
-    for (size_t i = 0; i < it->imp_prog_count; i++)
-        ast_program_free(it->imp_progs[i]);
-    free(it->imp_progs);
-    it->imp_progs      = NULL;
-    it->imp_prog_count = 0;
-    it->imp_prog_cap   = 0;
-}
-
-/* ──────────────────────────────────────────────────────────────────────
- * interp_call_core — delegate to a core.MODULE.FN native function.
- *
- * Looks up the `core` module in the symbol table, traverses to the
- * named sub-module and function, then calls fn->native_v directly.
- * Returns NAV(VOID) if the path cannot be resolved (module not loaded,
- * function not found, or not a native callable).
- * ────────────────────────────────────────────────────────────────────── */
-static xf_Value interp_call_core(Interp *it,
-                                 const char *module, const char *fn_name,
-                                 xf_Value *args, size_t argc) {
-    Symbol *core_sym = sym_lookup(it->syms, "core", 4);
-    if (!core_sym || core_sym->value.type != XF_TYPE_MODULE ||
-        !core_sym->value.data.mod) return xf_val_nav(XF_TYPE_VOID);
-
-    xf_Value sub = xf_module_get(core_sym->value.data.mod, module);
-    if (sub.state != XF_STATE_OK || sub.type != XF_TYPE_MODULE || !sub.data.mod) {
-        xf_value_release(sub);
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-
-    xf_Value fv = xf_module_get(sub.data.mod, fn_name);
-    if (fv.state != XF_STATE_OK || fv.type != XF_TYPE_FN || !fv.data.fn) {
-        xf_value_release(fv);
-        xf_value_release(sub);
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-
-    xf_Fn *fn = fv.data.fn;
-    if (!fn->is_native || !fn->native_v) {
-        xf_value_release(fv);
-        xf_value_release(sub);
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-
-    xf_Value ret = fn->native_v(args, argc);
-    xf_value_release(fv);
-    xf_value_release(sub);
-    return ret;
-}
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdarg.h>
-#include <stdbool.h>
-
-static char *xf_read_line_from_file(const char *path, int target_line) {
-    if (!path || target_line <= 0) return NULL;
-    if (strcmp(path, "<repl>") == 0) return NULL;
-
-    FILE *fp = fopen(path, "r");
-    if (!fp) return NULL;
-
-    char buf[4096];
-    int line_no = 0;
-    char *out = NULL;
-
-    while (fgets(buf, sizeof(buf), fp)) {
-        line_no++;
-        if (line_no == target_line) {
-            size_t len = strlen(buf);
-
-            while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
-                buf[--len] = '\0';
-            }
-
-            out = malloc(len + 1);
-            if (out) memcpy(out, buf, len + 1);
-            break;
         }
     }
 
-    fclose(fp);
-    return out;
-}
-
-static void xf_print_caret_line(const char *src_line, int col) {
-    fprintf(stdout, "   | ");
-
-    if (!src_line || col <= 1) {
-        fprintf(stdout, "^\n");
-        return;
-    }
-
-    int visual = 0;
-    for (int i = 0; src_line[i] && i < col - 1; i++) {
-        if (src_line[i] == '\t') {
-            fputc('\t', stdout);
-        } else {
-            fputc(' ', stdout);
-        }
-        visual++;
-    }
-
-    (void)visual;
-    fprintf(stdout, "^\n");
-}
-void interp_error(Interp *it, Loc loc, const char *fmt, ...) {
-    if (!it) return;
-
-    const char *src = loc.source ? loc.source : "<unknown>";
-
-    char msg[1024];
-    va_list ap;
-    fmt = fmt ? fmt : "<null fmt>";
-    va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt ? fmt : "<error>", ap);
-    va_end(ap);
-
-    fprintf(stderr, "ERR ──────CRAPPLES!!──────────────────────\n");
-    fprintf(stderr, "  %s\n", msg);
-    fprintf(stderr, "  --> %s:%u:%u\n", src, loc.line, loc.col);
-    fprintf(stderr, "──────────────────────────────────────────\n");
-
-    it->had_error = true;
-}
-static void xf_print_value(FILE *out, xf_Value v) {
-    if (v.state == XF_STATE_TRUE)  { fputs("true",  out); return; }
-    if (v.state == XF_STATE_FALSE) { fputs("false", out); return; }
-        switch (v.state) {
-        case XF_STATE_OK:
-            break;
-        default:
-            fputs(XF_STATE_NAMES[v.state], out);
-            return;
-    }
-
-    switch (v.type) {
-        case XF_TYPE_NUM:
-            fprintf(out, "%.15g", v.data.num);
-            return;
-
-        case XF_TYPE_STR:
-            fputs(v.data.str ? v.data.str->data : "", out);
-            return;
-case XF_TYPE_COMPLEX: {
-    double re = v.data.complex.re;
-    double im = v.data.complex.im;
-
-    if (re == 0.0) {
-        fprintf(out, "%.15gi", im);
-    } else if (im < 0.0) {
-        fprintf(out, "%.15g%.15gi", re, im);
+    if (s->as.var_decl.init) {
+        if (!compile_expr(it, c, s->as.var_decl.init)) return false;
     } else {
-        fprintf(out, "%.15g+%.15gi", re, im);
-    }
-    return;
-}
-        case XF_TYPE_ARR: {
-            fputc('[', out);
-            if (v.data.arr) {
-                for (size_t i = 0; i < v.data.arr->len; i++) {
-                    if (i > 0) fputs(", ", out);
-                    xf_print_value(out, v.data.arr->items[i]);
-                }
-            }
-            fputc(']', out);
-            return;
-        }
-case XF_TYPE_TUPLE: {
-    fputc('(', out);
-    if (v.data.tuple) {
-        size_t n = xf_tuple_len(v.data.tuple);
-        for (size_t i = 0; i < n; i++) {
-            if (i > 0) fputs(", ", out);
-            xf_print_value(out, xf_tuple_get(v.data.tuple, i));
-        }
-        if (n == 1) fputc(',', out);
-    }
-    fputc(')', out);
-    return;
-}
-                case XF_TYPE_MAP: {
-            fputc('{', out);
-            if (v.data.map) {
-                for (size_t i = 0; i < v.data.map->order_len; i++) {
-                    if (i > 0) fputs(", ", out);
-                    xf_Str *k = v.data.map->order[i];
-                    fputs(k ? k->data : "", out);
-                    fputc(':', out);
-                    xf_Value mv = xf_map_get(v.data.map, k);
-                    xf_print_value(out, mv);
-                    xf_value_release(mv);
-                }
-            }
-            fputc('}', out);
-            return;
-        }
-
-        case XF_TYPE_SET: {
-            fputc('{', out);
-            if (v.data.map) {
-                for (size_t i = 0; i < v.data.map->order_len; i++) {
-                    if (i > 0) fputs(", ", out);
-                    xf_Str *k = v.data.map->order[i];
-                    fputs(k ? k->data : "", out);
-                }
-            }
-            fputc('}', out);
-            return;
-        }
-
-        case XF_TYPE_FN:
-            fputs("<fn>", out);
-            return;
-
-        case XF_TYPE_VOID:
-            fputs("void", out);
-            return;
-
-        default: {
-            xf_Value sv = xf_coerce_str(v);
-            if (sv.state == XF_STATE_OK && sv.data.str)
-                fputs(sv.data.str->data, out);
-            else
-                fputs(XF_TYPE_NAMES[v.type], out);
-            xf_value_release(sv);
-            return;
-        }
-        printf("\n\n\n");
-    }
-}
-void interp_type_err(Interp *it, Loc loc,
-                     const char *op, uint8_t got, uint8_t expected) {
-    interp_error(it, loc, "type error in '%s': got %s, expected %s",
-                 op, XF_TYPE_NAMES[got], XF_TYPE_NAMES[expected]);
-}
-static xf_Fn *build_fn(xf_Str *name, uint8_t ret,
-                        Param *params, size_t pc, Stmt *body) {
-    xf_Fn *fn = calloc(1, sizeof(xf_Fn));
-    atomic_store(&fn->refcount, 1);   /* must be 1: xf_fn_release checks fetch_sub==1 */
-    fn->name        = xf_str_retain(name);
-    fn->return_type = ret;
-    fn->param_count = pc;
-    fn->body        = body;
-    fn->is_native   = false;
-    if (pc > 0) {
-        fn->params = calloc(pc, sizeof(xf_param_t));
-        for (size_t i = 0; i < pc; i++) {
-            fn->params[i].name = xf_str_retain(params[i].name);
-            fn->params[i].type = params[i].type;
-        }
-    }
-    return fn;
-}
-static bool is_truthy(xf_Value v) {
-    /* boolean states resolve without touching the data union */
-    if (v.state == XF_STATE_TRUE)  return true;
-    if (v.state == XF_STATE_FALSE) return false;
-    if (v.state != XF_STATE_OK) return false;
-    if (v.type == XF_TYPE_BOOL) return v.data.num != 0.0;
-    if (v.type == XF_TYPE_NUM) return v.data.num != 0.0;
-    if (v.type == XF_TYPE_STR) return v.data.str && v.data.str->len > 0;
-    if (v.type == XF_TYPE_ARR) return v.data.arr && v.data.arr->len > 0;
-    if (v.type == XF_TYPE_MAP || v.type == XF_TYPE_SET)
-        return v.data.map && v.data.map->used > 0;
-    /* fn, regex, module — non-null pointer is truthy */
-    return true;
-}
-static xf_Value make_bool(bool b) {
-    return b ? xf_val_true() : xf_val_false();
-}
-static int val_cmp(xf_Value a, xf_Value b) {
-    if (a.state != XF_STATE_OK && b.state != XF_STATE_OK)
-        return (int)a.state - (int)b.state;
-
-    xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
-    if (na.state == XF_STATE_OK && nb.state == XF_STATE_OK) {
-        int out = 0;
-        if (na.data.num < nb.data.num) out = -1;
-        else if (na.data.num > nb.data.num) out = 1;
-        xf_value_release(na);
-        xf_value_release(nb);
-        return out;
-    }
-    xf_value_release(na);
-    xf_value_release(nb);
-
-    xf_Value sa = xf_coerce_str(a), sb = xf_coerce_str(b);
-    int cmp = 0;
-    if (sa.state == XF_STATE_OK && sb.state == XF_STATE_OK && sa.data.str && sb.data.str)
-        cmp = strcmp(sa.data.str->data, sb.data.str->data);
-    xf_value_release(sa);
-    xf_value_release(sb);
-    return cmp;
-}
-static xf_Value val_concat(xf_Value a, xf_Value b) {
-    xf_Value sa = xf_coerce_str(a), sb = xf_coerce_str(b);
-    if (sa.state != XF_STATE_OK) { xf_value_release(sb); return sa; }
-    if (sb.state != XF_STATE_OK) { xf_value_release(sa); return sb; }
-    size_t la = sa.data.str ? sa.data.str->len : 0;
-    size_t lb = sb.data.str ? sb.data.str->len : 0;
-    char *buf = malloc(la + lb + 1);
-    if (la) memcpy(buf, sa.data.str->data, la);
-    if (lb) memcpy(buf + la, sb.data.str->data, lb);
-    buf[la+lb] = '\0';
-    xf_Str *s = xf_str_new(buf, la+lb);
-    free(buf);
-    xf_Value r = xf_val_ok_str(s);
-    xf_str_release(s);
-    /* release coerced copies — coerce_str retains for STR type, so always release */
-    xf_value_release(sa);
-    xf_value_release(sb);
-    return r;
-}
-static double scalar_op(double a, double b, int op) {
-    switch(op){case 0:return a+b;case 1:return a-b;case 2:return a*b;
-    case 3:return b!=0?a/b:0;case 4:return b!=0?fmod(a,b):0;case 5:return pow(a,b);default:return 0;}
-}
-static xf_Value elem_op(xf_Value a, xf_Value b, int op);
-static xf_Value arr_broadcast(xf_Value a, xf_Value b, int op) {
-    bool aa=(a.state==XF_STATE_OK&&a.type==XF_TYPE_ARR&&a.data.arr);
-    bool ba=(b.state==XF_STATE_OK&&b.type==XF_TYPE_ARR&&b.data.arr);
-    if(aa&&ba){size_t len=a.data.arr->len>b.data.arr->len?a.data.arr->len:b.data.arr->len;xf_arr_t*out=xf_arr_new();for(size_t i=0;i<len;i++){xf_Value av=i<a.data.arr->len?a.data.arr->items[i]:xf_val_ok_num(0);xf_Value bv=i<b.data.arr->len?b.data.arr->items[i]:xf_val_ok_num(0);xf_arr_push(out,elem_op(av,bv,op));}xf_Value r=xf_val_ok_arr(out);xf_arr_release(out);return r;}
-    if(aa){xf_arr_t*out=xf_arr_new();for(size_t i=0;i<a.data.arr->len;i++)xf_arr_push(out,elem_op(a.data.arr->items[i],b,op));xf_Value r=xf_val_ok_arr(out);xf_arr_release(out);return r;}
-    if(ba){xf_arr_t*out=xf_arr_new();for(size_t i=0;i<b.data.arr->len;i++)xf_arr_push(out,elem_op(a,b.data.arr->items[i],op));xf_Value r=xf_val_ok_arr(out);xf_arr_release(out);return r;}
-    return xf_val_nav(XF_TYPE_NUM);
-}
-static xf_Value elem_op(xf_Value a, xf_Value b, int op) {
-    if ((a.state == XF_STATE_OK && a.type == XF_TYPE_ARR) ||
-        (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR))
-        return arr_broadcast(a, b, op);
-
-    xf_Value na = xf_coerce_num(a), nb = xf_coerce_num(b);
-    xf_Value out = xf_val_ok_num(
-        scalar_op((na.state == XF_STATE_OK) ? na.data.num : 0,
-                  (nb.state == XF_STATE_OK) ? nb.data.num : 0, op)
-    );
-    xf_value_release(na);
-    xf_value_release(nb);
-    return out;
-}
-static xf_Value mat_mul(xf_Value a, xf_Value b) {
-    if(!(a.state==XF_STATE_OK&&a.type==XF_TYPE_ARR&&a.data.arr)) return xf_val_nav(XF_TYPE_ARR);
-    if(!(b.state==XF_STATE_OK&&b.type==XF_TYPE_ARR&&b.data.arr)) return xf_val_nav(XF_TYPE_ARR);
-    size_t rows=a.data.arr->len;
-    size_t k_max=(rows>0&&a.data.arr->items[0].type==XF_TYPE_ARR&&a.data.arr->items[0].data.arr)?a.data.arr->items[0].data.arr->len:1;
-    size_t cols=(b.data.arr->len>0&&b.data.arr->items[0].state==XF_STATE_OK&&b.data.arr->items[0].type==XF_TYPE_ARR&&b.data.arr->items[0].data.arr)?b.data.arr->items[0].data.arr->len:1;
-    xf_arr_t *result=xf_arr_new();
-    for(size_t i=0;i<rows;i++){
-        xf_arr_t *row=xf_arr_new();
-        for(size_t j=0;j<cols;j++){
-            double sum=0;
-            for(size_t k=0;k<k_max;k++){
-                double aik=0,bkj=0;
-                xf_Value ar=a.data.arr->items[i];
-                if (ar.state == XF_STATE_OK && ar.type == XF_TYPE_ARR && ar.data.arr && k < ar.data.arr->len) {
-    xf_Value n = xf_coerce_num(ar.data.arr->items[k]);
-    if (n.state == XF_STATE_OK) aik = n.data.num;
-    xf_value_release(n);
-}
-                else if(ar.state==XF_STATE_OK&&ar.type==XF_TYPE_NUM&&k==0)aik=ar.data.num;
-                if(k<b.data.arr->len){xf_Value br=b.data.arr->items[k];
-if (br.state == XF_STATE_OK && br.type == XF_TYPE_ARR && br.data.arr && j < br.data.arr->len) {
-    xf_Value n = xf_coerce_num(br.data.arr->items[j]);
-    if (n.state == XF_STATE_OK) bkj = n.data.num;
-    xf_value_release(n);
-}
-                                        else if(br.state==XF_STATE_OK&&br.type==XF_TYPE_NUM&&j==0)bkj=br.data.num;}
-                sum+=aik*bkj;
-            }
-            xf_arr_push(row,xf_val_ok_num(sum));
-        }
-        xf_Value rv=xf_val_ok_arr(row);xf_arr_release(row);xf_arr_push(result,rv);
-    }
-    xf_Value r=xf_val_ok_arr(result);xf_arr_release(result);return r;
-}
-static xf_Value apply_assign_op(Interp *it,AssignOp op, xf_Value cur, xf_Value rhs, Loc loc) {
-
-switch (op) {
-    case ASSIGNOP_EQ:     return rhs;
-    case ASSIGNOP_ADD:    return apply_binary_op(it, BINOP_ADD,    cur, rhs, loc);
-    case ASSIGNOP_SUB:    return apply_binary_op(it, BINOP_SUB,    cur, rhs, loc);
-    case ASSIGNOP_MUL:    return apply_binary_op(it, BINOP_MUL,    cur, rhs, loc);
-    case ASSIGNOP_MADD:   return apply_binary_op(it, BINOP_MADD,   cur, rhs, loc);
-    case ASSIGNOP_MSUB:   return apply_binary_op(it, BINOP_MSUB,   cur, rhs, loc);
-    case ASSIGNOP_MMUL:   return apply_binary_op(it, BINOP_MMUL,   cur, rhs, loc);
-    case ASSIGNOP_MDIV:   return apply_binary_op(it, BINOP_MDIV,   cur, rhs, loc);
-    case ASSIGNOP_DIV:    return apply_binary_op(it, BINOP_DIV,    cur, rhs, loc);
-    case ASSIGNOP_MOD:    return apply_binary_op(it, BINOP_MOD,    cur, rhs, loc);
-    case ASSIGNOP_CONCAT: return apply_binary_op(it, BINOP_CONCAT, cur, rhs, loc);
-    default:              return rhs;
-}
-
-}
-static xf_Value lvalue_load(Interp *it, Expr *target);
-static bool lvalue_store(Interp *it, Expr *target, xf_Value val) {
-    if (!it || !target) return false;
-
-    if (target->kind == EXPR_IDENT) {
-        return sym_assign(it->syms, target->as.ident.name, val);
+        chunk_write(c, OP_PUSH_UNDEF, s->loc.line);
     }
 
-    if (target->kind == EXPR_IVAR) {
-        xf_Value sv = xf_coerce_str(val);
-        const char *s = (sv.state == XF_STATE_OK && sv.data.str)
-                      ? sv.data.str->data
-                      : "";
+    if (g_fn_ctx) {
+        int slot = fn_local_add(s->as.var_decl.name, s->as.var_decl.type);
+        if (slot < 0) return false;
 
-        bool matched = false;
-        switch (target->as.ivar.var) {
-            case TK_VAR_FS:
-                strncpy(IT_REC(it)->fs, s, sizeof(IT_REC(it)->fs) - 1);
-                IT_REC(it)->fs[sizeof(IT_REC(it)->fs) - 1] = '\0';
-                matched = true;
-                break;
-
-            case TK_VAR_RS:
-                strncpy(IT_REC(it)->rs, s, sizeof(IT_REC(it)->rs) - 1);
-                IT_REC(it)->rs[sizeof(IT_REC(it)->rs) - 1] = '\0';
-                matched = true;
-                break;
-
-            case TK_VAR_OFS:
-                strncpy(IT_REC(it)->ofs, s, sizeof(IT_REC(it)->ofs) - 1);
-                IT_REC(it)->ofs[sizeof(IT_REC(it)->ofs) - 1] = '\0';
-                matched = true;
-                break;
-
-            case TK_VAR_ORS:
-                strncpy(IT_REC(it)->ors, s, sizeof(IT_REC(it)->ors) - 1);
-                IT_REC(it)->ors[sizeof(IT_REC(it)->ors) - 1] = '\0';
-                matched = true;
-                break;
-
-            default:
-                break;
-        }
-
-        xf_value_release(sv);
-        return matched;
-    }
-
-    if (target->kind == EXPR_SUBSCRIPT) {
-        Expr *obj_expr = target->as.subscript.obj;
-        xf_Value key = interp_eval_expr(it, target->as.subscript.key);
-
-        if (key.state != XF_STATE_OK) {
-            interp_error(it, target->loc, "subscript key is not OK");
-            xf_value_release(key);
-            return false;
-        }
-
-        xf_Value container = lvalue_load(it, obj_expr);
-
-        if (container.state == XF_STATE_OK && container.type == XF_TYPE_TUPLE) {
-            interp_error(it, target->loc, "cannot assign to tuple element");
-            xf_value_release(key);
-            xf_value_release(container);
-            return false;
-        }
-
-        if (container.state != XF_STATE_OK ||
-            (container.type != XF_TYPE_ARR && container.type != XF_TYPE_MAP)) {
-
-            xf_Value num_key = xf_coerce_num(key);
-
-            if (num_key.state == XF_STATE_OK) {
-                xf_arr_t *a = xf_arr_new();
-                xf_value_release(container);
-
-                if (!a) {
-                    xf_value_release(num_key);
-                    xf_value_release(key);
-                    interp_error(it, target->loc, "out of memory creating array");
-                    return false;
-                }
-
-                container = xf_val_ok_arr(a);
-                xf_arr_release(a);
-            } else {
-                xf_map_t *m = xf_map_new();
-                xf_value_release(container);
-
-                if (!m) {
-                    xf_value_release(num_key);
-                    xf_value_release(key);
-                    interp_error(it, target->loc, "out of memory creating map");
-                    return false;
-                }
-
-                container = xf_val_ok_map(m);
-                xf_map_release(m);
-            }
-
-            xf_value_release(num_key);
-
-            if (!lvalue_store(it, obj_expr, container)) {
-                xf_value_release(key);
-                xf_value_release(container);
-                return false;
-            }
-        }
-
-        if (container.type == XF_TYPE_ARR && container.data.arr) {
-            xf_Value ni = xf_coerce_num(key);
-            if (ni.state != XF_STATE_OK) {
-                interp_error(it, target->loc, "array index must be numeric");
-                xf_value_release(ni);
-                xf_value_release(key);
-                xf_value_release(container);
-                return false;
-            }
-
-            xf_arr_set(container.data.arr, (size_t)ni.data.num, xf_value_retain(val));
-
-            xf_value_release(ni);
-            xf_value_release(key);
-            xf_value_release(container);
-            return true;
-        }
-
-        if (container.type == XF_TYPE_MAP && container.data.map) {
-            xf_Value sk = xf_coerce_str(key);
-            if (sk.state != XF_STATE_OK || !sk.data.str) {
-                interp_error(it, target->loc, "map key must be a string");
-                xf_value_release(sk);
-                xf_value_release(key);
-                xf_value_release(container);
-                return false;
-            }
-
-            xf_map_set(container.data.map, sk.data.str, val);
-
-            xf_value_release(sk);
-            xf_value_release(key);
-            xf_value_release(container);
-            return true;
-        }
-
-        interp_error(it, target->loc, "cannot index into type '%s'",
-                     XF_TYPE_NAMES[container.type]);
-        xf_value_release(key);
-        xf_value_release(container);
-        return false;
-    }
-
-    if (target->kind == EXPR_TUPLE_LIT) {
-        size_t n = target->as.tuple_lit.count;
-        bool is_tuple_rhs = (val.state == XF_STATE_OK &&
-                             val.type == XF_TYPE_TUPLE &&
-                             val.data.tuple != NULL);
-        size_t have = is_tuple_rhs ? xf_tuple_len(val.data.tuple) : 0;
-
-        for (size_t i = 0; i < n; i++) {
-            xf_Value elem;
-
-            if (is_tuple_rhs) {
-                elem = (i < have)
-                    ? xf_value_retain(xf_tuple_get(val.data.tuple, i))
-                    : xf_val_nav(XF_TYPE_VOID);
-            } else {
-                elem = xf_value_retain(val);
-            }
-
-            bool ok = lvalue_store(it, target->as.tuple_lit.items[i], elem);
-            xf_value_release(elem);
-
-            if (!ok) return false;
-        }
-
+        chunk_write(c, OP_STORE_LOCAL, s->loc.line);
+        chunk_write(c, (uint8_t)slot, s->loc.line);
         return true;
     }
 
-    interp_error(it, target->loc, "invalid assignment target");
-    return false;
-}
-static xf_Value lvalue_load(Interp *it, Expr *target) {
-    if (target->kind == EXPR_IDENT) {
-        Symbol *s = sym_lookup_str(it->syms, target->as.ident.name);
-        if (!s || !s->is_defined || s->state == XF_STATE_UNDEF || s->state == XF_STATE_UNDET) {
-            interp_error(it, target->loc, "undetermined variable '%s'",
-                         ((target->as.ident.name && target->as.ident.name->data) ? target->as.ident.name->data : "<null-ident>"));
-            return xf_val_nav(XF_TYPE_BOOL);
-        }
-        return xf_value_retain(s->value);
-    }
-    return interp_eval_expr(it, target);
-}
-static size_t xf_sprintf_impl(char *out, size_t cap,
-                               const char *fmt,
-                               xf_Value *args, size_t argc) {
-    size_t wi = 0;
-    size_t ai = 0;
-#define PUTC(c) do { if (wi < cap-1) out[wi++] = (c); } while(0)
-#define PUTS(s) do { const char *_s=(s); while(*_s && wi<cap-1) out[wi++]=*_s++; } while(0)
-    for (const char *p = fmt; *p; p++) {
-        if (*p != '%') { PUTC(*p); continue; }
-        p++;
-        if (!*p) break;
-        if (*p == '%') { PUTC('%'); continue; }
-        char flags[8] = {0}; int nf = 0;
-        while (*p == '-' || *p == '+' || *p == ' ' || *p == '0' || *p == '#')
-            flags[nf++] = *p++;
-        char wbuf[16] = {0}; int wn = 0;
-        while (isdigit((unsigned char)*p)) wbuf[wn++] = *p++;
-        char pbuf[16] = {0};
-        if (*p == '.') { p++; int pn=0; while(isdigit((unsigned char)*p)) pbuf[pn++]=*p++; }
-        char subfmt[64];
-        snprintf(subfmt, sizeof(subfmt), "%%%s%s%s%c",
-                 flags, wbuf, *pbuf ? "." : "", *p ? *p : 's');
-        if (*pbuf) snprintf(subfmt, sizeof(subfmt), "%%%s%s.%s%c",
-                             flags, wbuf, pbuf, *p ? *p : 's');
-        xf_Value av = (ai < argc) ? args[ai++] : xf_val_ok_num(0);
-        char tmp[512];
-        switch (*p) {
-            case 'd': case 'i': {
-                xf_Value n = xf_coerce_num(av);
-                snprintf(tmp, sizeof(tmp), subfmt, (long long)(n.state==XF_STATE_OK?n.data.num:0));
-                PUTS(tmp); break;
-            }
-            case 'u': {
-                xf_Value n = xf_coerce_num(av);
-                snprintf(tmp, sizeof(tmp), subfmt, (unsigned long long)(n.state==XF_STATE_OK?n.data.num:0));
-                PUTS(tmp); break;
-            }
-            case 'o': case 'x': case 'X': {
-                xf_Value n = xf_coerce_num(av);
-                snprintf(tmp, sizeof(tmp), subfmt, (unsigned long long)(n.state==XF_STATE_OK?n.data.num:0));
-                PUTS(tmp); break;
-            }
-            case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
-                xf_Value n = xf_coerce_num(av);
-                snprintf(tmp, sizeof(tmp), subfmt, n.state==XF_STATE_OK?n.data.num:0.0);
-                PUTS(tmp); break;
-            }
-            case 's': {
-                xf_Value s = xf_coerce_str(av);
-                snprintf(tmp, sizeof(tmp), subfmt,
-                         (s.state==XF_STATE_OK&&s.data.str) ? s.data.str->data : "");
-                xf_value_release(s);
-                PUTS(tmp); break;
-            }
-            case 'c': {
-                xf_Value n = xf_coerce_num(av);
-                char c = (n.state==XF_STATE_OK) ? (char)(int)n.data.num : '?';
-                PUTC(c); break;
-            }
-            default:
-                PUTC('%'); PUTC(*p); break;
-        }
-    }
-    out[wi] = '\0';
-    return wi;
-#undef PUTC
-#undef PUTS
-}
-static void csv_quote(FILE *f, const char *s) {
-    bool needs = (strchr(s, ',') || strchr(s, '"') || strchr(s, '\n'));
-    if (!needs) { fputs(s, f); return; }
-    fputc('"', f);
-    for (; *s; s++) { if (*s == '"') fputc('"', f); fputc(*s, f); }
-    fputc('"', f);
-}
-static void tsv_escape(FILE *f, const char *s) {
-    for (; *s; s++) {
-        if (*s == '\t') fputs("\\t", f);
-        else            fputc(*s, f);
-    }
-}
-static void json_str(FILE *f, const char *s) {
-    fputc('"', f);
-    for (; *s; s++) {
-        switch (*s) {
-            case '"':  fputs("\\\"", f); break;
-            case '\\': fputs("\\\\", f); break;
-            case '\n': fputs("\\n",  f); break;
-            case '\r': fputs("\\r",  f); break;
-            case '\t': fputs("\\t",  f); break;
-            default:   fputc(*s, f);     break;
-        }
-    }
-    fputc('"', f);
-}
-static void print_structured(Interp *it, xf_Value *vals, size_t count,
-                              uint8_t mode) {
-    RecordCtx *_rc = IT_REC(it);
-    switch (mode) {
-        case XF_OUTFMT_CSV:
-            for (size_t i = 0; i < count; i++) {
-                if (i > 0) fputc(',', stdout);
-                xf_Value sv = xf_coerce_str(vals[i]);
-                csv_quote(stdout, (sv.state==XF_STATE_OK&&sv.data.str)
-                                  ? sv.data.str->data : "");
-                xf_value_release(sv);
-            }
-            fputs(_rc->ors, stdout);
-            break;
-        case XF_OUTFMT_TSV:
-            for (size_t i = 0; i < count; i++) {
-                if (i > 0) fputc('\t', stdout);
-                xf_Value sv = xf_coerce_str(vals[i]);
-                tsv_escape(stdout, (sv.state==XF_STATE_OK&&sv.data.str)
-                                   ? sv.data.str->data : "");
-                xf_value_release(sv);
-            }
-            fputs(_rc->ors, stdout);
-            break;
-        case XF_OUTFMT_JSON: {
-            fputc('{', stdout);
-            for (size_t i = 0; i < count; i++) {
-                if (i > 0) fputc(',', stdout);
-                if (i < _rc->header_count)
-                    json_str(stdout, _rc->headers[i]);
-                else {
-                    char key[32]; snprintf(key, sizeof(key), "f%zu", i+1);
-                    json_str(stdout, key);
-                }
-                fputc(':', stdout);
-                xf_Value sv = xf_coerce_str(vals[i]);
-                json_str(stdout, (sv.state==XF_STATE_OK&&sv.data.str)
-                                 ? sv.data.str->data : "");
-                xf_value_release(sv);
-            }
-            fputs("}", stdout);
-            fputs(_rc->ors, stdout);
-            break;
-        }
-        default:
-            for (size_t i = 0; i < count; i++) {
-                if (i > 0) fputs(_rc->ofs, stdout);
-                xf_Value sv = xf_coerce_str(vals[i]);
-                if (sv.state==XF_STATE_OK && sv.data.str)
-                    fputs(sv.data.str->data, stdout);
-                else
-                    fputs(XF_STATE_NAMES[vals[i].state], stdout);
-                xf_value_release(sv);
-            }
-            fputs(_rc->ors, stdout);
-            break;
-    }
-}
-/* ── builtin dispatch table ──────────────────────────────────────────
- * Maps bare function name → (module, fn_name) for core delegation.
- * Sorted by name so future binary search is possible; currently hashed
- * via FNV-1a for O(1) average dispatch without a giant strcmp chain.
- * ─────────────────────────────────────────────────────────────────── */
-typedef struct { const char *name; const char *mod; const char *fn; } CoreRoute;
+    uint32_t slot = compile_global_name(it, s->as.var_decl.name);
+    if (slot == UINT32_MAX) return false;
 
-static const CoreRoute k_core_routes[] = {
-    { "abs",     "math", "abs"         },
-    { "column",  "str",  "column"      },
-    { "cos",     "math", "cos"         },
-    { "gsub",    "str",  "replace_all" },
-    { "index",   "str",  "index"       },
-    { "int",     "math", "int"         },
-    { "len",     "str",  "len"         },
-    { "lower",   "str",  "lower"       },
-    { "match",   "regex",    "match"  },
-    { "rand",    "math", "rand"        },
-    { "sin",     "math", "sin"         },
-    { "split",   "generics", "split"  },
-    { "sprintf", "str",  "sprintf"     },
-    { "sqrt",    "math", "sqrt"        },
-    { "srand",   "math", "srand"       },
-    { "sub",     "str",  "replace"     },
-    { "substr",  "str",  "substr"      },
-    { "time",    "os",       "time"   },
-    { "tolower", "str",  "lower"       },
-    { "toupper", "str",  "upper"       },
-    { "trim",    "str",  "trim"        },
-    { "upper",   "str",  "upper"       },
-};
-#define CORE_ROUTE_COUNT (sizeof(k_core_routes)/sizeof(k_core_routes[0]))
-
-static int core_route_cmp(const void *key, const void *elem) {
-    return strcmp((const char *)key, ((const CoreRoute *)elem)->name);
+    chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+    chunk_write_u32(c, slot, s->loc.line);
+    return true;
 }
+        case STMT_DELETE: {
+            Expr *target = s->as.delete_stmt.target;
+            if (!target || target->kind != EXPR_SUBSCRIPT) {
+                fprintf(stderr, "compile_stmt: delete expects subscript target at %u:%u\n",
+                        s->loc.line, s->loc.col);
+                return false;
+            }
 
-/* Lookup name in the sorted route table; returns NULL if not found. */
-static const CoreRoute *find_core_route(const char *name) {
-    return (const CoreRoute *)bsearch(name, k_core_routes, CORE_ROUTE_COUNT,
-                                      sizeof(CoreRoute), core_route_cmp);
-}
-xf_Value interp_call_builtin(Interp *it, const char *name, xf_Value *args, size_t argc) {
-    (void)it;
+            if (!compile_expr(it, c, target->as.subscript.obj)) return false;
+            if (!compile_expr(it, c, target->as.subscript.key)) return false;
 
-    if (strcmp(name, "print") == 0) {
-        for (size_t i = 0; i < argc; i++) {
-            xf_Value sv = xf_coerce_str(args[i]);
-            if (sv.state == XF_STATE_OK && sv.data.str) {
-                fputs(sv.data.str->data, stdout);
+            chunk_write(c, OP_DELETE_IDX, s->loc.line);
+            return true;
+        }
+        case STMT_IF:
+            return compile_if_stmt(it, c, s);
+
+        case STMT_WHILE:
+        case STMT_WHILE_SHORT: {
+            Stmt temp = *s;
+            if (s->kind == STMT_WHILE_SHORT) {
+                temp.kind = STMT_WHILE;
+                temp.as.while_stmt.cond = s->as.while_short.cond;
+                temp.as.while_stmt.body = s->as.while_short.body;
+            }
+            return compile_while_stmt(it, c, &temp);
+        }
+
+        case STMT_FOR:
+            return compile_for_stmt(it, c, s);
+
+        case STMT_FOR_SHORT:
+            return compile_for_short_stmt(it, c, s);
+
+        case STMT_RETURN:
+            if (s->as.ret.value) {
+                if (!compile_expr(it, c, s->as.ret.value)) return false;
+                chunk_write(c, OP_RETURN, s->loc.line);
             } else {
-                fputs(XF_STATE_NAMES[args[i].state], stdout);
+                chunk_write(c, OP_RETURN_NULL, s->loc.line);
             }
-            xf_value_release(sv);
-            if (i + 1 < argc) fputc(' ', stdout);
-        }
-        fputc('\n', stdout);
-        return xf_val_null();
+            return true;
+        case STMT_FN_DECL: {
+    xf_fn_t *fn = compile_named_function(it,
+                                         s->as.fn_decl.name,
+                                         s->as.fn_decl.return_type,
+                                         s->as.fn_decl.params,
+                                         s->as.fn_decl.param_count,
+                                         s->as.fn_decl.body,
+                                         s->loc);
+    if (!fn) return false;
+
+    xf_Value fv = xf_val_ok_fn(fn);
+    xf_fn_release(fn);
+
+    uint32_t slot = compile_global_name(it, s->as.fn_decl.name);
+    if (slot == UINT32_MAX) {
+        xf_value_release(fv);
+        return false;
     }
 
-    if (strcmp(name, "len") == 0 && argc == 1) {
-        xf_Value v = args[0];
-        if (v.state != XF_STATE_OK) return xf_value_retain(v);
-
-        switch (v.type) {
-            case XF_TYPE_STR:
-                return xf_val_ok_num(v.data.str ? (double)v.data.str->len : 0.0);
-            case XF_TYPE_ARR:
-                return xf_val_ok_num(v.data.arr ? (double)v.data.arr->len : 0.0);
-            case XF_TYPE_TUPLE:
-                return xf_val_ok_num(v.data.tuple ? (double)xf_tuple_len(v.data.tuple) : 0.0);
-            case XF_TYPE_MAP:
-            case XF_TYPE_SET:
-                return xf_val_ok_num(v.data.map ? (double)v.data.map->order_len : 0.0);
-            default:
-                return xf_val_nav(XF_TYPE_NUM);
-        }
-    }
-
-    if (strcmp(name, "push") == 0 && argc == 2) {
-    if (args[0].state == XF_STATE_OK &&
-        args[0].type  == XF_TYPE_ARR &&
-        args[0].data.arr) {
-        xf_arr_push(args[0].data.arr, xf_value_retain(args[1]));
-    } else if (args[0].state == XF_STATE_OK &&
-               args[0].type  == XF_TYPE_SET &&
-               args[0].data.map) {
-        xf_Value ks = xf_coerce_str(args[1]);
-        if (ks.state == XF_STATE_OK && ks.data.str) {
-            xf_map_set(args[0].data.map, ks.data.str, xf_val_ok_num(1.0));
-        }
-        xf_value_release(ks);
-    }
-    return xf_value_retain(args[0]);
+    vm_set_global(it->vm, slot, fv);
+    xf_value_release(fv);
+    return true;
 }
-    if (strcmp(name, "pop") == 0 && argc == 1) {
-        if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_ARR && args[0].data.arr) {
-            return xf_arr_pop(args[0].data.arr);
-        }
-        return xf_val_nav(XF_TYPE_VOID);
-    }
+        case STMT_EXIT:
+            chunk_write(c, OP_EXIT, s->loc.line);
+            return true;
+                    case STMT_IMPORT: {
+            xf_Str *path_str = s->as.import_stmt.path;
+            if (!path_str || !path_str->data) {
+                fprintf(stderr, "import expects string path at %u:%u\n",
+                        s->loc.line, s->loc.col);
+                return false;
+            }
 
-    if (strcmp(name, "unshift") == 0 && argc == 2) {
-    if (args[0].state == XF_STATE_OK &&
-        args[0].type  == XF_TYPE_ARR &&
-        args[0].data.arr) {
-        xf_arr_unshift(args[0].data.arr, xf_value_retain(args[1]));
+            const char *path = path_str->data;
+
+            FILE *f = fopen(path, "rb");
+            if (!f) {
+                fprintf(stderr, "import: failed to open '%s'\n", path);
+                return false;
+            }
+
+            if (fseek(f, 0, SEEK_END) != 0) {
+                fclose(f);
+                fprintf(stderr, "import: failed to seek '%s'\n", path);
+                return false;
+            }
+
+            long flen = ftell(f);
+            if (flen < 0) {
+                fclose(f);
+                fprintf(stderr, "import: failed to measure '%s'\n", path);
+                return false;
+            }
+            rewind(f);
+
+            char *src = malloc((size_t)flen + 1);
+            if (!src) {
+                fclose(f);
+                return false;
+            }
+
+            size_t nread = fread(src, 1, (size_t)flen, f);
+            fclose(f);
+            src[nread] = '\0';
+
+            Lexer lx;
+            xf_lex_init_cstr(&lx, src, XF_SRC_FILE, path);
+            xf_tokenize(&lx);
+
+            Program *prog = xf_parse_program(&lx, it->syms);
+            if (!prog) {
+                fprintf(stderr, "import: parse failed for '%s'\n", path);
+                xf_lex_free(&lx);
+                free(src);
+                return false;
+            }
+
+            bool ok = interp_compile_program(it, prog);
+
+            ast_program_free(prog);
+            xf_lex_free(&lx);
+            free(src);
+
+            if (!ok) {
+                fprintf(stderr, "import: compile failed for '%s'\n", path);
+                return false;
+            }
+
+            return true;
+        }
+        case STMT_BREAK:
+        case STMT_JOIN:
+        case STMT_SPAWN:
+        case STMT_SUBST:
+        case STMT_TRANS:
+        default:
+        fprintf(stderr, "compile_stmt: unimplemented %s at %u:%u\n",
+                    stmt_kind_name(s->kind), s->loc.line, s->loc.col);
     }
-    return xf_value_retain(args[0]);
 }
-    if (strcmp(name, "shift") == 0 && argc == 1) {
-        if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_ARR && args[0].data.arr) {
-            return xf_arr_shift(args[0].data.arr);
-        }
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-
-    if (strcmp(name, "remove") == 0 && argc == 2) {
-        xf_Value coll = args[0];
-        if (coll.state != XF_STATE_OK) return xf_value_retain(coll);
-
-        if (coll.type == XF_TYPE_ARR && coll.data.arr) {
-            xf_Value ni = xf_coerce_num(args[1]);
-            if (ni.state == XF_STATE_OK) {
-                xf_arr_delete(coll.data.arr, (size_t)ni.data.num);
-            }
-            xf_value_release(ni);
-            return xf_value_retain(coll);
-        }
-
-        if ((coll.type == XF_TYPE_MAP || coll.type == XF_TYPE_SET) && coll.data.map) {
-            xf_Value ks = xf_coerce_str(args[1]);
-            if (ks.state == XF_STATE_OK && ks.data.str) {
-                xf_map_delete(coll.data.map, ks.data.str);
-            }
-            xf_value_release(ks);
-            return xf_value_retain(coll);
-        }
-
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-
-    if (strcmp(name, "keys") == 0 && argc == 1) {
-        if (args[0].state == XF_STATE_OK &&
-            (args[0].type == XF_TYPE_MAP || args[0].type == XF_TYPE_SET) &&
-            args[0].data.map) {
-            xf_arr_t *out = xf_arr_new();
-            if (!out) return xf_val_nav(XF_TYPE_ARR);
-
-            xf_map_t *m = args[0].data.map;
-            for (size_t i = 0; i < m->order_len; i++) {
-                xf_arr_push(out, xf_val_ok_str(m->order[i]));
-            }
-
-            xf_Value v = xf_val_ok_arr(out);
-            xf_arr_release(out);
-            return v;
-        }
-        return xf_val_nav(XF_TYPE_ARR);
-    }
-
-    if (strcmp(name, "values") == 0 && argc == 1) {
-        if (args[0].state == XF_STATE_OK && args[0].type == XF_TYPE_MAP && args[0].data.map) {
-            xf_arr_t *out = xf_arr_new();
-            if (!out) return xf_val_nav(XF_TYPE_ARR);
-
-            xf_map_t *m = args[0].data.map;
-            for (size_t i = 0; i < m->order_len; i++) {
-                xf_Value v = xf_map_get(m, m->order[i]);
-                xf_arr_push(out, v);
-            }
-
-            xf_Value rv = xf_val_ok_arr(out);
-            xf_arr_release(out);
-            return rv;
-        }
-        return xf_val_nav(XF_TYPE_ARR);
-    }
-
-    if (strcmp(name, "has") == 0 && argc == 2) {
-        xf_Value coll = args[0], needle = args[1];
-        if (coll.state != XF_STATE_OK) return xf_value_retain(coll);
-        if (needle.state != XF_STATE_OK) return xf_value_retain(needle);
-
-        if (coll.type == XF_TYPE_STR && coll.data.str) {
-            xf_Value ns = xf_coerce_str(needle);
-            if (ns.state != XF_STATE_OK || !ns.data.str) {
-                if (ns.state == XF_STATE_OK) xf_value_release(ns);
-                return xf_val_false();
-            }
-
-            bool found = strstr(coll.data.str->data, ns.data.str->data) != NULL;
-            xf_value_release(ns);
-            return found ? xf_val_true() : xf_val_false();
-        }
-
-        if (coll.type == XF_TYPE_ARR && coll.data.arr) {
-            xf_Value ns = xf_coerce_str(needle);
-            if (ns.state != XF_STATE_OK || !ns.data.str) {
-                if (ns.state == XF_STATE_OK) xf_value_release(ns);
-                return xf_val_false();
-            }
-
-            xf_arr_t *a = coll.data.arr;
-            for (size_t i = 0; i < a->len; i++) {
-                xf_Value es = xf_coerce_str(a->items[i]);
-                bool match = (es.state == XF_STATE_OK &&
-                              es.data.str &&
-                              strcmp(es.data.str->data, ns.data.str->data) == 0);
-                xf_value_release(es);
-                if (match) {
-                    xf_value_release(ns);
-                    return xf_val_true();
-                }
-            }
-
-            xf_value_release(ns);
-            return xf_val_false();
-        }
-
-        if ((coll.type == XF_TYPE_MAP || coll.type == XF_TYPE_SET) && coll.data.map) {
-            xf_Value ks = xf_coerce_str(needle);
-            if (ks.state != XF_STATE_OK || !ks.data.str) {
-                if (ks.state == XF_STATE_OK) xf_value_release(ks);
-                return xf_val_false();
-            }
-xf_Value got = xf_map_get(coll.data.map, ks.data.str);
-bool found = (got.state == XF_STATE_OK);
-xf_value_release(got);
-xf_value_release(ks);
-return found ? xf_val_true() : xf_val_false();
-        }
-
-        return xf_val_false();
-    }
-
-    if (strcmp(name, "type") == 0 && argc == 1) {
-        xf_Value v = args[0];
-        uint8_t t = XF_STATE_IS_BOOL(v.state) ? XF_TYPE_BOOL : v.type;
-        if (t >= XF_TYPE_COUNT) t = XF_TYPE_VOID;
-
-        xf_Str *s = xf_str_from_cstr(XF_TYPE_NAMES[t]);
-        if (!s) return xf_val_nav(XF_TYPE_STR);
-
-        xf_Value out = xf_val_ok_str(s);
-        xf_str_release(s);
-        return out;
-    }
-
-    if (strcmp(name, "state") == 0 && argc == 1) {
-        xf_Value v = args[0];
-        uint8_t st = (v.state < XF_STATE_COUNT) ? v.state : XF_STATE_OK;
-
-        xf_Str *s = xf_str_from_cstr(XF_STATE_NAMES[st]);
-        if (!s) return xf_val_nav(XF_TYPE_STR);
-
-        xf_Value out = xf_val_ok_str(s);
-        xf_str_release(s);
-        return out;
-    }
-
-    return xf_val_nav(XF_TYPE_VOID);
-}
-static xf_Value eval_rip_call(Interp *it, Expr *arg, Loc loc) {
-    if (!arg || arg->kind != EXPR_IDENT) {
-        interp_error(it, loc, "rip() requires an identifier");
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-
-    Symbol *sym = sym_lookup_str(it->syms, arg->as.ident.name);
-    if (!sym) {
-        interp_error(it, loc, "cannot rip undefined variable '%s'",
-                     arg->as.ident.name ? arg->as.ident.name->data : "<null>");
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-
-    xf_Value old = sym->value;
-
-    sym->value = xf_val_undet(XF_TYPE_BOOL);
-    sym->state = XF_STATE_UNDET;
-    sym->is_defined = false;
-
-    xf_value_release(old);
-    maybe_auto_gc(it);
-
-    return xf_val_null();
-}
-
-xf_Value interp_eval_expr(Interp *it, Expr *e) {
-    if (!e) return xf_val_null();
-    if (it->had_error || it->returning || it->exiting || it->nexting)
-        return xf_val_null();
+static bool compile_expr(Interp *it, Chunk *c, Expr *e) {
+    if (!e) return false;
 
     switch (e->kind) {
-    case EXPR_NUM:
-        return xf_val_ok_num(e->as.num);
+        case EXPR_NUM:
+            chunk_write(c, OP_PUSH_NUM, e->loc.line);
+            chunk_write_f64(c, e->as.num, e->loc.line);
+            return true;
 
-    case EXPR_STR: {
-        xf_Value v = xf_val_ok_str(e->as.str.value);
-        return v;
-    }
-
-    case EXPR_REGEX: {
-        xf_Regex *re = calloc(1, sizeof(xf_Regex));
-        if (!re) return xf_val_nav(XF_TYPE_REGEX);
-        atomic_init(&re->refcount, 1);
-        re->pattern  = xf_str_retain(e->as.regex.pattern);
-        re->flags    = e->as.regex.flags;
-        re->compiled = NULL;
-        return xf_val_ok_re(re);
-    }
-
-    case EXPR_TUPLE_LIT: {
-        size_t n = e->as.tuple_lit.count;
-        xf_Value *items = n ? malloc(sizeof(xf_Value) * n) : NULL;
-
-        for (size_t i = 0; i < n; i++) {
-        xf_Value v = interp_eval_expr(it, e->as.tuple_lit.items[i]);
-bool is_valid = (v.state == XF_STATE_OK   ||
-                 v.state == XF_STATE_TRUE  ||
-                 v.state == XF_STATE_FALSE ||
-                 v.state == XF_STATE_UNDET ||
-                 v.state == XF_STATE_NULL);
-if (!is_valid) {
-    for (size_t j = 0; j < i; j++) xf_value_release(items[j]);
-    free(items);
-    return v;
-}
-items[i] = v;
+        case EXPR_STR: {
+            uint32_t idx = chunk_add_const(c, xf_val_ok_str(e->as.str.value));
+            chunk_write(c, OP_PUSH_STR, e->loc.line);
+            chunk_write_u32(c, idx, e->loc.line);
+            return true;
         }
-
-        xf_tuple_t *t = xf_tuple_new(items, n);
-        free(items);
-
-        xf_Value out = xf_val_ok_tuple(t);
-        xf_tuple_release(t);
-        return out;
-    }
-
-    case EXPR_ARR_LIT: {
-        xf_arr_t *a = xf_arr_new();
-        for (size_t i = 0; i < e->as.arr_lit.count; i++) {
-            Expr *item = e->as.arr_lit.items[i];
-            if (item->kind == EXPR_SPREAD) {
-                /* ..arr — expand each element into this array */
-                xf_Value sv = interp_eval_expr(it, item->as.spread.operand);
-                if (sv.state == XF_STATE_OK && sv.type == XF_TYPE_ARR && sv.data.arr) {
-                    xf_arr_t *src = sv.data.arr;
-                    for (size_t j = 0; j < src->len; j++)
-                        xf_arr_push(a, xf_value_retain(src->items[j]));
-                }
-                xf_value_release(sv);
-            } else {
-                /* Include all values (OK, NAV, NULL, etc.) — don't propagate errors */
-                xf_arr_push(a, interp_eval_expr(it, item));
-            }
-        }
-        xf_Value out = xf_val_ok_arr(a);
-        xf_arr_release(a);
-        return out;
-    }
-
-    case EXPR_SPREAD: {
-        /* spread outside array literal — evaluate the operand directly */
-        return interp_eval_expr(it, e->as.spread.operand);
-    }
-
-
-case EXPR_MAP_LIT: {
-    xf_map_t *m = xf_map_new();
-
-    for (size_t i = 0; i < e->as.map_lit.count; i++) {
-        xf_Value kv = interp_eval_expr(it, e->as.map_lit.keys[i]);
-        if (kv.state != XF_STATE_OK) {
-            xf_map_release(m);
-            return kv;
-        }
-
-        xf_Value vv = interp_eval_expr(it, e->as.map_lit.vals[i]);
-
-        xf_Value ks = xf_coerce_str(kv);
-        if (ks.state != XF_STATE_OK) {
-            xf_value_release(kv);
-            xf_value_release(vv);
-            xf_map_release(m);
-            return ks;
-        }
-
-        xf_map_set(m, ks.data.str, vv);
-
-        xf_value_release(kv);
-        xf_value_release(ks);
-        xf_value_release(vv);
-        /* do NOT release vv here */
-    }
-
-    xf_Value out = xf_val_ok_map(m);
-    xf_map_release(m);
-    return out;
-}
-case EXPR_SET_LIT: {
-    xf_map_t *m = xf_map_new();
-
-    for (size_t i = 0; i < e->as.set_lit.count; i++) {
-        xf_Value v = interp_eval_expr(it, e->as.set_lit.items[i]);
-        if (v.state != XF_STATE_OK) {
-            xf_map_release(m);
-            return v;
-        }
-
-        if (v.type == XF_TYPE_SET || v.type == XF_TYPE_MAP || v.type == XF_TYPE_ARR) {
-            char kb[32];
-            snprintf(kb, sizeof(kb), "#%zu", i);
-            xf_Str *ks = xf_str_from_cstr(kb);
-
-            xf_map_set(m, ks, v);   /* map owns v now */
-            xf_str_release(ks);
-        } else {
-            xf_Value ks = xf_coerce_str(v);
-            if (ks.state != XF_STATE_OK) {
-                xf_value_release(v);
-                xf_map_release(m);
-                return ks;
-            }
-
-            xf_map_set(m, ks.data.str, xf_val_ok_num(1.0));
-            xf_value_release(ks);
-            xf_value_release(v);
-        }
-    }
-
-    xf_Value out = xf_val_ok_map(m);
-    xf_map_release(m);
-    out.type = XF_TYPE_SET;
-    return out;
-}
-    case EXPR_IDENT: {
-        Symbol *s = sym_lookup_str(it->syms, e->as.ident.name);
-        if (!s) {
-            interp_error(it, e->loc, "undetermined variable '%s'",
-                         ((e->as.ident.name && e->as.ident.name->data) ? e->as.ident.name->data : "<null-ident>"));
-            return xf_val_undet(XF_TYPE_BOOL);
-        }
-        return xf_value_retain(s->value);
-    }
-
-    case EXPR_FIELD: {
-        int n = e->as.field.index;
-        RecordCtx *_rc = IT_REC(it);
-
-        if (n == 0) {
-            if (!_rc->buf) return xf_val_ok_str(xf_str_from_cstr(""));
-            xf_Str *s = xf_str_new(_rc->buf, _rc->buf_len);
-            xf_Value v = xf_val_ok_str(s);
-            xf_str_release(s);
-            return v;
-        }
-
-        if (n > 0 && (size_t)n <= _rc->field_count) {
-            xf_Str *s = xf_str_from_cstr(_rc->fields[n - 1]);
-            xf_Value v = xf_val_ok_str(s);
-            xf_str_release(s);
-            return v;
-        }
-
-        return xf_val_ok_str(xf_str_from_cstr(""));
-    }
-
-    case EXPR_IVAR: {
-        RecordCtx *_rc = IT_REC(it);
-        switch (e->as.ivar.var) {
-            case TK_VAR_NR:  return xf_val_ok_num((double)_rc->nr);
-            case TK_VAR_NF:  return xf_val_ok_num((double)_rc->field_count);
-            case TK_VAR_FNR: return xf_val_ok_num((double)_rc->fnr);
-            case TK_VAR_FS:  { xf_Str *s = xf_str_from_cstr(_rc->fs);  xf_Value v = xf_val_ok_str(s); xf_str_release(s); return v; }
-            case TK_VAR_RS:  { xf_Str *s = xf_str_from_cstr(_rc->rs);  xf_Value v = xf_val_ok_str(s); xf_str_release(s); return v; }
-            case TK_VAR_OFS: { xf_Str *s = xf_str_from_cstr(_rc->ofs); xf_Value v = xf_val_ok_str(s); xf_str_release(s); return v; }
-            case TK_VAR_ORS: { xf_Str *s = xf_str_from_cstr(_rc->ors); xf_Value v = xf_val_ok_str(s); xf_str_release(s); return v; }
-            default: return xf_val_nav(XF_TYPE_VOID);
-        }
-    }
-
-    case EXPR_SUBSCRIPT: {
-        xf_Value obj = interp_eval_expr(it, e->as.subscript.obj);
-        xf_Value key = interp_eval_expr(it, e->as.subscript.key);
-
-        if (obj.state != XF_STATE_OK) {
-            xf_value_release(key);
-            return obj;
-        }
-        if (key.state != XF_STATE_OK) {
-            xf_value_release(obj);
-            return key;
-        }
-
-        xf_Value _sub_result = xf_val_nav(XF_TYPE_VOID);
-
-        if (obj.type == XF_TYPE_ARR) {
-            xf_Value ni = xf_coerce_num(key);
-            if (ni.state == XF_STATE_OK && obj.data.arr) {
-                if (ni.data.num < 0) {
-                    interp_error(it, e->loc, "negative index");
-                    _sub_result = xf_val_nav(XF_TYPE_VOID);
-                } else {
-                    size_t idx = (size_t)ni.data.num;
-                    if (idx >= obj.data.arr->len) {
-                        interp_error(it, e->loc, "array index out of range");
-                        _sub_result = xf_val_nav(XF_TYPE_VOID);
-                    } else {
-                        _sub_result = xf_value_retain(xf_arr_get(obj.data.arr, idx));
-                    }
-                }
-            }
-
-        } else if (obj.type == XF_TYPE_TUPLE) {
-            xf_Value ni = xf_coerce_num(key);
-            if (ni.state == XF_STATE_OK) {
-                if (ni.data.num < 0) {
-                    interp_error(it, e->loc, "negative index");
-                    _sub_result = xf_val_nav(XF_TYPE_VOID);
-                } else {
-                    size_t idx = (size_t)ni.data.num;
-                    if (!obj.data.tuple || idx >= xf_tuple_len(obj.data.tuple)) {
-                        interp_error(it, e->loc, "tuple index out of range");
-                        _sub_result = xf_val_nav(XF_TYPE_VOID);
-                    } else {
-                        _sub_result = xf_value_retain(xf_tuple_get(obj.data.tuple, idx));
-                    }
-                }
-            }
-
-        } else if (obj.type == XF_TYPE_MAP) {
-            xf_Value sk = xf_coerce_str(key);
-            if (sk.state == XF_STATE_OK && sk.data.str && obj.data.map) {
-                _sub_result = xf_value_retain(xf_map_get(obj.data.map, sk.data.str));
-            }
-            xf_value_release(sk);
-
-        } else if (obj.type == XF_TYPE_STR && obj.data.str) {
-            xf_Value ni = xf_coerce_num(key);
-            if (ni.state == XF_STATE_OK) {
-                if (ni.data.num < 0) {
-                    interp_error(it, e->loc, "negative index");
-                    _sub_result = xf_val_nav(XF_TYPE_STR);
-                } else {
-                    size_t idx = (size_t)ni.data.num;
-                    if (idx < obj.data.str->len) {
-                        char ch[2] = { obj.data.str->data[idx], '\0' };
-                        xf_Str *cs = xf_str_new(ch, 1);
-                        _sub_result = xf_val_ok_str(cs);
-                        xf_str_release(cs);
-                    } else {
-                        _sub_result = xf_val_nav(XF_TYPE_STR);
-                    }
-                }
-            } else {
-                _sub_result = xf_val_nav(XF_TYPE_STR);
-            }
-
-        } else {
-            interp_error(it, e->loc, "subscript on non-indexable type '%s'",
-                         XF_TYPE_NAMES[obj.type]);
-        }
-
-        xf_value_release(obj);
-        xf_value_release(key);
-        return _sub_result;
-    }
-
-    case EXPR_SVAR: {
-        RecordCtx *_rc = IT_REC(it);
-        switch (e->as.svar.var) {
-            case TK_VAR_FILE: {
-                xf_Str *s = xf_str_from_cstr(_rc->current_file);
-                xf_Value v = xf_val_ok_str(s);
-                xf_str_release(s);
-                return v;
-            }
-            case TK_VAR_MATCH:
-                return xf_value_retain(_rc->last_match);
-            case TK_VAR_CAPS:
-                return xf_value_retain(_rc->last_captures);
-            case TK_VAR_ERR:
-                return xf_value_retain(it->last_err);
-            default: {
-                xf_Str *s = xf_str_from_cstr("");
-                xf_Value v = xf_val_ok_str(s);
-                xf_str_release(s);
-                return v;
-            }
-        }
-    }
-
-    case EXPR_UNARY: {
-        switch (e->as.unary.op) {
-            case UNOP_NEG: {
-                xf_Value v = xf_coerce_num(interp_eval_expr(it, e->as.unary.operand));
-                if (v.state != XF_STATE_OK) return v;
-                return xf_val_ok_num(-v.data.num);
-            }
-
-            case UNOP_NOT:
-                return make_bool(!is_truthy(interp_eval_expr(it, e->as.unary.operand)));
-
-            case UNOP_PRE_INC: {
-                xf_Value v = xf_coerce_num(lvalue_load(it, e->as.unary.operand));
-                if (v.state != XF_STATE_OK) return v;
-                xf_Value nv = xf_val_ok_num(v.data.num + 1);
-                lvalue_store(it, e->as.unary.operand, nv);
-                return nv;
-            }
-
-            case UNOP_PRE_DEC: {
-                xf_Value v = xf_coerce_num(lvalue_load(it, e->as.unary.operand));
-                if (v.state != XF_STATE_OK) return v;
-                xf_Value nv = xf_val_ok_num(v.data.num - 1);
-                lvalue_store(it, e->as.unary.operand, nv);
-                return nv;
-            }
-
-            case UNOP_POST_INC: {
-                xf_Value old = xf_coerce_num(lvalue_load(it, e->as.unary.operand));
-                if (old.state == XF_STATE_OK)
-                    lvalue_store(it, e->as.unary.operand, xf_val_ok_num(old.data.num + 1));
-                return old;
-            }
-
-            case UNOP_POST_DEC: {
-                xf_Value old = xf_coerce_num(lvalue_load(it, e->as.unary.operand));
-                if (old.state == XF_STATE_OK)
-                    lvalue_store(it, e->as.unary.operand, xf_val_ok_num(old.data.num - 1));
-                return old;
-            }
-
-            default:
-                return xf_val_nav(XF_TYPE_VOID);
-        }
-    }
-
-    case EXPR_BINARY: {
-    if (e->as.binary.op == BINOP_AND) {
-        xf_Value a = interp_eval_expr(it, e->as.binary.left);
-        bool ta = is_truthy(a);
-        xf_value_release(a);
-        if (!ta) return make_bool(false);
-
-        xf_Value b = interp_eval_expr(it, e->as.binary.right);
-        bool tb = is_truthy(b);
-        xf_value_release(b);
-        return make_bool(tb);
-    }
-
-    if (e->as.binary.op == BINOP_OR) {
-        xf_Value a = interp_eval_expr(it, e->as.binary.left);
-        bool ta = is_truthy(a);
-        xf_value_release(a);
-        if (ta) return make_bool(true);
-
-        xf_Value b = interp_eval_expr(it, e->as.binary.right);
-        bool tb = is_truthy(b);
-        xf_value_release(b);
-        return make_bool(tb);
-    }
-
-    xf_Value a = interp_eval_expr(it, e->as.binary.left);
-    xf_Value b = interp_eval_expr(it, e->as.binary.right);
-
-    switch (e->as.binary.op) {
-        case BINOP_ADD:
-        case BINOP_SUB:
-        case BINOP_MUL:
-        case BINOP_DIV:
-        case BINOP_MOD:
-        case BINOP_CONCAT:
-        case BINOP_MADD:
-        case BINOP_MSUB:
-        case BINOP_MMUL:
-        case BINOP_MDIV: {
-            xf_Value ret = apply_binary_op(it,e->as.binary.op, a, b, e->loc);
-            xf_value_release(a);
-            xf_value_release(b);
-            return ret;
-        }
-
-        case BINOP_POW: {
-            if ((a.state == XF_STATE_OK && a.type == XF_TYPE_ARR) ||
-                (b.state == XF_STATE_OK && b.type == XF_TYPE_ARR)) {
-                xf_Value ret = arr_broadcast(a, b, 5);
-                xf_value_release(a);
-                xf_value_release(b);
-                return ret;
-            }
-
-            xf_Value na = xf_coerce_num(a);
-            xf_Value nb = xf_coerce_num(b);
-            xf_value_release(a);
-            xf_value_release(b);
-
-            if (na.state != XF_STATE_OK) return na;
-            if (nb.state != XF_STATE_OK) {
-                xf_value_release(na);
-                return nb;
-            }
-
-            xf_Value ret = xf_val_ok_num(pow(na.data.num, nb.data.num));
-            xf_value_release(na);
-            xf_value_release(nb);
-            return ret;
-        }
-
-        case BINOP_PIPE_CMD: {
-            xf_Value cmd = xf_coerce_str(b);
-            xf_value_release(b);
-            if (cmd.state != XF_STATE_OK || !cmd.data.str) {
-                xf_value_release(cmd);
-                xf_value_release(a);
-                return xf_val_nav(XF_TYPE_STR);
-            }
-
-            xf_Value sv = xf_coerce_str(a);
-            xf_value_release(a);
-            if (sv.state != XF_STATE_OK || !sv.data.str) {
-                xf_value_release(cmd);
-                xf_value_release(sv);
-                return xf_val_nav(XF_TYPE_STR);
-            }
-
-            char tmpname[] = "/tmp/xf_pipe_XXXXXX";
-            int fd = mkstemp(tmpname);
-            if (fd < 0) {
-                xf_value_release(cmd);
-                xf_value_release(sv);
-                return xf_val_nav(XF_TYPE_STR);
-            }
-
-            FILE *tf = fdopen(fd, "w");
-            if (!tf) {
-                close(fd);
-                unlink(tmpname);
-                xf_value_release(cmd);
-                xf_value_release(sv);
-                return xf_val_nav(XF_TYPE_STR);
-            }
-
-            fwrite(sv.data.str->data, 1, sv.data.str->len, tf);
-            fclose(tf);
-
-            char shellcmd[8192];
-            snprintf(shellcmd, sizeof(shellcmd), "%s < '%s'", cmd.data.str->data, tmpname);
-
-            FILE *fp = popen(shellcmd, "r");
-            if (!fp) {
-                unlink(tmpname);
-                xf_value_release(cmd);
-                xf_value_release(sv);
-                return xf_val_nav(XF_TYPE_STR);
-            }
-
-            char buf[65536];
-            size_t n = 0;
-            int c;
-            while (n < sizeof(buf) - 1 && (c = fgetc(fp)) != EOF)
-                buf[n++] = (char)c;
-            buf[n] = '\0';
-
-            pclose(fp);
-            unlink(tmpname);
-
-            while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
-                buf[--n] = '\0';
-
-            xf_Str *r = xf_str_from_cstr(buf);
-            xf_Value rv = xf_val_ok_str(r);
-            xf_str_release(r);
-
-            xf_value_release(cmd);
-            xf_value_release(sv);
-            return rv;
-        }
-
-        case BINOP_EQ: {
-            bool ok = (val_cmp(a, b) == 0);
-            xf_value_release(a);
-            xf_value_release(b);
-            return make_bool(ok);
-        }
-
-        case BINOP_NEQ: {
-            bool ok = (val_cmp(a, b) != 0);
-            xf_value_release(a);
-            xf_value_release(b);
-            return make_bool(ok);
-        }
-
-        case BINOP_LT: {
-            bool ok = (val_cmp(a, b) < 0);
-            xf_value_release(a);
-            xf_value_release(b);
-            return make_bool(ok);
-        }
-
-        case BINOP_GT: {
-            bool ok = (val_cmp(a, b) > 0);
-            xf_value_release(a);
-            xf_value_release(b);
-            return make_bool(ok);
-        }
-
-        case BINOP_LTE: {
-            bool ok = (val_cmp(a, b) <= 0);
-            xf_value_release(a);
-            xf_value_release(b);
-            return make_bool(ok);
-        }
-
-        case BINOP_GTE: {
-            bool ok = (val_cmp(a, b) >= 0);
-            xf_value_release(a);
-            xf_value_release(b);
-            return make_bool(ok);
-        }
-
-        case BINOP_SPACESHIP: {
-            xf_Value ret;
-            if (a.state != b.state) ret = xf_val_ok_num(0.0);
-            else ret = xf_val_ok_num((double)val_cmp(a, b));
-            xf_value_release(a);
-            xf_value_release(b);
-            return ret;
-        }
-        case BINOP_IN:
-            return eval_in(a,b);
-
-        case BINOP_MATCH:
-        case BINOP_NMATCH: {
-            bool is_nmatch = (e->as.binary.op == BINOP_NMATCH);
-
-            xf_Value sa = xf_coerce_str(a);
-            xf_value_release(a);
-            if (sa.state != XF_STATE_OK || !sa.data.str) {
-                xf_value_release(sa);
-                xf_value_release(b);
-                return make_bool(is_nmatch);
-            }
-
-            const char *subject = sa.data.str->data;
-            const char *pattern = NULL;
-            int cflags = REG_EXTENDED;
-
-            xf_Value sb_coerced = xf_val_null();
-            bool sb_allocated = false;
-            regex_t *precompiled = NULL;
-
-            if (b.state == XF_STATE_OK && b.type == XF_TYPE_REGEX && b.data.re) {
-                if (b.data.re->compiled) {
-                    precompiled = (regex_t *)b.data.re->compiled;
-                } else {
-                    pattern = b.data.re->pattern ? b.data.re->pattern->data : "";
-                    if (b.data.re->flags & XF_RE_ICASE) cflags |= REG_ICASE;
-                    if (b.data.re->flags & XF_RE_MULTILINE) cflags |= REG_NEWLINE;
-                }
-            } else {
-                sb_coerced = xf_coerce_str(b);
-                sb_allocated = true;
-                if (sb_coerced.state != XF_STATE_OK || !sb_coerced.data.str) {
-                    xf_value_release(sa);
-                    xf_value_release(sb_coerced);
-                    xf_value_release(b);
-                    return make_bool(is_nmatch);
-                }
-                pattern = sb_coerced.data.str->data;
-            }
-
-            regex_t re_local;
-            char errbuf[128];
-            bool matched;
-            regmatch_t pm[33] = {0};
-            int ngroups = 33;
-
-            if (precompiled) {
-                matched = (regexec(precompiled, subject, ngroups, pm, 0) == 0);
-            } else {
-                int rcc = regcomp(&re_local, pattern ? pattern : "", cflags);
-                if (rcc != 0) {
-                    regerror(rcc, &re_local, errbuf, sizeof(errbuf));
-                    interp_error(it, e->loc, "invalid regex '%s': %s",
-                                 pattern ? pattern : "", errbuf);
-                    matched = false;
-                } else {
-                    matched = (regexec(&re_local, subject, ngroups, pm, 0) == 0);
-                    regfree(&re_local);
-                }
-            }
-
-            if (matched) {
-                regoff_t ms = pm[0].rm_so, me = pm[0].rm_eo;
-                if (ms >= 0) {
-                    xf_Str *ms_str = xf_str_new(subject + ms, (size_t)(me - ms));
-                    xf_value_release(IT_REC(it)->last_match);
-                    IT_REC(it)->last_match = xf_val_ok_str(ms_str);
-                    xf_str_release(ms_str);
-                }
-
-                xf_arr_t *caps = xf_arr_new();
-                for (int gi = 1; gi < ngroups && pm[gi].rm_so >= 0; gi++) {
-                    regoff_t gs = pm[gi].rm_so, ge = pm[gi].rm_eo;
-                    xf_Str *gs_str = xf_str_new(subject + gs, (size_t)(ge - gs));
-                    xf_Value gv = xf_val_ok_str(gs_str);
-                    xf_str_release(gs_str);
-                    xf_arr_push(caps, gv);
-                }
-
-                xf_value_release(IT_REC(it)->last_captures);
-                IT_REC(it)->last_captures = xf_val_ok_arr(caps);
-                xf_arr_release(caps);
-            }
-
-            xf_value_release(sa);
-            if (sb_allocated) xf_value_release(sb_coerced);
-            xf_value_release(b);
-            return make_bool(is_nmatch ? !matched : matched);
-        }
+        case EXPR_SVAR: {
+    switch (e->as.var_ref.var) {
+        case TK_VAR_NR:
+            chunk_write(c, OP_LOAD_NR, e->loc.line);
+            return true;
+        case TK_VAR_NF:
+            chunk_write(c, OP_LOAD_NF, e->loc.line);
+            return true;
+        case TK_VAR_FNR:
+            chunk_write(c, OP_LOAD_FNR, e->loc.line);
+            return true;
+        case TK_VAR_FS:
+            chunk_write(c, OP_LOAD_FS, e->loc.line);
+            return true;
+        case TK_VAR_RS:
+            chunk_write(c, OP_LOAD_RS, e->loc.line);
+            return true;
+        case TK_VAR_OFS:
+            chunk_write(c, OP_LOAD_OFS, e->loc.line);
+            return true;
+        case TK_VAR_ORS:
+            chunk_write(c, OP_LOAD_ORS, e->loc.line);
+            return true;
+
+        /* these can be added later if/when their runtime path is wired */
+        case TK_VAR_OFMT:
+        case TK_VAR_FILE:
+        case TK_VAR_MATCH:
+        case TK_VAR_CAPS:
+        case TK_VAR_ERR:
+            fprintf(stderr,
+                    "compile_expr: stream var token not implemented yet (%d) at %u:%u\n",
+                    (int)e->as.var_ref.var, e->loc.line, e->loc.col);
+            return false;
 
         default:
-            xf_value_release(a);
-            xf_value_release(b);
-            return xf_val_nav(XF_TYPE_VOID);
+            fprintf(stderr,
+                    "compile_expr: unsupported EXPR_SVAR token %d at %u:%u\n",
+                    (int)e->as.var_ref.var, e->loc.line, e->loc.col);
+            return false;
     }
 }
-    case EXPR_TERNARY: {
-        xf_Value cond = interp_eval_expr(it, e->as.ternary.cond);
-        bool _cond_truthy = is_truthy(cond);
-        xf_value_release(cond);
-        return _cond_truthy
-               ? interp_eval_expr(it, e->as.ternary.then)
-               : interp_eval_expr(it, e->as.ternary.els);
+        case EXPR_TUPLE_LIT: {
+    size_t n = e->as.list_lit.count;
+
+    for (size_t i = 0; i < n; i++) {
+        if (!compile_expr(it, c, e->as.list_lit.items[i])) return false;
     }
 
-    case EXPR_COALESCE: {
-        xf_Value v = interp_eval_expr(it, e->as.coalesce.left);
-
-        switch (v.state) {
-            case XF_STATE_NULL:
-            case XF_STATE_NAV:
-            case XF_STATE_UNDEF:
-                xf_value_release(v);
-                return interp_eval_expr(it, e->as.coalesce.right);
-
-            default:
-                return v;
-        }
-    }
-
-    case EXPR_ASSIGN: {
-    xf_Value rhs = interp_eval_expr(it, e->as.assign.value);
-
-    if (e->as.assign.op != ASSIGNOP_EQ) {
-        xf_Value cur = lvalue_load(it, e->as.assign.target);
-        xf_Value old_rhs = rhs;
-        rhs = apply_assign_op(it,e->as.assign.op, cur, old_rhs, e->loc);
-        xf_value_release(cur);
-        xf_value_release(old_rhs);
-    }
-if (!lvalue_store(it, e->as.assign.target, rhs)) {
-    xf_value_release(rhs);
-    return xf_val_nav(XF_TYPE_VOID);
+    chunk_write(c, OP_MAKE_TUPLE, e->loc.line);
+    chunk_write_u16(c, (uint16_t)n, e->loc.line);
+    return true;
+}
+case EXPR_FIELD: {
+    chunk_write(c, OP_LOAD_FIELD, e->loc.line);
+    chunk_write(c, (uint8_t)e->as.field.index, e->loc.line);
+    return true;
 }
 
-return rhs;
+case EXPR_IVAR: {
+    switch (e->as.var_ref.var) {
+        case TK_VAR_NR:
+            chunk_write(c, OP_LOAD_NR, e->loc.line);
+            return true;
+        case TK_VAR_NF:
+            chunk_write(c, OP_LOAD_NF, e->loc.line);
+            return true;
+        case TK_VAR_FNR:
+            chunk_write(c, OP_LOAD_FNR, e->loc.line);
+            return true;
+        case TK_VAR_FS:
+            chunk_write(c, OP_LOAD_FS, e->loc.line);
+            return true;
+        case TK_VAR_RS:
+            chunk_write(c, OP_LOAD_RS, e->loc.line);
+            return true;
+        case TK_VAR_OFS:
+            chunk_write(c, OP_LOAD_OFS, e->loc.line);
+            return true;
+        case TK_VAR_ORS:
+            chunk_write(c, OP_LOAD_ORS, e->loc.line);
+            return true;
+        default:
+            fprintf(stderr, "compile_expr: unsupported record var token %d at %u:%u\n",
+                    (int)e->as.var_ref.var, e->loc.line, e->loc.col);
+            return false;
+    }
+}
+case EXPR_COALESCE: {
+    if (!compile_expr(it, c, e->as.coalesce.left)) return false;
+
+    chunk_write(c, OP_DUP, e->loc.line);
+    chunk_write(c, OP_GET_STATE, e->loc.line);
+
+    /* compare state string to "OK" */
+    xf_Str *ok_s = xf_str_from_cstr("OK");
+    if (!ok_s) return false;
+    xf_Value ok_v = xf_val_ok_str(ok_s);
+    xf_str_release(ok_s);
+
+    uint32_t ok_idx = chunk_add_const(c, ok_v);
+    xf_value_release(ok_v);
+
+    chunk_write(c, OP_PUSH_STR, e->loc.line);
+    chunk_write_u32(c, ok_idx, e->loc.line);
+    chunk_write(c, OP_EQ, e->loc.line);
+
+    size_t use_left = emit_jump(c, OP_JUMP_IF, e->loc.line);
+
+    /* left was not OK: discard duplicate + original left */
+    chunk_write(c, OP_POP, e->loc.line);
+    chunk_write(c, OP_POP, e->loc.line);
+
+    if (!compile_expr(it, c, e->as.coalesce.right)) return false;
+
+    size_t done = emit_jump(c, OP_JUMP, e->loc.line);
+
+    /* left was OK: discard duplicate state-check path result, keep original left */
+    patch_jump_here(c, use_left);
+    chunk_write(c, OP_POP, e->loc.line);
+
+    patch_jump_here(c, done);
+    return true;
 }
 case EXPR_WALRUS: {
-    xf_Value rhs = interp_eval_expr(it, e->as.walrus.value);
+    if (!compile_expr(it, c, e->as.walrus.value)) return false;
 
-    Symbol *s = sym_lookup_str(it->syms, e->as.walrus.name);
-    if (s) {
-        xf_value_release(s->value);
-        s->value      = rhs;
-        s->state      = rhs.state;
-        s->is_defined = true;
-    } else {
-        s = sym_declare(it->syms, e->as.walrus.name,
-                        SYM_VAR, e->as.walrus.type, e->loc);
-        if (s) {
-            xf_value_release(s->value);
-            s->value      = rhs;
-            s->state      = rhs.state;
-            s->is_defined = true;
+    /* expression result should remain on stack */
+    chunk_write(c, OP_DUP, e->loc.line);
+
+    if (g_fn_ctx) {
+        int local_slot = fn_local_find(e->as.walrus.name);
+        if (local_slot < 0) {
+            uint8_t decl_type = e->as.walrus.type ? e->as.walrus.type : XF_TYPE_VOID;
+            local_slot = fn_local_add(e->as.walrus.name, decl_type);
+            if (local_slot < 0) return false;
+        }
+
+        chunk_write(c, OP_STORE_LOCAL, e->loc.line);
+        chunk_write(c, (uint8_t)local_slot, e->loc.line);
+        return true;
+    }
+
+    if (it->syms) {
+        Symbol *sym = sym_lookup_local_str(it->syms, e->as.walrus.name);
+        if (!sym) {
+            uint8_t decl_type = e->as.walrus.type ? e->as.walrus.type : XF_TYPE_VOID;
+            sym = sym_declare(it->syms,
+                              e->as.walrus.name,
+                              SYM_VAR,
+                              decl_type,
+                              e->loc);
+        }
+        if (sym) {
+            if (e->as.walrus.type) sym->type = e->as.walrus.type;
+            sym->is_defined = true;
         }
     }
 
-    return xf_value_retain(rhs);
+    uint32_t slot = compile_global_name(it, e->as.walrus.name);
+    if (slot == UINT32_MAX) return false;
+
+    chunk_write(c, OP_STORE_GLOBAL, e->loc.line);
+    chunk_write_u32(c, slot, e->loc.line);
+    return true;
+}
+case EXPR_MAP_LIT: {
+    size_t n = e->as.map_lit.count;
+
+    for (size_t i = 0; i < n; i++) {
+        if (!compile_expr(it, c, e->as.map_lit.keys[i])) return false;
+        if (!compile_expr(it, c, e->as.map_lit.vals[i])) return false;
+    }
+
+    chunk_write(c, OP_MAKE_MAP, e->loc.line);
+    chunk_write_u16(c, (uint16_t)n, e->loc.line);
+    return true;
 }
 
-case EXPR_CALL: {
-    Expr *callee_expr = e->as.call.callee;
+case EXPR_SET_LIT: {
+    size_t n = e->as.list_lit.count;
 
-    if (callee_expr &&
-        callee_expr->kind == EXPR_IDENT &&
-        e->as.call.argc == 1 &&
-        strcmp(callee_expr->as.ident.name->data, "rip") == 0) {
-        return eval_rip_call(it, e->as.call.args[0], e->loc);
-    }
-        xf_Value args[64];
-    size_t argc = e->as.call.argc < 64 ? e->as.call.argc : 64;
-
-    for (size_t i = 0; i < argc; i++)
-        args[i] = interp_eval_expr(it, e->as.call.args[i]);
-
-    /* -----------------------------
-     * MEMBER CALL: obj.method(...)
-     * ----------------------------- */
-    if (e->as.call.callee->kind == EXPR_MEMBER) {
-        Expr *member = e->as.call.callee;
-
-        xf_Value obj = interp_eval_expr(it, member->as.member.obj);
-
-        const char *mname =
-            (member->as.member.field && member->as.member.field->data)
-            ? member->as.member.field->data
-            : "<null-member>";
-
-        /* -------- MODULE CALL -------- */
-        if (obj.state == XF_STATE_OK &&
-            obj.type == XF_TYPE_MODULE &&
-            obj.data.mod) {
-
-            xf_Value callee = xf_module_get(obj.data.mod, mname);
-
-            if (callee.state == XF_STATE_OK &&
-                callee.type == XF_TYPE_FN &&
-                callee.data.fn) {
-
-                xf_Fn *fn = callee.data.fn;
-
-                /* ---- XF function ---- */
-                if (!fn->is_native) {
-                    Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
-                    fn_sc->fn_ret_type = fn->return_type;
-
-                    for (size_t i = 0; i < fn->param_count; i++) {
-                        xf_Value av = i < argc ? args[i]
-                                               : xf_val_undef(fn->params[i].type);
-
-                        Symbol *ps = sym_declare(it->syms,
-                                                 fn->params[i].name,
-                                                 SYM_PARAM,
-                                                 fn->params[i].type,
-                                                 e->loc);
-                        if (ps) {
-                            xf_value_release(ps->value);
-                            ps->value      = xf_value_retain(av);
-                            ps->state      = av.state;
-                            ps->is_defined = true;
-                        }
-                    }
-
-                    bool saved_returning = it->returning;
-                    xf_Value saved_ret   = it->return_val;
-
-                    it->returning  = false;
-                    it->return_val = xf_val_null();
-
-                    interp_eval_stmt(it, (Stmt *)fn->body);
-
-                    xf_Value ret = it->returning
-                        ? xf_value_retain(it->return_val)
-                        : xf_val_null();
-
-                    xf_value_release(it->return_val);
-                    it->return_val = saved_ret;
-                    it->returning  = saved_returning;
-
-                    scope_free(sym_pop(it->syms));
-
-                    if (fn->return_type != XF_TYPE_VOID &&
-                        ret.state == XF_STATE_NULL)
-                        ret = xf_val_nav(fn->return_type);
-
-                    xf_value_release(callee);
-                    xf_value_release(obj);
-                    for (size_t i = 0; i < argc; i++)
-                        xf_value_release(args[i]);
-
-                    return ret;
-                }
-
-                /* ---- native fn ---- */
-                if (fn->native_v) {
-                    xf_Value ret = fn->native_v(args, argc);
-
-                    xf_value_release(callee);
-                    xf_value_release(obj);
-                    for (size_t i = 0; i < argc; i++)
-                        xf_value_release(args[i]);
-
-                    return ret;
-                }
-            }
-
-            const char *modname =
-                (obj.data.mod && obj.data.mod->name)
-                ? obj.data.mod->name
-                : "<module>";
-
-            xf_value_release(callee);
-            xf_value_release(obj);
-            for (size_t i = 0; i < argc; i++)
-                xf_value_release(args[i]);
-
-            interp_error(it, e->loc, "'%s' has no member '%s'", modname, mname);
-            return xf_val_nav(XF_TYPE_VOID);
-        }
-
-        /* -------- NON-MODULE MEMBER -------- */
-        xf_Value margs[65];
-        margs[0] = obj;
-        for (size_t i = 0; i < argc && i + 1 < 65; i++)
-            margs[i + 1] = args[i];
-
-        xf_Value mr = interp_call_builtin(it, mname, margs, argc + 1);
-
-        if (mr.state != XF_STATE_NAV) {
-            xf_Value ret = xf_value_retain(mr);
-
-            xf_value_release(obj);
-            for (size_t i = 0; i < argc; i++)
-                xf_value_release(args[i]);
-
-            return ret;
-        }
-
-        xf_value_release(obj);
+    for (size_t i = 0; i < n; i++) {
+        if (!compile_expr(it, c, e->as.list_lit.items[i])) return false;
     }
 
-    /* -----------------------------
-     * NORMAL CALL: f(...)
-     * ----------------------------- */
-    xf_Value callee = interp_eval_expr(it, e->as.call.callee);
+    chunk_write(c, OP_MAKE_SET, e->loc.line);
+    chunk_write_u16(c, (uint16_t)n, e->loc.line);
+    return true;
+}
+        case EXPR_SUBSCRIPT: {
+    if (!compile_expr(it, c, e->as.subscript.obj)) return false;
+    if (!compile_expr(it, c, e->as.subscript.key)) return false;
 
-    if (callee.state == XF_STATE_OK &&
-        callee.type == XF_TYPE_FN &&
-        callee.data.fn) {
+    chunk_write(c, OP_GET_IDX, e->loc.line);
+    return true;
+}
+case EXPR_ARR_LIT: {
+    size_t n = e->as.list_lit.count;
 
-        xf_Fn *fn = callee.data.fn;
-
-        /* ---- XF function ---- */
-        if (!fn->is_native) {
-            Scope *fn_sc = sym_push(it->syms, SCOPE_FN);
-            fn_sc->fn_ret_type = fn->return_type;
-
-            for (size_t i = 0; i < fn->param_count; i++) {
-                xf_Value av = i < argc ? args[i]
-                                       : xf_val_undef(fn->params[i].type);
-
-                Symbol *ps = sym_declare(it->syms,
-                                         fn->params[i].name,
-                                         SYM_PARAM,
-                                         fn->params[i].type,
-                                         e->loc);
-                if (ps) {
-                    xf_value_release(ps->value);
-                    ps->value      = xf_value_retain(av);
-                    ps->state      = av.state;
-                    ps->is_defined = true;
-                }
-            }
-
-            bool saved_returning = it->returning;
-            xf_Value saved_ret   = it->return_val;
-
-            it->returning  = false;
-            it->return_val = xf_val_null();
-
-            interp_eval_stmt(it, (Stmt *)fn->body);
-
-            xf_Value ret = it->returning
-                ? xf_value_retain(it->return_val)
-                : xf_val_null();
-
-            xf_value_release(it->return_val);
-            it->return_val = saved_ret;
-            it->returning  = saved_returning;
-
-            scope_free(sym_pop(it->syms));
-
-            if (fn->return_type != XF_TYPE_VOID &&
-                ret.state == XF_STATE_NULL)
-                ret = xf_val_nav(fn->return_type);
-
-            xf_value_release(callee);
-            for (size_t i = 0; i < argc; i++)
-                xf_value_release(args[i]);
-
-            return ret;
-        }
-
-        /* ---- native ---- */
-        if (fn->native_v) {
-            xf_Value ret = fn->native_v(args, argc);
-
-            xf_value_release(callee);
-            for (size_t i = 0; i < argc; i++)
-                xf_value_release(args[i]);
-
-            return ret;
-        }
+    for (size_t i = 0; i < n; i++) {
+        if (!compile_expr(it, c, e->as.list_lit.items[i])) return false;
     }
 
-    /* ---- builtin fallback ---- */
-    if (e->as.call.callee->kind == EXPR_IDENT) {
-        const char *name =
-            (e->as.call.callee->as.ident.name &&
-             e->as.call.callee->as.ident.name->data)
-            ? e->as.call.callee->as.ident.name->data
-            : "<null-ident>";
-
-        xf_Value r = interp_call_builtin(it, name, args, argc);
-
-        if (r.state != XF_STATE_NAV) {
-            xf_Value ret = xf_value_retain(r);
-
-            xf_value_release(callee);
-            for (size_t i = 0; i < argc; i++)
-                xf_value_release(args[i]);
-
-            return ret;
-        }
-    }
-
-    xf_value_release(callee);
-    for (size_t i = 0; i < argc; i++)
-        xf_value_release(args[i]);
-
-    interp_error(it, e->loc, "attempt to call non-function");
-    return xf_val_nav(XF_TYPE_VOID);
+    chunk_write(c, OP_MAKE_ARR, e->loc.line);
+    chunk_write_u16(c, (uint16_t)n, e->loc.line);
+    return true;
+}
+case EXPR_STATE: {
+    if (!compile_expr(it, c, e->as.introspect.operand)) return false;
+    chunk_write(c, OP_GET_STATE, e->loc.line);
+    return true;
 }
 
+case EXPR_TYPE: {
+    if (!compile_expr(it, c, e->as.introspect.operand)) return false;
+    chunk_write(c, OP_GET_TYPE, e->loc.line);
+    return true;
+}
 
+case EXPR_LEN: {
+    if (!compile_expr(it, c, e->as.introspect.operand)) return false;
+    chunk_write(c, OP_GET_LEN, e->loc.line);
+    return true;
+}
+case EXPR_ASSIGN: {
+    AssignOp op = e->as.assign.op;
+    Expr *target = e->as.assign.target;
+    Expr *value  = e->as.assign.value;
+        if (target->kind == EXPR_SVAR || target->kind == EXPR_IVAR) {
+        TokenKind vk = target->as.var_ref.var;
 
-                case EXPR_STATE: {
-        xf_Value v = interp_eval_expr(it, e->as.introspect.operand);
+        if (op != ASSIGNOP_EQ) {
+            fprintf(stderr,
+                    "compile_expr: only '=' is supported for stream var assignment at %u:%u\n",
+                    e->loc.line, e->loc.col);
+            return false;
+        }
 
-        uint8_t st = (v.state < XF_STATE_COUNT) ? v.state : XF_STATE_OK;
-        const char *name = XF_STATE_NAMES[st];
+        if (!compile_expr(it, c, value)) return false;
 
-        xf_Str *s = xf_str_from_cstr(name);
-        xf_Value out = xf_val_ok_str(s);
-        xf_str_release(s);
-        return out;
-    }
+        /* assignment expression leaves value on stack */
+        chunk_write(c, OP_DUP, e->loc.line);
 
-    case EXPR_TYPE: {
-        xf_Value v = interp_eval_expr(it, e->as.introspect.operand);
-
-        uint8_t t = XF_STATE_IS_BOOL(v.state) ? XF_TYPE_BOOL : v.type;
-        if (t >= XF_TYPE_COUNT) t = XF_TYPE_VOID;
-
-        const char *name = XF_TYPE_NAMES[t];
-
-        xf_Str *s = xf_str_from_cstr(name);
-        xf_Value out = xf_val_ok_str(s);
-        xf_str_release(s);
-        return out;
-    }
-
-    case EXPR_LEN: {
-        xf_Value v = interp_eval_expr(it, e->as.introspect.operand);
-        if (v.state != XF_STATE_OK) return v;
-
-        switch (v.type) {
-            case XF_TYPE_STR:
-                return xf_val_ok_num(v.data.str ? (double)v.data.str->len : 0.0);
-            case XF_TYPE_ARR:
-                return xf_val_ok_num(v.data.arr ? (double)v.data.arr->len : 0.0);
-            case XF_TYPE_TUPLE:
-                return xf_val_ok_num(v.data.tuple ? (double)xf_tuple_len(v.data.tuple) : 0.0);
-            case XF_TYPE_MAP:
-            case XF_TYPE_SET:
-                return xf_val_ok_num(v.data.map ? (double)v.data.map->order_len : 0.0);
-            case XF_TYPE_MODULE:
-                if (v.data.mod) {
-                    xf_Value r = xf_module_get(v.data.mod, "length");
-                    if (r.state != XF_STATE_NAV) return r;
-                }
-                interp_error(it, e->loc, "module has no member 'length'");
-                return xf_val_nav(XF_TYPE_NUM);
+        switch (vk) {
+            case TK_VAR_FS:
+                chunk_write(c, OP_STORE_FS, e->loc.line);
+                return true;
+            case TK_VAR_RS:
+                chunk_write(c, OP_STORE_RS, e->loc.line);
+                return true;
+            case TK_VAR_OFS:
+                chunk_write(c, OP_STORE_OFS, e->loc.line);
+                return true;
+            case TK_VAR_ORS:
+                chunk_write(c, OP_STORE_ORS, e->loc.line);
+                return true;
             default:
-                interp_error(it, e->loc, ".len not defined for type '%s'",
-                             XF_TYPE_NAMES[v.type]);
-                return xf_val_nav(XF_TYPE_NUM);
+                fprintf(stderr,
+                        "compile_expr: stream var assignment not supported for token %d at %u:%u\n",
+                        (int)vk, e->loc.line, e->loc.col);
+                return false;
         }
     }
-
-    case EXPR_CAST: {
-        xf_Value v = interp_eval_expr(it, e->as.cast.operand);
-        if (v.state != XF_STATE_OK) return v;
-
-        uint8_t target = e->as.cast.to_type;
-        if (v.type == target) return v;
-
-        switch (target) {
-            case XF_TYPE_NUM:
-                return xf_coerce_num(v);
-
-            case XF_TYPE_STR:
-                return xf_coerce_str(v);
-
-            default:
-                interp_error(it, e->loc, "cast to '%s' is not supported",
-                             XF_TYPE_NAMES[target]);
-                return xf_val_nav(target);
-        }
+    if (!target || target->kind != EXPR_IDENT) {
+        fprintf(stderr, "compile_expr: assignment target kind not implemented at %u:%u\n",
+                e->loc.line, e->loc.col);
+        return false;
     }
 
-    case EXPR_MEMBER: {
-        xf_Value obj = interp_eval_expr(it, e->as.member.obj);
-        const char *field = (e->as.member.field && e->as.member.field->data) ? e->as.member.field->data : "<null-field>";
+    int local_slot = fn_local_find(target->as.ident.name);
 
-        if (obj.state == XF_STATE_OK &&
-            obj.type == XF_TYPE_MODULE && obj.data.mod) {
-            xf_Value r = xf_module_get(obj.data.mod, field);
-            xf_value_release(obj);
-            if (r.state != XF_STATE_NAV) return r;
-            interp_error(it, e->loc, "'%s' has no member '%s'",
-                         obj.data.mod->name, field);
-            return xf_val_nav(XF_TYPE_VOID);
-        }
+    if (op == ASSIGNOP_EQ) {
+        if (!compile_expr(it, c, value)) return false;
 
-        if (strcmp(field, "state") == 0) {
-            const char *name = XF_STATE_NAMES[
-                obj.state < XF_STATE_COUNT ? obj.state : 0
-            ];
-            xf_Str *s = xf_str_from_cstr(name);
-            xf_Value out = xf_val_ok_str(s);
-            xf_str_release(s);
-            return out;
-        }
+        chunk_write(c, OP_DUP, e->loc.line);
 
-        if (strcmp(field, "type") == 0) {
-            uint8_t t = XF_STATE_IS_BOOL(obj.state) ? XF_TYPE_BOOL : obj.type;
-            const char *name = XF_TYPE_NAMES[
-                t < XF_TYPE_COUNT ? t : 0
-            ];
-            xf_Str *s = xf_str_from_cstr(name);
-            xf_Value out = xf_val_ok_str(s);
-            xf_str_release(s);
-            return out;
-        }
-
-        if (strcmp(field, "len") == 0 || strcmp(field, "length") == 0) {
-            if (obj.state != XF_STATE_OK) return obj;
-            if (obj.type == XF_TYPE_STR)
-                return xf_val_ok_num(obj.data.str ? (double)obj.data.str->len : 0.0);
-            if (obj.type == XF_TYPE_ARR)
-                return xf_val_ok_num(obj.data.arr ? (double)obj.data.arr->len : 0.0);
-            if (obj.type == XF_TYPE_MAP || obj.type == XF_TYPE_SET)
-                return xf_val_ok_num(obj.data.map ? (double)obj.data.map->used : 0.0);
-            return xf_val_nav(XF_TYPE_NUM);
-        }
-
-        interp_error(it, e->loc, "unknown member '.%s'", field);
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-
-case EXPR_PIPE_FN: {
-    xf_Value left = interp_eval_expr(it, e->as.pipe_fn.left);
-    Expr *rhs = e->as.pipe_fn.right;
-
-    /* ── a |> f(b, c)  →  f(left, b, c) ──────────────────────
-     * Inject left as the first argument into the call.         */
-    if (rhs->kind == EXPR_CALL) {
-        size_t extra_argc = rhs->as.call.argc < 63 ? rhs->as.call.argc : 63;
-        xf_Value args[64];
-        args[0] = left;
-        for (size_t i = 0; i < extra_argc; i++)
-            args[i + 1] = interp_eval_expr(it, rhs->as.call.args[i]);
-        size_t total_argc = extra_argc + 1;
-
-        xf_Value result = xf_val_nav(XF_TYPE_VOID);
-
-        /* try builtin by name first */
-        if (rhs->as.call.callee->kind == EXPR_IDENT &&
-            rhs->as.call.callee->as.ident.name) {
-            const char *bname = rhs->as.call.callee->as.ident.name->data;
-            xf_Value r = interp_call_builtin(it, bname, args, total_argc);
-            if (r.state != XF_STATE_NAV) {
-                result = xf_value_retain(r);
-                for (size_t i = 0; i < total_argc; i++) xf_value_release(args[i]);
-                return result;
-            }
-        }
-
-        /* evaluate callee and dispatch */
-        xf_Value callee_val = interp_eval_expr(it, rhs->as.call.callee);
-        if (callee_val.state == XF_STATE_OK &&
-            callee_val.type  == XF_TYPE_FN  &&
-            callee_val.data.fn) {
-            xf_Fn *fn = callee_val.data.fn;
-            if (fn->is_native && fn->native_v) {
-                xf_Value r0 = fn->native_v(args, total_argc);
-                result = xf_value_retain(r0);
-            } else {
-                result = interp_exec_xf_fn(it->vm, it->syms, fn, args, total_argc);
-            }
+        if (local_slot >= 0) {
+            chunk_write(c, OP_STORE_LOCAL, e->loc.line);
+            chunk_write(c, (uint8_t)local_slot, e->loc.line);
         } else {
-            interp_error(it, e->loc, "pipe target is not callable");
+            uint32_t slot = compile_global_name(it, target->as.ident.name);
+            if (slot == UINT32_MAX) return false;
+            chunk_write(c, OP_STORE_GLOBAL, e->loc.line);
+            chunk_write_u32(c, slot, e->loc.line);
         }
-        xf_value_release(callee_val);
-        for (size_t i = 0; i < total_argc; i++) xf_value_release(args[i]);
-        return result;
+        return true;
     }
 
-    /* ── a |> obj.method ────────────────────────────────────── */
-    if (rhs->kind == EXPR_MEMBER) {
-        xf_Value obj = interp_eval_expr(it, rhs->as.member.obj);
-        const char *mn = (rhs->as.member.field && rhs->as.member.field->data)
-                         ? rhs->as.member.field->data : "<null-member>";
-
-        /* module member: look up fn in module, call with left */
-        if (obj.state == XF_STATE_OK &&
-            obj.type  == XF_TYPE_MODULE && obj.data.mod) {
-            xf_Value fv = xf_module_get(obj.data.mod, mn);
-            if (fv.state == XF_STATE_OK &&
-                fv.type  == XF_TYPE_FN  && fv.data.fn) {
-                xf_Fn *fn = fv.data.fn;
-                xf_Value result;
-                if (fn->is_native && fn->native_v) {
-                    xf_Value r0 = fn->native_v(&left, 1);
-                    result = xf_value_retain(r0);
-                } else {
-                    result = interp_exec_xf_fn(it->vm, it->syms, fn, &left, 1);
-                }
-                xf_value_release(fv);
-                xf_value_release(obj);
-                xf_value_release(left);
-                return result;
-            }
-            xf_value_release(fv);
-            interp_error(it, e->loc, "module has no callable member '%s'", mn);
-            xf_value_release(obj);
-            xf_value_release(left);
-            return xf_val_nav(XF_TYPE_VOID);
-        }
-
-        /* non-module: try builtin with (obj, left) as before */
-        xf_Value margs[2] = { obj, left };
-        xf_Value mr = interp_call_builtin(it, mn, margs, 2);
-        if (mr.state != XF_STATE_NAV) {
-            xf_Value ret = xf_value_retain(mr);
-            xf_value_release(obj);
-            xf_value_release(left);
-            return ret;
-        }
-        xf_value_release(obj);
-    }
-
-    /* ── a |> ident ─────────────────────────────────────────── */
-    if (rhs->kind == EXPR_IDENT) {
-        const char *name = (rhs->as.ident.name && rhs->as.ident.name->data)
-                           ? rhs->as.ident.name->data : "<null-ident>";
-        xf_Value r = interp_call_builtin(it, name, &left, 1);
-        if (r.state != XF_STATE_NAV) {
-            xf_Value ret = xf_value_retain(r);
-            xf_value_release(left);
-            return ret;
-        }
-    }
-
-    /* ── fallback: evaluate rhs as a fn value and call it ───── */
-    xf_Value callee = interp_eval_expr(it, rhs);
-    if (callee.state == XF_STATE_OK &&
-        callee.type  == XF_TYPE_FN  &&
-        callee.data.fn) {
-        xf_Fn *fn = callee.data.fn;
-        if (fn->is_native && fn->native_v) {
-            xf_Value r0 = fn->native_v(&left, 1);
-            xf_Value ret = xf_value_retain(r0);
-            xf_value_release(callee);
-            xf_value_release(left);
-            return ret;
-        }
-        xf_Value ret = interp_exec_xf_fn(it->vm, it->syms, fn, &left, 1);
-        xf_value_release(callee);
-        xf_value_release(left);
-        return ret;
-    }
-
-    xf_value_release(callee);
-    xf_value_release(left);
-    interp_error(it, e->loc, "pipe target is not callable");
-    return xf_val_nav(XF_TYPE_VOID);
-}
-    case EXPR_FN: {
-        xf_Fn *fn = build_fn(NULL, e->as.fn.return_type,
-                             e->as.fn.params, e->as.fn.param_count,
-                             e->as.fn.body);
-        return xf_val_ok_fn(fn);
-    }
-
-    case EXPR_SPAWN: {
-        if (it->is_worker)
-            return xf_val_ok_num(0.0);
-
-        Expr *call_expr = e->as.spawn_expr.call;
-        if (!call_expr || call_expr->kind != EXPR_CALL)
-            return xf_val_ok_num(0.0);
-
-        xf_Value callee = interp_eval_expr(it, call_expr->as.call.callee);
-        size_t argc = call_expr->as.call.argc < 64 ? call_expr->as.call.argc : 64;
-        xf_Value sargs[64];
-        for (size_t i = 0; i < argc; i++)
-            sargs[i] = interp_eval_expr(it, call_expr->as.call.args[i]);
-
-        pthread_mutex_lock(&g_spawn_mu);
-        if (g_spawn_live >= XF_SPAWN_MAX ||
-            callee.state != XF_STATE_OK ||
-            callee.type  != XF_TYPE_FN  ||
-            !callee.data.fn) {
-            pthread_mutex_unlock(&g_spawn_mu);
-            xf_value_release(callee);
-            for (size_t i = 0; i < argc; i++) xf_value_release(sargs[i]);
-            return xf_val_ok_num(0.0);
-        }
-
-        SpawnCtx *ctx = alloc_spawn_ctx();
-        if (!ctx) {
-            pthread_mutex_unlock(&g_spawn_mu);
-            xf_value_release(callee);
-            for (size_t i = 0; i < argc; i++) xf_value_release(sargs[i]);
-            return xf_val_ok_num(0.0);
-        }
-        ctx->id = g_spawn_next++;
-        ctx->vm = it->vm;
-        sym_init(&ctx->snap_syms);
-        copy_globals_from(&ctx->snap_syms, it->syms);
-        ctx->snap_ready = true;
-        ctx->fn_val = callee;
-        ctx->argc   = argc;
-        for (size_t i = 0; i < argc; i++) ctx->args[i] = sargs[i];
-
-        uint32_t handle_id = ctx->id;
-        pthread_mutex_unlock(&g_spawn_mu);
-
-        if (!start_spawn_ctx(ctx)) {
-            pthread_mutex_lock(&g_spawn_mu);
-            SpawnCtx *slot = find_spawn_ctx_by_id(handle_id);
-            if (slot) free_spawn_ctx_slot(slot);
-            pthread_mutex_unlock(&g_spawn_mu);
-            return xf_val_ok_num(0.0);
-        }
-
-        return xf_val_ok_num((double)handle_id);
-    }
-
-    case EXPR_STATE_LIT:
-        return (xf_Value){
-            .state = e->as.state_lit.state,
-            .type  = XF_STATE_IS_BOOL(e->as.state_lit.state)
-                        ? XF_TYPE_BOOL : XF_TYPE_VOID
-        };
-
-    default:
-        interp_error(it, e->loc, "unhandled expression kind %d", e->kind);
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-}
-/* ── iter_collection ────────────────────────────────────────────────
- * Shared iteration kernel used by both STMT_FOR and STMT_FOR_SHORT.
- * Walks arr / tuple / map / set / str collections, binding key+val
- * loop variables and executing `body` for each element.
- * ------------------------------------------------------------------ */
-static void iter_collection(Interp *it, xf_Value col,
-                             LoopBind *iter_key, LoopBind *iter_val,
-                             Stmt *body, Loc loc) {
-    if (col.type == XF_TYPE_ARR && col.data.arr) {
-        xf_arr_t *a = col.data.arr;
-        for (size_t i = 0; i < a->len; i++) {
-            sym_push(it->syms, SCOPE_LOOP);
-
-            xf_Value keyv = xf_val_ok_num((double)i);
-            bind_loop_index_value(it, iter_key, iter_val, keyv, a->items[i], loc);
-
-            xf_Value body_r = interp_eval_stmt(it, body);
-            xf_value_release(body_r);
-
-            scope_free(sym_pop(it->syms));
-
-            if (it->nexting)  { it->nexting  = false; continue; }
-            if (it->breaking) { it->breaking = false; break; }
-            if (it->returning || it->exiting || it->had_error) break;
-        }
-
-    } else if (col.type == XF_TYPE_TUPLE && col.data.tuple) {
-        size_t n = xf_tuple_len(col.data.tuple);
-        for (size_t i = 0; i < n; i++) {
-            xf_Value tv = xf_tuple_get(col.data.tuple, i);
-
-            sym_push(it->syms, SCOPE_LOOP);
-
-            xf_Value keyv = xf_val_ok_num((double)i);
-            bind_loop_index_value(it, iter_key, iter_val, keyv, tv, loc);
-
-            xf_Value body_r = interp_eval_stmt(it, body);
-            xf_value_release(body_r);
-
-            scope_free(sym_pop(it->syms));
-
-            if (it->nexting)  { it->nexting  = false; continue; }
-            if (it->breaking) { it->breaking = false; break; }
-            if (it->returning || it->exiting || it->had_error) break;
-        }
-
-    } else if ((col.type == XF_TYPE_MAP || col.type == XF_TYPE_SET) && col.data.map) {
-        xf_map_t *m = col.data.map;
-        bool is_set = (col.type == XF_TYPE_SET);
-
-        for (size_t i = 0; i < m->order_len; i++) {
-            xf_Str  *key = m->order[i];
-            xf_Value kv  = xf_val_ok_str(key);
-            xf_Value vv  = is_set ? xf_val_ok_str(key) : xf_map_get(m, key);
-
-            sym_push(it->syms, SCOPE_LOOP);
-
-            if (!iter_key &&
-                iter_val && iter_val->kind == LOOP_BIND_TUPLE &&
-                iter_val->as.tuple.count == 2) {
-                bind_loop_index_value(it,
-                    iter_val->as.tuple.items[0],
-                    iter_val->as.tuple.items[1],
-                    kv, vv, loc);
-            } else {
-                bind_loop_index_value(it, iter_key, iter_val, kv, vv, loc);
-            }
-
-            xf_Value body_r = interp_eval_stmt(it, body);
-            xf_value_release(body_r);
-
-            scope_free(sym_pop(it->syms));
-
-            xf_value_release(kv);
-            xf_value_release(vv);
-
-            if (it->nexting)  { it->nexting  = false; continue; }
-            if (it->breaking) { it->breaking = false; break; }
-            if (it->returning || it->exiting || it->had_error) break;
-        }
-
+    if (local_slot >= 0) {
+        chunk_write(c, OP_LOAD_LOCAL, e->loc.line);
+        chunk_write(c, (uint8_t)local_slot, e->loc.line);
     } else {
-        interp_error(it, loc, "cannot iterate over type '%s'",
-                     XF_TYPE_NAMES[col.type]);
-    }
-}
-xf_Value interp_eval_stmt(Interp *it, Stmt *s) {
-    if (!s) return xf_val_null();
-    if (it->had_error || it->returning || it->exiting || it->nexting || it->breaking)
-        return xf_val_null();
-
-    switch (s->kind) {
-case STMT_BLOCK: {
-    xf_Value last = xf_val_null();
-    sym_push(it->syms, SCOPE_BLOCK);
-
-    for (size_t i = 0; i < s->as.block.count; i++) {
-        xf_Value cur = interp_eval_stmt(it, s->as.block.stmts[i]);
-        xf_value_release(last);
-        last = cur;
-        if (it->returning || it->exiting || it->nexting ||
-            it->breaking || it->had_error) break;
+        uint32_t slot = compile_global_name(it, target->as.ident.name);
+        if (slot == UINT32_MAX) return false;
+        chunk_write(c, OP_LOAD_GLOBAL, e->loc.line);
+        chunk_write_u32(c, slot, e->loc.line);
     }
 
-    scope_free(sym_pop(it->syms));
-        xf_value_release(last);   // ← add: always drop before returning
-    return xf_val_null();
-}
-    case STMT_EXPR:{
-    return  interp_eval_expr(it, s->as.expr.expr);
-}
-case STMT_VAR_DECL: {
-    xf_Value init = s->as.var_decl.init
-        ? interp_eval_expr(it, s->as.var_decl.init)
-        : xf_val_undef(s->as.var_decl.type);
+    if (!compile_expr(it, c, value)) return false;
 
-    if (init.state == XF_STATE_OK &&
-        s->as.var_decl.type != XF_TYPE_VOID &&
-        init.type != s->as.var_decl.type) {
-        if (s->as.var_decl.type == XF_TYPE_NUM) {
-            xf_Value old = init;
-            init = xf_coerce_num(old);
-            xf_value_release(old);
-        } else if (s->as.var_decl.type == XF_TYPE_STR) {
-            xf_Value old = init;
-            init = xf_coerce_str(old);
-            xf_value_release(old);
+    switch (op) {
+        case ASSIGNOP_ADD:    chunk_write(c, OP_ADD, e->loc.line); break;
+        case ASSIGNOP_SUB:    chunk_write(c, OP_SUB, e->loc.line); break;
+        case ASSIGNOP_MUL:    chunk_write(c, OP_MUL, e->loc.line); break;
+        case ASSIGNOP_DIV:    chunk_write(c, OP_DIV, e->loc.line); break;
+        case ASSIGNOP_MOD:    chunk_write(c, OP_MOD, e->loc.line); break;
+        case ASSIGNOP_CONCAT: chunk_write(c, OP_CONCAT, e->loc.line); break;
+        default:
+            fprintf(stderr, "compile_expr: assignment op not implemented at %u:%u\n",
+                    e->loc.line, e->loc.col);
+            return false;
+    }
+
+    chunk_write(c, OP_DUP, e->loc.line);
+
+    if (local_slot >= 0) {
+        chunk_write(c, OP_STORE_LOCAL, e->loc.line);
+        chunk_write(c, (uint8_t)local_slot, e->loc.line);
+    } else {
+        uint32_t slot = compile_global_name(it, target->as.ident.name);
+        if (slot == UINT32_MAX) return false;
+        chunk_write(c, OP_STORE_GLOBAL, e->loc.line);
+        chunk_write_u32(c, slot, e->loc.line);
+    }
+    return true;
+}
+case EXPR_CALL: {
+    if (!compile_expr(it, c, e->as.call.callee)) return false;
+
+    for (size_t i = 0; i < e->as.call.argc; i++) {
+        if (!compile_expr(it, c, e->as.call.args[i])) return false;
+    }
+
+    chunk_write(c, OP_CALL, e->loc.line);
+    chunk_write(c, (uint8_t)e->as.call.argc, e->loc.line);
+    return true;
+}
+case EXPR_IDENT: {
+    int local_slot = fn_local_find(e->as.ident.name);
+    if (local_slot >= 0) {
+        chunk_write(c, OP_LOAD_LOCAL, e->loc.line);
+        chunk_write(c, (uint8_t)local_slot, e->loc.line);
+        return true;
+    }
+
+    uint32_t slot = compile_global_name(it, e->as.ident.name);
+    if (slot == UINT32_MAX) return false;
+
+    chunk_write(c, OP_LOAD_GLOBAL, e->loc.line);
+    chunk_write_u32(c, slot, e->loc.line);
+    return true;
+}
+                case EXPR_MEMBER: {
+            if (!compile_expr(it, c, e->as.member.obj)) return false;
+
+            xf_Value fv = xf_val_ok_str(e->as.member.field);
+            uint32_t idx = chunk_add_const(c, fv);
+            xf_value_release(fv);
+
+            chunk_write(c, OP_GET_MEMBER, e->loc.line);
+            chunk_write_u32(c, idx, e->loc.line);
+            return true;
         }
-    }
+        case EXPR_BINARY:
+            if (!compile_expr(it, c, e->as.binary.left)) return false;
+            if (!compile_expr(it, c, e->as.binary.right)) return false;
 
-    Symbol *sym = sym_lookup_local(it->syms,
-                                   s->as.var_decl.name->data,
-                                   s->as.var_decl.name->len);
-    if (!sym) {
-        sym = sym_declare(it->syms, s->as.var_decl.name,
-                          SYM_VAR, s->as.var_decl.type, s->loc);
-    }
+            switch (e->as.binary.op) {
+                case BINOP_ADD:       chunk_write(c, OP_ADD, e->loc.line); return true;
+                case BINOP_SUB:       chunk_write(c, OP_SUB, e->loc.line); return true;
+                case BINOP_MUL:       chunk_write(c, OP_MUL, e->loc.line); return true;
+                case BINOP_DIV:       chunk_write(c, OP_DIV, e->loc.line); return true;
+                case BINOP_MOD:       chunk_write(c, OP_MOD, e->loc.line); return true;
+                case BINOP_POW:       chunk_write(c, OP_POW, e->loc.line); return true;
+                case BINOP_EQ:        chunk_write(c, OP_EQ, e->loc.line); return true;
+                case BINOP_NEQ:       chunk_write(c, OP_NEQ, e->loc.line); return true;
+                case BINOP_LT:        chunk_write(c, OP_LT, e->loc.line); return true;
+                case BINOP_GT:        chunk_write(c, OP_GT, e->loc.line); return true;
+                case BINOP_LTE:       chunk_write(c, OP_LTE, e->loc.line); return true;
+                case BINOP_GTE:       chunk_write(c, OP_GTE, e->loc.line); return true;
+                case BINOP_SPACESHIP: chunk_write(c, OP_SPACESHIP, e->loc.line); return true;
+                case BINOP_AND:       chunk_write(c, OP_AND, e->loc.line); return true;
+                case BINOP_OR:        chunk_write(c, OP_OR, e->loc.line); return true;
+                case BINOP_CONCAT:    chunk_write(c, OP_CONCAT, e->loc.line); return true;
+                case BINOP_MATCH:     chunk_write(c, OP_MATCH, e->loc.line); return true;
+                case BINOP_NMATCH:    chunk_write(c, OP_NMATCH, e->loc.line); return true;
+                default: return false;
+            }
 
-    if (sym) {
-        xf_value_release(sym->value);
-        sym->value = xf_value_retain(init);
-        sym->state = init.state;
-        sym->is_defined = true;
-    }
+        case EXPR_UNARY:
+            if (!compile_expr(it, c, e->as.unary.operand)) return false;
 
-    return init;
+            switch (e->as.unary.op) {
+                case UNOP_NEG: chunk_write(c, OP_NEG, e->loc.line); return true;
+                case UNOP_NOT: chunk_write(c, OP_NOT, e->loc.line); return true;
+                default: return false;
+            }
+                    default:
+            fprintf(stderr, "compile_expr: unimplemented %s at %u:%u\n",
+                    expr_kind_name(e->kind), e->loc.line, e->loc.col);
+            return false;
+
+
+    }
 }
-case STMT_FN_DECL: {
-    xf_Fn *fn = build_fn(s->as.fn_decl.name, s->as.fn_decl.return_type,
-                         s->as.fn_decl.params, s->as.fn_decl.param_count,
-                         s->as.fn_decl.body);
-    xf_Value fv = xf_val_ok_fn(fn);
+static bool compile_if_stmt(Interp *it, Chunk *c, Stmt *s) {
+    if (!s) return false;
 
-    Scope *saved = it->syms->current;
-    it->syms->current = it->syms->global;
+    size_t end_jumps[64];
+    size_t end_count = 0;
 
-    Symbol *sym = sym_lookup_local(it->syms,
-                      s->as.fn_decl.name->data, s->as.fn_decl.name->len);
-    if (!sym)
-        sym = sym_declare(it->syms, s->as.fn_decl.name,
-                          SYM_FN, XF_TYPE_FN, s->loc);
-
-    it->syms->current = saved;
-
-    if (sym) {
-        xf_value_release(sym->value);
-        sym->value = fv;
-        sym->state = XF_STATE_OK;
-        sym->is_defined = true;
-    }
-if (!sym) xf_value_release(fv);
-//    xf_fn_release(fn);
-    return xf_val_null();
-}
-case STMT_IF: {
     for (size_t i = 0; i < s->as.if_stmt.count; i++) {
-        xf_Value cond = interp_eval_expr(it, s->as.if_stmt.branches[i].cond);
-        bool truth = is_truthy(cond);
-        xf_value_release(cond);
+        Branch *br = &s->as.if_stmt.branches[i];
+        if (!br->cond || !br->body) return false;
 
-        if (truth) {
-            sym_push(it->syms, SCOPE_BLOCK);
-            xf_Value r = interp_eval_stmt(it, s->as.if_stmt.branches[i].body);
-            scope_free(sym_pop(it->syms));
-            return r;
-        }
+        if (!compile_expr(it, c, br->cond)) return false;
+
+        size_t jump_not = emit_jump(c, OP_JUMP_NOT, br->loc.line);
+
+        if (!compile_stmt(it, c, br->body)) return false;
+
+        end_jumps[end_count++] = emit_jump(c, OP_JUMP, br->loc.line);
+        patch_jump_here(c, jump_not);
     }
 
     if (s->as.if_stmt.els) {
-        sym_push(it->syms, SCOPE_BLOCK);
-        xf_Value r = interp_eval_stmt(it, s->as.if_stmt.els);
-        scope_free(sym_pop(it->syms));
-        return r;
+        if (!compile_stmt(it, c, s->as.if_stmt.els)) return false;
     }
 
-    return xf_val_null();
-}
-case STMT_WHILE: {
-    sym_push(it->syms, SCOPE_LOOP);
-
-    for (;;) {
-        xf_Value cond = interp_eval_expr(it, s->as.while_stmt.cond);
-        bool truth = is_truthy(cond);
-        xf_value_release(cond);
-        if (!truth) break;
-
-        xf_Value body_r = interp_eval_stmt(it, s->as.while_stmt.body);
-        xf_value_release(body_r);
-
-        if (it->nexting)  { it->nexting = false; continue; }
-        if (it->breaking) { it->breaking = false; break; }
-        if (it->returning || it->exiting || it->had_error) break;
+    for (size_t i = 0; i < end_count; i++) {
+        patch_jump_here(c, end_jumps[i]);
     }
 
-    scope_free(sym_pop(it->syms));
-    return xf_val_null();
-}
-case STMT_WHILE_SHORT: {
-    sym_push(it->syms, SCOPE_LOOP);
-
-    for (;;) {
-        xf_Value cond = interp_eval_expr(it, s->as.while_short.cond);
-        bool truth = is_truthy(cond);
-        xf_value_release(cond);
-        if (!truth) break;
-
-        xf_Value body_r = interp_eval_stmt(it, s->as.while_short.body);
-        xf_value_release(body_r);
-
-        if (it->nexting)  { it->nexting = false; continue; }
-        if (it->breaking) { it->breaking = false; break; }
-        if (it->returning || it->exiting || it->had_error) break;
-    }
-
-    scope_free(sym_pop(it->syms));
-    return xf_val_null();
-}
-    case STMT_FOR: {
-        xf_Value col = interp_eval_expr(it, s->as.for_stmt.collection);
-        if (col.state != XF_STATE_OK) return col;
-        iter_collection(it, col, s->as.for_stmt.iter_key,
-                        s->as.for_stmt.iter_val, s->as.for_stmt.body, s->loc);
-        xf_value_release(col);
-        return xf_val_null();
-    }
-        case STMT_FOR_SHORT: {
-        xf_Value col = interp_eval_expr(it, s->as.for_short.collection);
-        if (col.state != XF_STATE_OK) return col;
-        iter_collection(it, col, s->as.for_short.iter_key,
-                        s->as.for_short.iter_val, s->as.for_short.body, s->loc);
-        xf_value_release(col);
-        return xf_val_null();
-    }
-case STMT_RETURN: {
-    xf_Value rv = s->as.ret.value
-        ? interp_eval_expr(it, s->as.ret.value)
-        : xf_val_null();
-
-    xf_value_release(it->return_val);
-    it->return_val = rv;
-    it->returning = true;
-
-    return xf_val_null();
-}
-    case STMT_NEXT:
-        it->nexting = true;
-        return xf_val_null();
-
-    case STMT_EXIT:
-        it->exiting = true;
-        return xf_val_null();
-
-    case STMT_BREAK:
-        it->breaking = true;
-        return xf_val_null();
-
-case STMT_PRINT: {
-    xf_Value vals[64];
-    size_t count = s->as.print.count < 64 ? s->as.print.count : 64;
-
-    for (size_t i = 0; i < count; i++)
-        vals[i] = interp_eval_expr(it, s->as.print.args[i]);
-
-    FILE *_out = stdout;
-
-    if (s->as.print.redirect && s->as.print.redirect_op != 0) {
-        xf_Value rv = interp_eval_expr(it, s->as.print.redirect);
-        xf_Value rs = xf_coerce_str(rv);
-        xf_value_release(rv);
-
-        if (rs.state == XF_STATE_OK && rs.data.str) {
-            FILE *cached = vm_redir_open(it->vm, rs.data.str->data,
-                                         s->as.print.redirect_op);
-            if (cached) _out = cached;
-        }
-        xf_value_release(rs);
-    }
-
-    for (size_t i = 0; i < count; i++) {
-        if (i > 0) fputs(" ", _out);
-        xf_print_value(_out, vals[i]);
-    }
-    fputc('\n', _out);
-
-    for (size_t i = 0; i < count; i++)
-        xf_value_release(vals[i]);
-
-    return xf_val_null();
-}
-        case STMT_PRINTF: {
-        if (s->as.printf_stmt.count == 0) return xf_val_null();
-
-        xf_Value fmtv = interp_eval_expr(it, s->as.printf_stmt.args[0]);
-        xf_Value fmts = xf_coerce_str(fmtv);
-        xf_value_release(fmtv);
-
-        if (fmts.state != XF_STATE_OK || !fmts.data.str) {
-            xf_value_release(fmts);
-            return xf_val_null();
-        }
-
-        xf_Value args[64];
-        size_t argc = s->as.printf_stmt.count < 64 ? s->as.printf_stmt.count : 64;
-        for (size_t i = 1; i < argc; i++)
-            args[i] = interp_eval_expr(it, s->as.printf_stmt.args[i]);
-
-        char buf[8192];
-        xf_sprintf_impl(buf, sizeof(buf), fmts.data.str->data, args + 1, argc - 1);
-
-        FILE *_pf_out = stdout;
-        bool _pf_close = false;
-
-        if (s->as.printf_stmt.redirect && s->as.printf_stmt.redirect_op != 0) {
-            xf_Value rv = interp_eval_expr(it, s->as.printf_stmt.redirect);
-            xf_Value rs = xf_coerce_str(rv);
-            xf_value_release(rv);
-            if (rs.state == XF_STATE_OK && rs.data.str) {
-                FILE *cached = vm_redir_open(it->vm, rs.data.str->data,
-                                             s->as.printf_stmt.redirect_op);
-                if (cached) _pf_out = cached;
-            }
-            xf_value_release(rs);
-        }
-
-        fputs(buf, _pf_out);
-
-        if (_pf_close) {
-            if (s->as.printf_stmt.redirect_op == 3) pclose(_pf_out);
-            else fclose(_pf_out);
-        }
-
-        for (size_t i = 1; i < argc; i++) xf_value_release(args[i]);
-        xf_value_release(fmts);
-        return xf_val_null();
-    }
-
-    case STMT_OUTFMT:
-        if (s->as.outfmt.mode == XF_OUTFMT_JSON &&
-            IT_REC(it)->out_mode != XF_OUTFMT_JSON)
-            IT_REC(it)->headers_set = false;
-        IT_REC(it)->out_mode = s->as.outfmt.mode;
-        return xf_val_null();
-
-    case STMT_IMPORT: {
-        if (!s->as.import.path)
-            return xf_val_null();
-
-        const char *imp_path = (s->as.import.path && s->as.import.path->data) ? s->as.import.path->data : "<null-import-path>";
-        FILE *imp_fp = fopen(imp_path, "r");
-        if (!imp_fp) {
-            interp_error(it, s->loc, "import: cannot open '%s'", imp_path);
-            return xf_val_null();
-        }
-
-        fseek(imp_fp, 0, SEEK_END);
-        long imp_sz = ftell(imp_fp);
-        rewind(imp_fp);
-
-        char *imp_src = malloc((size_t)imp_sz + 1);
-        fread(imp_src, 1, (size_t)imp_sz, imp_fp);
-        fclose(imp_fp);
-        imp_src[imp_sz] = '\0';
-
-        Lexer imp_lex;
-        xf_lex_init(&imp_lex, imp_src, (size_t)imp_sz, XF_SRC_FILE, imp_path);
-        xf_tokenize(&imp_lex);
-
-        Program *imp_prog = parse(&imp_lex, it->syms);
-
-        if (imp_prog) {
-            /* Declaration pass only — mirror interp_run_program's first pass.
-             * Imported BEGIN/END blocks must NOT fire at import time, and
-             * pattern-action rules have no record context to run against.
-             * Only TOP_FN (registers fn in syms) and TOP_STMT (top-level
-             * variable declarations / assignments) are evaluated here. */
-for (size_t ii = 0; ii < imp_prog->count; ii++) {
-    TopLevel *t = imp_prog->items[ii];
-    if (t->kind == TOP_BEGIN || t->kind == TOP_END ||
-        t->kind == TOP_RULE)
-        continue;
-
-    xf_Value tv = interp_eval_top(it, t);
-    xf_value_release(tv);
-
-    if (it->had_error) break;
-}
-            /* DO NOT free imp_prog here — build_fn() stores a raw pointer
-             * into top->as.fn.body.  Freeing the AST now would leave every
-             * imported function body dangling (→ garbage stmt kind / segfault).
-             * Instead, keep the program alive and free it in interp_free(). */
-            if (it->imp_prog_count >= it->imp_prog_cap) {
-                size_t new_cap = it->imp_prog_cap ? it->imp_prog_cap * 2 : 8;
-                it->imp_progs  = realloc(it->imp_progs,
-                                         new_cap * sizeof(Program *));
-                it->imp_prog_cap = new_cap;
-            }
-            it->imp_progs[it->imp_prog_count++] = imp_prog;
-        } else {
-            interp_error(it, s->loc, "import: parse error in '%s'", imp_path);
-        }
-
-        xf_lex_free(&imp_lex);
-        free(imp_src);
-        return xf_val_null();
-    }
-
-    case STMT_DELETE: {
-        Expr *tgt = s->as.delete.target;
-        if (tgt && tgt->kind == EXPR_SUBSCRIPT) {
-            xf_Value obj = interp_eval_expr(it, tgt->as.subscript.obj);
-            xf_Value key = interp_eval_expr(it, tgt->as.subscript.key);
-
-            if (obj.state == XF_STATE_OK && obj.type == XF_TYPE_ARR && obj.data.arr) {
-                xf_Value ni = xf_coerce_num(key);
-                if (ni.state == XF_STATE_OK)
-                    xf_arr_delete(obj.data.arr, (size_t)ni.data.num);
-            } else if (obj.state == XF_STATE_OK &&
-                       (obj.type == XF_TYPE_MAP || obj.type == XF_TYPE_SET) &&
-                       obj.data.map) {
-                xf_Value ks = xf_coerce_str(key);
-                if (ks.state == XF_STATE_OK && ks.data.str)
-                    xf_map_delete(obj.data.map, ks.data.str);
-                xf_value_release(ks);
-            }
-
-            xf_value_release(obj);
-            xf_value_release(key);
-        }
-        return xf_val_null();
-    }
-case STMT_SPAWN: {
-    if (it->is_worker) {
-        return xf_val_nav(XF_TYPE_NUM);
-    }
-
-    Expr *call_expr = s->as.spawn.call;
-    if (!call_expr || call_expr->kind != EXPR_CALL) {
-        return xf_val_ok_num(0.0);
-    }
-
-    xf_Value callee = interp_eval_expr(it, call_expr->as.call.callee);
-    size_t argc = call_expr->as.call.argc < 64 ? call_expr->as.call.argc : 64;
-    xf_Value sargs[64];
-
-    for (size_t i = 0; i < argc; i++)
-        sargs[i] = interp_eval_expr(it, call_expr->as.call.args[i]);
-
-    pthread_mutex_lock(&g_spawn_mu);
-    if (g_spawn_live >= XF_SPAWN_MAX ||
-        callee.state != XF_STATE_OK ||
-        callee.type != XF_TYPE_FN ||
-        !callee.data.fn) {
-        pthread_mutex_unlock(&g_spawn_mu);
-        xf_value_release(callee);
-        for (size_t i = 0; i < argc; i++) xf_value_release(sargs[i]);
-        return xf_val_ok_num(0.0);
-    }
-
-    SpawnCtx *ctx = alloc_spawn_ctx();
-    if (!ctx) {
-        pthread_mutex_unlock(&g_spawn_mu);
-        xf_value_release(callee);
-        for (size_t i = 0; i < argc; i++) xf_value_release(sargs[i]);
-        return xf_val_ok_num(0.0);
-    }
-    ctx->id = g_spawn_next++;
-    ctx->vm = it->vm;
-    sym_init(&ctx->snap_syms);
-    copy_globals_from(&ctx->snap_syms, it->syms);
-    ctx->snap_ready = true;
-    ctx->fn_val = callee;
-    ctx->argc = argc;
-    for (size_t i = 0; i < argc; i++) ctx->args[i] = sargs[i];
-
-    uint32_t handle_id = ctx->id;
-    pthread_mutex_unlock(&g_spawn_mu);
-
-    if (!start_spawn_ctx(ctx)) {
-        pthread_mutex_lock(&g_spawn_mu);
-        SpawnCtx *slot = find_spawn_ctx_by_id(handle_id);
-        if (slot) free_spawn_ctx_slot(slot);
-        pthread_mutex_unlock(&g_spawn_mu);
-        return xf_val_ok_num(0.0);
-    }
-
-    return xf_val_ok_num((double)handle_id);
-}
-case STMT_JOIN: {
-    xf_Value handle = interp_eval_expr(it, s->as.join.handle);
-    xf_Value join_result = xf_val_null();
-
-    if (handle.state == XF_STATE_OK && handle.type == XF_TYPE_NUM) {
-        uint32_t hid = (uint32_t)handle.data.num;
-
-        /* Phase 1: copy tid by value while holding the lock — never keep
-         * a pointer into g_spawn[] across a lock release.                  */
-        pthread_t tid = (pthread_t)0;
-        bool need_join = false;
-
-        pthread_mutex_lock(&g_spawn_mu);
-        SpawnCtx *slot = find_spawn_ctx_by_id(hid);
-        if (slot) {
-            if (!slot->started)
-                start_spawn_ctx(slot);
-            tid = slot->tid;
-            need_join = slot->started;
-        }
-        pthread_mutex_unlock(&g_spawn_mu);
-
-        /* Phase 2: block outside the lock using the copied tid value.      */
-        if (need_join) {
-            pthread_join(tid, NULL);
-
-            /* Phase 3: copy result first, then swap-remove.                */
-            pthread_mutex_lock(&g_spawn_mu);
-            SpawnCtx *slot = find_spawn_ctx_by_id(hid);
-            if (slot) {
-                join_result = xf_value_retain(slot->result);
-                free_spawn_ctx_slot(slot);
-            }
-            pthread_mutex_unlock(&g_spawn_mu);
-        }
-    }
-
-    xf_value_release(handle);
-    return join_result;
-}
-
-    case STMT_SUBST:
-    case STMT_TRANS:
-        return xf_val_null();
-
-    default:
-        interp_error(it, s->loc, "unhandled statement kind %d", s->kind);
-        return xf_val_null();
-    }
-}
-xf_Value interp_eval_top(Interp *it, TopLevel *top) {
-    if (!top) return xf_val_null();
-    switch (top->kind) {
-        case TOP_BEGIN:
-        case TOP_END:
-            return interp_eval_stmt(it, top->as.begin_end.body);
-case TOP_RULE:
-    if (top->as.rule.pattern) {
-        xf_Value pat = interp_eval_expr(it, top->as.rule.pattern);
-        bool truth = is_truthy(pat);
-        xf_value_release(pat);
-        if (!truth) return xf_val_null();
-    }
-    return interp_eval_stmt(it, top->as.rule.body);
-        case TOP_FN: {
-            xf_Fn *fn = build_fn(top->as.fn.name, top->as.fn.return_type,
-                                  top->as.fn.params, top->as.fn.param_count,
-                                  top->as.fn.body);
-            /* body stays in AST — not stolen */
-            xf_Value fv = xf_val_ok_fn(fn);
-            Symbol *sym = sym_lookup_local(it->syms,
-                              top->as.fn.name->data, top->as.fn.name->len);
-            if (!sym)
-                sym = sym_declare(it->syms, top->as.fn.name, SYM_FN, XF_TYPE_FN, top->loc);
-            if (sym) { xf_value_release(sym->value); sym->value = fv; sym->state = XF_STATE_OK; sym->is_defined = true; }
-            return xf_val_null();
-        }
-        case TOP_STMT:
-            return interp_eval_stmt(it, top->as.stmt.stmt);
-        default:
-            return xf_val_null();
-    }
-}
-int interp_run_program(Interp *it, Program *prog) {
-    for (size_t i = 0; i < prog->count; i++) {
-        TopLevel *t = prog->items[i];
-        if (t->kind == TOP_BEGIN || t->kind == TOP_END ||
-            t->kind == TOP_RULE  || t->kind == TOP_STMT) continue;
-
-        xf_Value tv = interp_eval_top(it, t);
-        xf_value_release(tv);
-
-        if (it->exiting || it->had_error) return it->had_error ? 1 : 0;
-    }
-
-    for (size_t i = 0; i < prog->count; i++) {
-        if (prog->items[i]->kind != TOP_BEGIN) continue;
-
-        xf_Value tv = interp_eval_top(it, prog->items[i]);
-        xf_value_release(tv);
-        xf_gc_maybe_collect(it->vm, it->syms, it);
-        if (it->had_error) return 1;
-        if (it->exiting) break;
-    }
-
-    return it->had_error ? 1 : 0;
-}
-void interp_run_end(Interp *it, Program *prog) {
-    if (it->had_error) return;
-    for (size_t i = 0; i < prog->count; i++) {
-        if (prog->items[i]->kind != TOP_END) continue;
-        it->exiting = false;
-
-        xf_Value tv = interp_eval_top(it, prog->items[i]);
-        xf_value_release(tv);
-        xf_gc_maybe_collect(it->vm, it->syms, it);
-        if (it->had_error) return;
-    }
-    vm_redir_flush(it->vm);
-}
-
-/* Print all fields of the current record through the active output format.
- * Used for format-conversion passthrough (e.g. -f csv:json data.csv). */
-void interp_print_record(Interp *it) {
-    RecordCtx *_rc = IT_REC(it);
-    size_t count = _rc->field_count;
-    if (count == 0) return;
-
-    xf_Value *vals = malloc(sizeof(xf_Value) * count);
-    if (!vals) return;
-    for (size_t i = 0; i < count; i++) {
-        xf_Str *s = xf_str_from_cstr(_rc->fields[i]);
-        vals[i] = xf_val_ok_str(s);
-        xf_str_release(s);
-    }
-    print_structured(it, vals, count, _rc->out_mode);
-    for (size_t i = 0; i < count; i++) xf_value_release(vals[i]);
-    free(vals);
-}
-void interp_feed_record(Interp *it, Program *prog,
-                        const char *rec, size_t len) {
-    vm_split_record(it->vm, rec, len);
-
-    if (IT_REC(it)->out_mode == XF_OUTFMT_JSON &&
-        !IT_REC(it)->headers_set) {
-        vm_capture_headers(it->vm);
-        return;
-    }
-
-    for (size_t i = 0; i < prog->count; i++) {
-        TopLevel *t = prog->items[i];
-
-        if (t->kind == TOP_RULE) {
-            if (t->as.rule.pattern) {
-                xf_Value pat = interp_eval_expr(it, t->as.rule.pattern);
-                bool ok = is_truthy(pat);
-                xf_value_release(pat);
-                if (!ok) continue;
-            }
-
-            it->nexting = false;
-            xf_Value rv = interp_eval_stmt(it, t->as.rule.body);
-            xf_value_release(rv);
-
-            if (it->nexting) { it->nexting = false; break; }
-            if (it->exiting || it->had_error) return;
-        } else if (t->kind == TOP_STMT) {
-            it->nexting = false;
-            xf_Value rv = interp_eval_top(it, t);
-            xf_value_release(rv);
-
-            if (it->nexting) { it->nexting = false; break; }
-            if (it->exiting || it->had_error) return;
-        }
-    }
-}
-bool interp_compile_program(Interp *it, Program *prog) {
-    (void)it; (void)prog;
     return true;
 }
-Chunk *interp_compile_expr(Interp *it, Expr *e, const char *name) {
-    (void)it; (void)e;
-    Chunk *c = malloc(sizeof(Chunk));
-    chunk_init(c, name);
-    chunk_write(c, OP_HALT, 0);
-    return c;
+static bool compile_while_stmt(Interp *it, Chunk *c, Stmt *s) {
+    if (!s) return false;
+
+    size_t loop_start = c->len;
+
+    if (!compile_expr(it, c, s->as.while_stmt.cond)) return false;
+    size_t jump_not = emit_jump(c, OP_JUMP_NOT, s->loc.line);
+
+    if (!compile_stmt(it, c, s->as.while_stmt.body)) return false;
+
+    chunk_write(c, OP_JUMP, s->loc.line);
+    int32_t back = (int32_t)loop_start - (int32_t)(c->len + 2);
+    chunk_write_u16(c, (uint16_t)(int16_t)back, s->loc.line);
+
+    patch_jump_here(c, jump_not);
+    return true;
 }
-Chunk *interp_compile_stmt(Interp *it, Stmt *s, const char *name) {
-    (void)it; (void)s;
-    Chunk *c = malloc(sizeof(Chunk));
-    chunk_init(c, name );
-    chunk_write(c, OP_HALT, 0);
-    return c;
+static bool compile_for_stmt(Interp *it, Chunk *c, Stmt *s) {
+    if (!it || !c || !s) return false;
+
+    LoopBind *iter_key = s->as.for_stmt.iter_key;
+    LoopBind *iter_val = s->as.for_stmt.iter_val;
+    Expr     *coll     = s->as.for_stmt.collection;
+    Stmt     *body     = s->as.for_stmt.body;
+
+    if (!iter_val || iter_val->kind != LOOP_BIND_NAME) {
+        fprintf(stderr,
+                "compile_for_stmt: only simple value binding is implemented right now at %u:%u\n",
+                s->loc.line, s->loc.col);
+        return false;
+    }
+
+    if (iter_key && iter_key->kind != LOOP_BIND_NAME) {
+        fprintf(stderr,
+                "compile_for_stmt: only simple key binding is implemented right now at %u:%u\n",
+                s->loc.line, s->loc.col);
+        return false;
+    }
+
+    uint8_t coll_type = infer_expr_type(it, coll);
+    bool is_map = (coll_type == XF_TYPE_MAP);
+    bool is_set = (coll_type == XF_TYPE_SET);
+    bool is_map_or_set = is_map || is_set;
+
+    /* hidden globals used by the lowered loop */
+    uint32_t coll_slot = bind_hidden_global(it, "for_coll"); /* iterable view */
+    uint32_t src_slot  = bind_hidden_global(it, "for_src");  /* original map/set */
+    uint32_t idx_slot  = bind_hidden_global(it, "for_idx");  /* numeric loop index */
+
+    if (coll_slot == UINT32_MAX || src_slot == UINT32_MAX || idx_slot == UINT32_MAX) {
+        return false;
+    }
+
+    /* user-visible loop vars */
+    uint32_t val_slot = compile_global_name(it, iter_val->as.name);
+    if (val_slot == UINT32_MAX) return false;
+
+    uint32_t key_slot = UINT32_MAX;
+    if (iter_key) {
+        key_slot = compile_global_name(it, iter_key->as.name);
+        if (key_slot == UINT32_MAX) return false;
+    }
+
+    /*
+     * Setup phase:
+     *   - arrays/tuples/strings: coll_slot = collection
+     *   - maps/sets: src_slot = original collection, coll_slot = keys/elements array
+     */
+    if (!compile_expr(it, c, coll)) return false;
+
+    if (is_map_or_set) {
+        /* preserve original map/set */
+        chunk_write(c, OP_DUP, s->loc.line);
+        chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+        chunk_write_u32(c, src_slot, s->loc.line);
+
+        /* iterable view = keys array (map) or element array (set) */
+        chunk_write(c, OP_GET_KEYS, s->loc.line);
+        chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+        chunk_write_u32(c, coll_slot, s->loc.line);
+    } else {
+        chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+        chunk_write_u32(c, coll_slot, s->loc.line);
+    }
+
+    /* idx = 0 */
+    chunk_write(c, OP_PUSH_NUM, s->loc.line);
+    chunk_write_f64(c, 0.0, s->loc.line);
+    chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+    chunk_write_u32(c, idx_slot, s->loc.line);
+
+    size_t loop_top = c->len;
+
+    /* condition: idx < coll.len */
+    chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
+    chunk_write_u32(c, idx_slot, s->loc.line);
+
+    chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
+    chunk_write_u32(c, coll_slot, s->loc.line);
+    chunk_write(c, OP_GET_LEN, s->loc.line);
+
+    chunk_write(c, OP_LT, s->loc.line);
+
+    size_t exit_jump = emit_jump(c, OP_JUMP_NOT, s->loc.line);
+
+    /*
+     * Bind loop variables
+     */
+    if (is_map_or_set) {
+        /* current item from iterable view: coll_slot[idx] */
+        chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
+        chunk_write_u32(c, coll_slot, s->loc.line);
+        chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
+        chunk_write_u32(c, idx_slot, s->loc.line);
+        chunk_write(c, OP_GET_IDX, s->loc.line);
+
+        if (is_map) {
+            /*
+             * At this point stack top is the current key.
+             *
+             * for (x in m):
+             *   bind x = key
+             *
+             * for ((k, v) in m):
+             *   bind k = key
+             *   bind v = src_map[key]
+             */
+            if (iter_key) {
+                /* duplicate key so one copy goes to k and one is used for m[key] */
+                chunk_write(c, OP_DUP, s->loc.line);
+                chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+                chunk_write_u32(c, key_slot, s->loc.line);
+            }
+
+            if (iter_key) {
+                /* value = src_map[key] */
+                chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
+                chunk_write_u32(c, src_slot, s->loc.line);
+                chunk_write(c, OP_SWAP, s->loc.line);
+                chunk_write(c, OP_GET_IDX, s->loc.line);
+                chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+                chunk_write_u32(c, val_slot, s->loc.line);
+            } else {
+                /* single-bind map iteration yields keys */
+                chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+                chunk_write_u32(c, val_slot, s->loc.line);
+            }
+        } else {
+            /* set iteration yields elements directly */
+            chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+            chunk_write_u32(c, val_slot, s->loc.line);
+        }
+    } else {
+        /* arrays / tuples / strings use numeric index iteration */
+        if (iter_key) {
+            chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
+            chunk_write_u32(c, idx_slot, s->loc.line);
+            chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+            chunk_write_u32(c, key_slot, s->loc.line);
+        }
+
+        chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
+        chunk_write_u32(c, coll_slot, s->loc.line);
+        chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
+        chunk_write_u32(c, idx_slot, s->loc.line);
+        chunk_write(c, OP_GET_IDX, s->loc.line);
+        chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+        chunk_write_u32(c, val_slot, s->loc.line);
+    }
+
+    if (!compile_stmt(it, c, body)) return false;
+
+    /* idx = idx + 1 */
+    chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
+    chunk_write_u32(c, idx_slot, s->loc.line);
+    chunk_write(c, OP_PUSH_NUM, s->loc.line);
+    chunk_write_f64(c, 1.0, s->loc.line);
+    chunk_write(c, OP_ADD, s->loc.line);
+    chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+    chunk_write_u32(c, idx_slot, s->loc.line);
+
+    emit_loop_back_jump(c, loop_top, s->loc.line);
+    patch_jump_here(c, exit_jump);
+    return true;
+}
+static bool compile_for_short_stmt(Interp *it, Chunk *c, Stmt *s) {
+    if (!it || !c || !s) return false;
+
+    Stmt temp = *s;
+    temp.kind = STMT_FOR;
+    temp.as.for_stmt.iter_key   = s->as.for_short.iter_key;
+    temp.as.for_stmt.iter_val   = s->as.for_short.iter_val;
+    temp.as.for_stmt.collection = s->as.for_short.collection;
+    temp.as.for_stmt.body       = s->as.for_short.body;
+
+    return compile_for_stmt(it, c, &temp);
+}
+xf_Value interp_exec_xf_fn_bridge(void *vm_ptr, void *syms_ptr,
+                                  xf_fn_t *fn, xf_Value *args, size_t argc) {
+    (void)syms_ptr;
+
+    if (!fn) return xf_val_null();
+
+    if (fn->is_native && fn->native_v) {
+        return fn->native_v(args, argc);
+    }
+
+    if (!vm_ptr || !fn->body) {
+        return xf_val_nav(XF_TYPE_FN);
+    }
+
+    VM *vm = (VM *)vm_ptr;
+    Chunk *chunk = (Chunk *)fn->body;
+return vm_call_function_chunk(vm, chunk, args, argc);
 }

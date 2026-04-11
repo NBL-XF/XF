@@ -231,7 +231,147 @@ static xf_Value csy_free(xf_Value *args, size_t argc) {
     (void)args; (void)argc;
     return xf_val_null();
 }
+#include <dirent.h>
+#include <sys/stat.h>
 
+/* Thread-local state for the nftw callback */
+static _Thread_local regex_t    *tl_grep_re      = NULL;
+static _Thread_local xf_arr_t  *tl_grep_results  = NULL;
+static _Thread_local size_t     tl_grep_max       = 0;   /* 0 = unlimited */
+
+static void grep_file(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+
+    char line[65536];
+    size_t lineno = 0;
+    regmatch_t pm[CR_MAX_GROUPS];
+
+    while (fgets(line, sizeof(line), fp)) {
+        lineno++;
+        size_t ln = strlen(line);
+        while (ln > 0 && (line[ln-1] == '\n' || line[ln-1] == '\r'))
+            line[--ln] = '\0';
+
+        if (regexec(tl_grep_re, line, CR_MAX_GROUPS, pm, 0) != 0)
+            continue;
+
+        xf_map_t *m = xf_map_new();
+        /* file */
+        xf_Str *k = xf_str_from_cstr("file");
+        xf_Str *sv = xf_str_from_cstr(path);
+        xf_Value tmp = xf_val_ok_str(sv);
+        xf_map_set(m, k, tmp); xf_value_release(tmp);
+        xf_str_release(k); xf_str_release(sv);
+        /* line number */
+        k = xf_str_from_cstr("line");
+        xf_map_set(m, k, xf_val_ok_num((double)lineno));
+        xf_str_release(k);
+        /* matched text */
+        k = xf_str_from_cstr("text");
+        sv = xf_str_new(line, ln);
+        tmp = xf_val_ok_str(sv);
+        xf_map_set(m, k, tmp); xf_value_release(tmp);
+        xf_str_release(k); xf_str_release(sv);
+        /* match start/end */
+        k = xf_str_from_cstr("index");
+        xf_map_set(m, k, xf_val_ok_num((double)pm[0].rm_so));
+        xf_str_release(k);
+
+        xf_Value row = xf_val_ok_map(m);
+        xf_arr_push(tl_grep_results, row);
+        xf_value_release(row);
+        xf_map_release(m);
+
+        if (tl_grep_max && tl_grep_results->len >= tl_grep_max)
+            break;
+    }
+    fclose(fp);
+}
+
+#ifdef __linux__
+#include <ftw.h>
+static int grep_nftw_cb(const char *path, const struct stat *sb,
+                         int typeflag, struct FTW *ftwbuf) {
+    (void)sb; (void)ftwbuf;
+    if (typeflag == FTW_F) grep_file(path);
+    if (tl_grep_max && tl_grep_results->len >= tl_grep_max) return 1; /* stop */
+    return 0;
+}
+#endif
+
+static void grep_walk(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+
+    if (S_ISREG(st.st_mode)) {
+        grep_file(path);
+        return;
+    }
+
+    if (!S_ISDIR(st.st_mode)) return;
+
+#ifdef __linux__
+    nftw(path, grep_nftw_cb, 64, FTW_PHYS);
+#else
+    /* Portable fallback: manual opendir recursion */
+    DIR *d = opendir(path);
+    if (!d) return;
+    struct dirent *ent;
+    char child[4096];
+    while ((ent = readdir(d))) {
+        if (ent->d_name[0] == '.') continue;
+        snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
+        grep_walk(child);   /* recurse */
+        if (tl_grep_max && tl_grep_results->len >= tl_grep_max) break;
+    }
+    closedir(d);
+#endif
+}
+
+/* core.os.grep(pattern, path [, flags_str [, max_results]]) -> arr<map> */
+static xf_Value csy_grep(xf_Value *args, size_t argc) {
+    NEED(2);
+    const char *pat, *path;
+    size_t patlen, pathlen;
+    if (!arg_str(args, argc, 0, &pat,  &patlen))  return propagate(args, argc);
+    if (!arg_str(args, argc, 1, &path, &pathlen)) return propagate(args, argc);
+
+    int cflags = REG_EXTENDED;
+    if (argc >= 3 && args[2].state == XF_STATE_OK &&
+        args[2].type == XF_TYPE_STR && args[2].data.str) {
+        const char *fs = args[2].data.str->data;
+        for (; *fs; fs++) {
+            if (*fs == 'i' || *fs == 'I') cflags |= REG_ICASE;
+            if (*fs == 'm' || *fs == 'M') cflags |= REG_NEWLINE;
+        }
+    }
+
+    double dmax = 0.0;
+    if (argc >= 4) arg_num(args, argc, 3, &dmax);
+
+    regex_t re;
+    char errmsg[256];
+    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
+        return xf_val_nav(XF_TYPE_ARR);
+
+    xf_arr_t *results = xf_arr_new();
+
+    tl_grep_re      = &re;
+    tl_grep_results = results;
+    tl_grep_max     = (size_t)(dmax > 0 ? dmax : 0);
+
+    grep_walk(path);
+
+    tl_grep_re      = NULL;
+    tl_grep_results = NULL;
+    tl_grep_max     = 0;
+
+    regfree(&re);
+    xf_Value rv = xf_val_ok_arr(results);
+    xf_arr_release(results);
+    return rv;
+}
 xf_module_t *build_os(void) {
     xf_module_t *m = xf_module_new("core.os");
     FN("execute",   XF_TYPE_NUM,  csy_execute);
@@ -250,5 +390,6 @@ xf_module_t *build_os(void) {
     FN("run",       XF_TYPE_STR,  csy_run);
     FN("run_lines", XF_TYPE_ARR,  csy_run_lines);
     FN("free",      XF_TYPE_VOID, csy_free);
+    FN("grep", XF_TYPE_ARR, csy_grep);
     return m;
 }

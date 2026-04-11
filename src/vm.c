@@ -1,43 +1,525 @@
 #if defined(__linux__) || defined(__CYGWIN__)
 #  define _GNU_SOURCE
 #endif
-#include "../include/value.h"
+
 #include "../include/vm.h"
-#include "../include/ast.h"
-#include <pthread.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdarg.h>
-#include <assert.h>
 
 /* ============================================================
  * Chunk
  * ============================================================ */
+static xf_Value val_add(xf_Value a, xf_Value b);
+static xf_Value val_sub(xf_Value a, xf_Value b);
+static xf_Value val_mul(xf_Value a, xf_Value b);
+static xf_Value val_div(VM *vm, xf_Value a, xf_Value b);
+static xf_Value val_mod(VM *vm, xf_Value a, xf_Value b);
+static int      val_cmp(xf_Value a, xf_Value b);
+static xf_Value val_concat(xf_Value a, xf_Value b);
+static uint32_t read_u32(const Chunk *c, size_t off);
+static xf_Value vm_call_compiled_fn(VM *vm, Chunk *chunk, xf_Value *args, size_t argc) {
+    if (!vm || !chunk) return xf_val_nav(XF_TYPE_VOID);
 
+    if (vm->frame_count >= VM_FRAMES_MAX) {
+        vm_error(vm, "call stack overflow");
+        return xf_val_nav(XF_TYPE_VOID);
+    }
+
+    CallFrame *frame = &vm->frames[vm->frame_count++];
+    memset(frame, 0, sizeof(*frame));
+    frame->chunk = chunk;
+    frame->ip = 0;
+    frame->return_val = xf_val_null();
+
+    for (size_t i = 0; i < argc && i < 256; i++) {
+        frame->locals[i] = xf_value_retain(args[i]);
+        frame->local_count = i + 1;
+    }
+
+    for (;;) {
+        if (frame->ip >= frame->chunk->len) break;
+
+        OpCode op = (OpCode)frame->chunk->code[frame->ip++];
+        xf_Value a, b;
+
+        switch (op) {
+            case OP_NOP:
+                break;
+
+            case OP_HALT:
+                goto done;
+
+            case OP_PUSH_NUM: {
+                uint64_t bits = 0;
+                for (int i = 0; i < 8; i++) bits = (bits << 8) | frame->chunk->code[frame->ip++];
+                double v;
+                memcpy(&v, &bits, 8);
+                vm_push(vm, xf_val_ok_num(v));
+                break;
+            }
+
+            case OP_PUSH_STR: {
+                uint32_t idx =
+                    ((uint32_t)frame->chunk->code[frame->ip] << 24) |
+                    ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
+                    ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
+                    (uint32_t)frame->chunk->code[frame->ip + 3];
+                frame->ip += 4;
+                vm_push(vm, frame->chunk->consts[idx]);
+                break;
+            }
+
+            case OP_PUSH_TRUE:  vm_push(vm, xf_val_true()); break;
+            case OP_PUSH_FALSE: vm_push(vm, xf_val_false()); break;
+            case OP_PUSH_NULL:  vm_push(vm, xf_val_null()); break;
+            case OP_PUSH_UNDEF: vm_push(vm, xf_val_undef(XF_TYPE_VOID)); break;
+
+            case OP_POP:
+                xf_value_release(vm_pop(vm));
+                break;
+
+            case OP_DUP:
+                vm_push(vm, vm_peek(vm, 0));
+                break;
+
+            case OP_SWAP: {
+                xf_Value top = vm_pop(vm);
+                xf_Value sec = vm_pop(vm);
+                vm_push(vm, top);
+                vm_push(vm, sec);
+                xf_value_release(top);
+                xf_value_release(sec);
+                break;
+            }
+                    case OP_GET_MEMBER: {
+                    uint32_t idx = read_u32(frame->chunk, frame->ip);
+frame->ip += 4;
+
+            if (idx >= frame->chunk->const_len) {
+                vm_error(vm, "GET_MEMBER constant index out of range");
+                goto err;
+            }
+
+            xf_Value obj = vm_pop(vm);
+            xf_Value keyv = frame->chunk->consts[idx];
+
+            if (keyv.state != XF_STATE_OK || keyv.type != XF_TYPE_STR || !keyv.data.str) {
+                xf_value_release(obj);
+                vm_error(vm, "GET_MEMBER requires string field name");
+                goto err;
+            }
+
+            const char *field = keyv.data.str->data;
+            xf_Value out = xf_val_nav(XF_TYPE_VOID);
+
+            if (obj.state == XF_STATE_OK &&
+                obj.type == XF_TYPE_MODULE &&
+                obj.data.mod) {
+                out = xf_module_get(obj.data.mod, field);
+            }
+
+            xf_value_release(obj);
+            vm_push(vm, out);
+            xf_value_release(out);
+            break;
+        }
+
+            case OP_LOAD_LOCAL: {
+                uint8_t slot = frame->chunk->code[frame->ip++];
+                vm_push(vm, frame->locals[slot]);
+                break;
+            }
+        case OP_STORE_LOCAL: {
+        uint8_t slot = frame->chunk->code[frame->ip++];
+            xf_value_release(frame->locals[slot]);
+            frame->locals[slot] = xf_value_retain(vm_peek(vm, 0));
+            if (frame->local_count <= slot) frame->local_count = slot + 1;
+            break;
+        }
+
+            case OP_LOAD_GLOBAL: {
+                uint32_t idx =
+                    ((uint32_t)frame->chunk->code[frame->ip] << 24) |
+                    ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
+                    ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
+                    (uint32_t)frame->chunk->code[frame->ip + 3];
+                frame->ip += 4;
+                vm_push(vm, idx < vm->global_count ? vm->globals[idx] : xf_val_undef(XF_TYPE_VOID));
+                break;
+            }
+
+                    case OP_STORE_GLOBAL: {
+                    uint32_t idx =
+    ((uint32_t)frame->chunk->code[frame->ip] << 24) |
+    ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
+    ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
+    (uint32_t)frame->chunk->code[frame->ip + 3];
+frame->ip += 4;
+            if (idx < vm->global_count) {
+                xf_value_release(vm->globals[idx]);
+                vm->globals[idx] = xf_value_retain(vm_peek(vm, 0));
+            }
+            break;
+        }
+            case OP_ADD: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value r = val_add(a, b);
+                vm_push(vm, r);
+                xf_value_release(a);
+                xf_value_release(b);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_SUB: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value r = val_sub(a, b);
+                vm_push(vm, r);
+                xf_value_release(a);
+                xf_value_release(b);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_MUL: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value r = val_mul(a, b);
+                vm_push(vm, r);
+                xf_value_release(a);
+                xf_value_release(b);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_DIV: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value r = val_div(vm, a, b);
+                vm_push(vm, r);
+                xf_value_release(a);
+                xf_value_release(b);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_MOD: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value r = val_mod(vm, a, b);
+                vm_push(vm, r);
+                xf_value_release(a);
+                xf_value_release(b);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_NEG: {
+                a = vm_pop(vm);
+                xf_Value na = xf_coerce_num(a);
+                if (na.state == XF_STATE_OK) {
+                    xf_Value r = xf_val_ok_num(-na.data.num);
+                    vm_push(vm, r);
+                    xf_value_release(r);
+                } else {
+                    vm_push(vm, na);
+                }
+                xf_value_release(a);
+                xf_value_release(na);
+                break;
+            }
+
+            case OP_EQ: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value r = xf_val_ok_num(val_cmp(a, b) == 0 ? 1.0 : 0.0);
+                vm_push(vm, r);
+                xf_value_release(a);
+                xf_value_release(b);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_NEQ: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value r = xf_val_ok_num(val_cmp(a, b) != 0 ? 1.0 : 0.0);
+                vm_push(vm, r);
+                xf_value_release(a);
+                xf_value_release(b);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_LT: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value r = xf_val_ok_num(val_cmp(a, b) < 0 ? 1.0 : 0.0);
+                vm_push(vm, r);
+                xf_value_release(a);
+                xf_value_release(b);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_GT: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value r = xf_val_ok_num(val_cmp(a, b) > 0 ? 1.0 : 0.0);
+                vm_push(vm, r);
+                xf_value_release(a);
+                xf_value_release(b);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_LTE: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value r = xf_val_ok_num(val_cmp(a, b) <= 0 ? 1.0 : 0.0);
+                vm_push(vm, r);
+                xf_value_release(a);
+                xf_value_release(b);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_GTE: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value r = xf_val_ok_num(val_cmp(a, b) >= 0 ? 1.0 : 0.0);
+                vm_push(vm, r);
+                xf_value_release(a);
+                xf_value_release(b);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_CONCAT: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value r = val_concat(a, b);
+                vm_push(vm, r);
+                xf_value_release(a);
+                xf_value_release(b);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_GET_LEN: {
+                a = vm_pop(vm);
+                xf_Value r;
+                if (a.state != XF_STATE_OK) {
+                    r = xf_value_retain(a);
+                } else {
+                    switch (a.type) {
+                        case XF_TYPE_STR:   r = xf_val_ok_num(a.data.str ? (double)a.data.str->len : 0.0); break;
+                        case XF_TYPE_ARR:   r = xf_val_ok_num(a.data.arr ? (double)a.data.arr->len : 0.0); break;
+                        case XF_TYPE_TUPLE: r = xf_val_ok_num(a.data.tuple ? (double)xf_tuple_len(a.data.tuple) : 0.0); break;
+                        case XF_TYPE_MAP:   r = xf_val_ok_num(a.data.map ? (double)xf_map_count(a.data.map) : 0.0); break;
+                        case XF_TYPE_SET:   r = xf_val_ok_num(a.data.set ? (double)xf_set_count(a.data.set) : 0.0); break;
+                        default:            r = xf_val_nav(XF_TYPE_NUM); break;
+                    }
+                }
+                xf_value_release(a);
+                vm_push(vm, r);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_GET_IDX: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value out = xf_val_nav(XF_TYPE_VOID);
+
+                if (a.state != XF_STATE_OK) {
+                    out = xf_value_retain(a);
+                } else if (b.state != XF_STATE_OK) {
+                    out = xf_value_retain(b);
+                } else if (a.type == XF_TYPE_ARR) {
+                    xf_Value nk = xf_coerce_num(b);
+                    if (nk.state == XF_STATE_OK && a.data.arr) {
+                        long idx = (long)nk.data.num;
+                        if (idx >= 0 && (size_t)idx < a.data.arr->len)
+                            out = xf_arr_get(a.data.arr, (size_t)idx);
+                    }
+                    xf_value_release(nk);
+                } else if (a.type == XF_TYPE_TUPLE) {
+                    xf_Value nk = xf_coerce_num(b);
+                    if (nk.state == XF_STATE_OK && a.data.tuple) {
+                        long idx = (long)nk.data.num;
+                        if (idx >= 0 && (size_t)idx < xf_tuple_len(a.data.tuple))
+                            out = xf_tuple_get(a.data.tuple, (size_t)idx);
+                    }
+                    xf_value_release(nk);
+                } else if (a.type == XF_TYPE_MAP) {
+                    xf_Value ks = xf_coerce_str(b);
+                    if (ks.state == XF_STATE_OK && ks.data.str && a.data.map)
+                        out = xf_map_get(a.data.map, ks.data.str);
+                    xf_value_release(ks);
+                } else if (a.type == XF_TYPE_STR) {
+                    xf_Value nk = xf_coerce_num(b);
+                    if (nk.state == XF_STATE_OK && a.data.str) {
+                        long idx = (long)nk.data.num;
+                        if (idx >= 0 && (size_t)idx < a.data.str->len) {
+                            char ch[2] = { a.data.str->data[idx], '\0' };
+                            xf_Str *s = xf_str_from_cstr(ch);
+                            out = xf_val_ok_str(s);
+                            xf_str_release(s);
+                        }
+                    }
+                    xf_value_release(nk);
+                }
+
+                xf_value_release(a);
+                xf_value_release(b);
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
+            }
+
+            case OP_JUMP: {
+                int16_t delta = (int16_t)((frame->chunk->code[frame->ip] << 8) | frame->chunk->code[frame->ip + 1]);
+                frame->ip += 2;
+                frame->ip += (size_t)((int)delta);
+                break;
+            }
+
+            case OP_JUMP_IF: {
+                int16_t delta = (int16_t)((frame->chunk->code[frame->ip] << 8) | frame->chunk->code[frame->ip + 1]);
+                frame->ip += 2;
+                a = vm_pop(vm);
+                if (((a.state == XF_STATE_TRUE) ||
+                     (a.state == XF_STATE_OK && a.type == XF_TYPE_NUM && a.data.num != 0.0))) {
+                    frame->ip += (size_t)((int)delta);
+                }
+                xf_value_release(a);
+                break;
+            }
+
+            case OP_JUMP_NOT: {
+                int16_t delta = (int16_t)((frame->chunk->code[frame->ip] << 8) | frame->chunk->code[frame->ip + 1]);
+                frame->ip += 2;
+                a = vm_pop(vm);
+                bool truth =
+                    (a.state == XF_STATE_TRUE) ||
+                    (a.state == XF_STATE_OK && a.type == XF_TYPE_NUM && a.data.num != 0.0);
+                if (!truth) frame->ip += (size_t)((int)delta);
+                xf_value_release(a);
+                break;
+            }
+
+            case OP_RETURN:
+                frame->return_val = vm_pop(vm);
+                goto done;
+
+            case OP_RETURN_NULL:
+                frame->return_val = xf_val_null();
+                goto done;
+
+            case OP_CALL: {
+                uint8_t argc_u8 = frame->chunk->code[frame->ip++];
+                size_t argc2 = (size_t)argc_u8;
+                xf_Value argv2[64];
+
+                if (argc2 > 64) {
+                    vm_error(vm, "too many call args");
+                    goto err;
+                }
+
+                for (int i = (int)argc2 - 1; i >= 0; i--) {
+                    argv2[i] = vm_pop(vm);
+                }
+
+                xf_Value callee = vm_pop(vm);
+
+                if (callee.state != XF_STATE_OK || callee.type != XF_TYPE_FN || !callee.data.fn) {
+                    for (size_t i = 0; i < argc2; i++) xf_value_release(argv2[i]);
+                    xf_value_release(callee);
+                    vm_error(vm, "attempt to call non-function");
+                    goto err;
+                }
+
+                xf_fn_t *fn = callee.data.fn;
+                xf_Value ret = xf_val_null();
+
+                if (fn->is_native && fn->native_v) {
+                    ret = fn->native_v(argv2, argc2);
+                } else {
+                    Chunk *fn_chunk = (Chunk *)fn->body;
+                    ret = vm_call_compiled_fn(vm, fn_chunk, argv2, argc2);
+                }
+
+                for (size_t i = 0; i < argc2; i++) xf_value_release(argv2[i]);
+                xf_value_release(callee);
+
+                vm_push(vm, ret);
+                xf_value_release(ret);
+                break;
+            }
+
+            default:
+                vm_error(vm, "opcode not implemented in compiled fn: %d", op);
+                goto err;
+        }
+
+        if (vm->had_error) goto err;
+    }
+
+done: {
+        xf_Value ret = frame->return_val;
+
+        for (size_t i = 0; i < frame->local_count; i++) {
+            xf_value_release(frame->locals[i]);
+        }
+        frame->local_count = 0;
+
+        vm->frame_count--;
+        return ret;
+    }
+
+err:
+    for (size_t i = 0; i < frame->local_count; i++) {
+        xf_value_release(frame->locals[i]);
+    }
+    frame->local_count = 0;
+    vm->frame_count--;
+    return xf_val_nav(XF_TYPE_VOID);
+}
 void chunk_init(Chunk *c, const char *source) {
     memset(c, 0, sizeof(*c));
     c->source    = source;
     c->cap       = 64;
     c->code      = malloc(c->cap);
+    c->lines     = malloc(sizeof(uint32_t) * c->cap);
     c->const_cap = 16;
     c->consts    = malloc(sizeof(xf_Value) * c->const_cap);
-    c->lines     = malloc(sizeof(uint32_t) * c->cap);
 }
 
 void chunk_free(Chunk *c) {
+    if (!c) return;
+
+    for (size_t i = 0; i < c->const_len; i++) {
+        xf_value_release(c->consts[i]);
+    }
+
     free(c->code);
-    free(c->consts);
     free(c->lines);
+    free(c->consts);
     memset(c, 0, sizeof(*c));
 }
 
 static void chunk_grow(Chunk *c) {
     if (c->len >= c->cap) {
-        c->cap   *= 2;
-        c->code   = realloc(c->code,  c->cap);
-        c->lines  = realloc(c->lines, sizeof(uint32_t) * c->cap);
+        c->cap *= 2;
+        c->code  = realloc(c->code, c->cap);
+        c->lines = realloc(c->lines, sizeof(uint32_t) * c->cap);
     }
 }
 
@@ -49,22 +531,23 @@ void chunk_write(Chunk *c, uint8_t byte, uint32_t line) {
 }
 
 void chunk_write_u16(Chunk *c, uint16_t v, uint32_t line) {
-    chunk_write(c, (v >> 8) & 0xff, line);
-    chunk_write(c,  v       & 0xff, line);
+    chunk_write(c, (uint8_t)((v >> 8) & 0xff), line);
+    chunk_write(c, (uint8_t)(v & 0xff), line);
 }
 
 void chunk_write_u32(Chunk *c, uint32_t v, uint32_t line) {
-    chunk_write(c, (v >> 24) & 0xff, line);
-    chunk_write(c, (v >> 16) & 0xff, line);
-    chunk_write(c, (v >>  8) & 0xff, line);
-    chunk_write(c,  v        & 0xff, line);
+    chunk_write(c, (uint8_t)((v >> 24) & 0xff), line);
+    chunk_write(c, (uint8_t)((v >> 16) & 0xff), line);
+    chunk_write(c, (uint8_t)((v >> 8) & 0xff), line);
+    chunk_write(c, (uint8_t)(v & 0xff), line);
 }
 
 void chunk_write_f64(Chunk *c, double v, uint32_t line) {
     uint64_t bits;
     memcpy(&bits, &v, 8);
-    for (int i = 7; i >= 0; i--)
-        chunk_write(c, (bits >> (i * 8)) & 0xff, line);
+    for (int i = 7; i >= 0; i--) {
+        chunk_write(c, (uint8_t)((bits >> (i * 8)) & 0xff), line);
+    }
 }
 
 uint32_t chunk_add_const(Chunk *c, xf_Value v) {
@@ -72,7 +555,7 @@ uint32_t chunk_add_const(Chunk *c, xf_Value v) {
         c->const_cap *= 2;
         c->consts = realloc(c->consts, sizeof(xf_Value) * c->const_cap);
     }
-    c->consts[c->const_len] = v;
+    c->consts[c->const_len] = xf_value_retain(v);
     return (uint32_t)c->const_len++;
 }
 
@@ -80,262 +563,259 @@ uint32_t chunk_add_str_const(Chunk *c, const char *s, size_t len) {
     xf_Str *str = xf_str_new(s, len);
     xf_Value v  = xf_val_ok_str(str);
     xf_str_release(str);
-    return chunk_add_const(c, v);
+    uint32_t idx = chunk_add_const(c, v);
+    xf_value_release(v);
+    return idx;
 }
 
 void chunk_patch_jump(Chunk *c, size_t pos, int16_t offset) {
     c->code[pos]   = (uint8_t)((offset >> 8) & 0xff);
-    c->code[pos+1] = (uint8_t)( offset        & 0xff);
+    c->code[pos+1] = (uint8_t)(offset & 0xff);
 }
 
-/* ── disassembler ─────────────────────────────────────────── */
+/* ============================================================
+ * Disasm
+ * ============================================================ */
 
 const char *opcode_name(OpCode op) {
     switch (op) {
-        case OP_PUSH_NUM:    return "PUSH_NUM";
-        case OP_PUSH_STR:    return "PUSH_STR";
-        case OP_PUSH_TRUE:   return "PUSH_TRUE";
-        case OP_PUSH_FALSE:  return "PUSH_FALSE";
-        case OP_PUSH_NULL:   return "PUSH_NULL";
-        case OP_PUSH_UNDEF:  return "PUSH_UNDEF";
-        case OP_POP:         return "POP";
-        case OP_DUP:         return "DUP";
-        case OP_SWAP:        return "SWAP";
-        case OP_LOAD_LOCAL:  return "LOAD_LOCAL";
+        case OP_PUSH_NUM: return "PUSH_NUM";
+        case OP_PUSH_STR: return "PUSH_STR";
+        case OP_GET_KEYS: return "GET_KEYS";
+        case OP_STORE_FS: return "STORE_FS";
+        case OP_STORE_RS: return "STORE_RS";
+        case OP_STORE_OFS: return "STORE_OFS";
+        case OP_STORE_ORS: return "STORE_ORS";
+        case OP_PUSH_TRUE: return "PUSH_TRUE";
+        case OP_PUSH_FALSE: return "PUSH_FALSE";
+        case OP_PUSH_NULL: return "PUSH_NULL";
+        case OP_PUSH_UNDEF: return "PUSH_UNDEF";
+        case OP_POP: return "POP";
+        case OP_DUP: return "DUP";
+        case OP_SWAP: return "SWAP";
+        case OP_LOAD_LOCAL: return "LOAD_LOCAL";
         case OP_STORE_LOCAL: return "STORE_LOCAL";
         case OP_LOAD_GLOBAL: return "LOAD_GLOBAL";
-        case OP_STORE_GLOBAL:return "STORE_GLOBAL";
-        case OP_LOAD_FIELD:  return "LOAD_FIELD";
+        case OP_STORE_GLOBAL: return "STORE_GLOBAL";
+        case OP_LOAD_FIELD: return "LOAD_FIELD";
         case OP_STORE_FIELD: return "STORE_FIELD";
-        case OP_LOAD_NR:     return "LOAD_NR";
-        case OP_LOAD_NF:     return "LOAD_NF";
-        case OP_LOAD_FNR:    return "LOAD_FNR";
-        case OP_LOAD_FS:     return "LOAD_FS";
-        case OP_LOAD_RS:     return "LOAD_RS";
-        case OP_LOAD_OFS:    return "LOAD_OFS";
-        case OP_LOAD_ORS:    return "LOAD_ORS";
-        case OP_ADD:         return "ADD";
-        case OP_SUB:         return "SUB";
-        case OP_MUL:         return "MUL";
-        case OP_DIV:         return "DIV";
-        case OP_MOD:         return "MOD";
-        case OP_POW:         return "POW";
-        case OP_NEG:         return "NEG";
-        case OP_EQ:          return "EQ";
-        case OP_NEQ:         return "NEQ";
-        case OP_LT:          return "LT";
-        case OP_GT:          return "GT";
-        case OP_LTE:         return "LTE";
-        case OP_GTE:         return "GTE";
-        case OP_SPACESHIP:   return "SPACESHIP";
-        case OP_AND:         return "AND";
-        case OP_OR:          return "OR";
-        case OP_NOT:         return "NOT";
-        case OP_CONCAT:      return "CONCAT";
-        case OP_MATCH:       return "MATCH";
-        case OP_NMATCH:      return "NMATCH";
-        case OP_GET_STATE:   return "GET_STATE";
-        case OP_GET_TYPE:    return "GET_TYPE";
-        case OP_COALESCE:    return "COALESCE";
-        case OP_MAKE_ARR:    return "MAKE_ARR";
-        case OP_MAKE_MAP:    return "MAKE_MAP";
-        case OP_MAKE_SET:    return "MAKE_SET";
-        case OP_GET_IDX:     return "GET_IDX";
-        case OP_SET_IDX:     return "SET_IDX";
-        case OP_DELETE_IDX:  return "DELETE_IDX";
-        case OP_CALL:        return "CALL";
-        case OP_RETURN:      return "RETURN";
+        case OP_LOAD_NR: return "LOAD_NR";
+        case OP_LOAD_NF: return "LOAD_NF";
+        case OP_LOAD_FNR: return "LOAD_FNR";
+        case OP_LOAD_FS: return "LOAD_FS";
+        case OP_LOAD_RS: return "LOAD_RS";
+        case OP_LOAD_OFS: return "LOAD_OFS";
+        case OP_LOAD_ORS: return "LOAD_ORS";
+        case OP_ADD: return "ADD";
+        case OP_SUB: return "SUB";
+        case OP_MUL: return "MUL";
+        case OP_DIV: return "DIV";
+        case OP_MOD: return "MOD";
+        case OP_POW: return "POW";
+        case OP_NEG: return "NEG";
+        case OP_EQ: return "EQ";
+        case OP_NEQ: return "NEQ";
+        case OP_LT: return "LT";
+        case OP_GT: return "GT";
+        case OP_LTE: return "LTE";
+        case OP_GTE: return "GTE";
+        case OP_SPACESHIP: return "SPACESHIP";
+        case OP_AND: return "AND";
+        case OP_OR: return "OR";
+        case OP_NOT: return "NOT";
+        case OP_CONCAT: return "CONCAT";
+        case OP_MATCH: return "MATCH";
+        case OP_NMATCH: return "NMATCH";
+        case OP_GET_STATE: return "GET_STATE";
+        case OP_GET_TYPE: return "GET_TYPE";
+        case OP_COALESCE: return "COALESCE";
+        case OP_CALL: return "CALL";
+        case OP_RETURN: return "RETURN";
         case OP_RETURN_NULL: return "RETURN_NULL";
-        case OP_SPAWN:       return "SPAWN";
-        case OP_JOIN:        return "JOIN";
-        case OP_YIELD:       return "YIELD";
-        case OP_PRINT:       return "PRINT";
-        case OP_SUBST:       return "SUBST";
-        case OP_TRANS:       return "TRANS";
-        case OP_JUMP:        return "JUMP";
-        case OP_JUMP_IF:     return "JUMP_IF";
-        case OP_JUMP_NOT:    return "JUMP_NOT";
-        case OP_JUMP_NAV:    return "JUMP_NAV";
+        case OP_SPAWN: return "SPAWN";
+        case OP_JOIN: return "JOIN";
+        case OP_PRINT: return "PRINT";
+        case OP_JUMP: return "JUMP";
+        case OP_MAKE_TUPLE: return "MAKE_TUPLE";
+        case OP_JUMP_IF: return "JUMP_IF";
+        case OP_JUMP_NOT: return "JUMP_NOT";
+        case OP_JUMP_NAV: return "JUMP_NAV";
         case OP_NEXT_RECORD: return "NEXT_RECORD";
-        case OP_EXIT:        return "EXIT";
-        case OP_NOP:         return "NOP";
-        case OP_HALT:        return "HALT";
-        default:             return "?";
+        case OP_EXIT: return "EXIT";
+        case OP_NOP: return "NOP";
+        case OP_HALT: return "HALT";
+        default: return "?";
     }
 }
 
 static uint16_t read_u16(const Chunk *c, size_t off) {
-    return (uint16_t)((c->code[off] << 8) | c->code[off+1]);
+    return (uint16_t)((c->code[off] << 8) | c->code[off + 1]);
 }
+
 static uint32_t read_u32(const Chunk *c, size_t off) {
-    return ((uint32_t)c->code[off]   << 24) |
-           ((uint32_t)c->code[off+1] << 16) |
-           ((uint32_t)c->code[off+2] <<  8) |
-            (uint32_t)c->code[off+3];
-}
-static double read_f64(const Chunk *c, size_t off) {
-    uint64_t bits = 0;
-    for (int i = 0; i < 8; i++) bits = (bits << 8) | c->code[off+i];
-    double v; memcpy(&v, &bits, 8); return v;
+    return ((uint32_t)c->code[off] << 24) |
+           ((uint32_t)c->code[off + 1] << 16) |
+           ((uint32_t)c->code[off + 2] << 8) |
+           (uint32_t)c->code[off + 3];
 }
 
 size_t chunk_disasm_instr(const Chunk *c, size_t off) {
     printf("%04zu  ", off);
-    if (off > 0 && c->lines[off] == c->lines[off-1])
-        printf("   | ");
-    else
-        printf("%4u ", c->lines[off]);
+    if (off > 0 && c->lines[off] == c->lines[off - 1]) printf("   | ");
+    else printf("%4u ", c->lines[off]);
 
     OpCode op = (OpCode)c->code[off++];
     printf("%-16s", opcode_name(op));
 
     switch (op) {
-        case OP_PUSH_NUM: {
-            double v = read_f64(c, off);
-            printf("  %g", v);
+        case OP_MAKE_ARR:
+case OP_MAKE_MAP:
+case OP_MAKE_SET:
+case OP_MAKE_TUPLE:
+    printf("  %u", read_u16(c, off));
+    off += 2;
+    break;
+        case OP_PUSH_NUM:
+            printf("  <f64>");
             off += 8;
             break;
-        }
-        case OP_PUSH_STR: {
-            uint32_t idx = read_u32(c, off);
-            xf_Value v   = c->consts[idx];
-            if (v.type == XF_TYPE_STR && v.data.str)
-                printf("  \"%s\"", v.data.str->data);
-            off += 4;
-            break;
-        }
-        case OP_LOAD_LOCAL:
-        case OP_STORE_LOCAL:
-        case OP_LOAD_FIELD:
-        case OP_STORE_FIELD:
-        case OP_CALL:
-        case OP_SPAWN:
-        case OP_PRINT:
-            printf("  %u", c->code[off++]);
-            break;
+        case OP_PUSH_STR:
         case OP_LOAD_GLOBAL:
         case OP_STORE_GLOBAL:
+        case OP_GET_MEMBER:
             printf("  %u", read_u32(c, off));
             off += 4;
+            break;
+        case OP_STORE_FIELD:
+        case OP_PRINT:
+        case OP_PRINTF:
+        case OP_CALL:
+        case OP_SPAWN:
+            printf("  %u", c->code[off++]);
             break;
         case OP_JUMP:
         case OP_JUMP_IF:
         case OP_JUMP_NOT:
         case OP_JUMP_NAV: {
             int16_t delta = (int16_t)read_u16(c, off);
-            printf("  %+d  (→ %zu)", delta, off + 2 + (size_t)delta);
+            printf("  %+d", delta);
             off += 2;
             break;
         }
-        case OP_MAKE_ARR:
-        case OP_MAKE_MAP:
-        case OP_MAKE_SET:
-            printf("  %u", read_u16(c, off));
-            off += 2;
+        default:
             break;
-        default: break;
     }
+
     printf("\n");
     return off;
 }
 
 void chunk_disasm(const Chunk *c, const char *name) {
     printf("== %s ==\n", name);
-    for (size_t off = 0; off < c->len; )
+    for (size_t off = 0; off < c->len; ) {
         off = chunk_disasm_instr(c, off);
+    }
 }
 
-
 /* ============================================================
- * VM — init / free
+ * VM init/free
  * ============================================================ */
 
 void vm_init(VM *vm, int max_jobs) {
     memset(vm, 0, sizeof(*vm));
-    vm->max_jobs   = max_jobs > 0 ? max_jobs : 1;
-    vm->global_cap = 64;
-    vm->globals    = malloc(sizeof(xf_Value) * vm->global_cap);
+    vm->max_jobs = max_jobs > 0 ? max_jobs : 1;
 
-    /* default record separators */
-    strcpy(vm->rec.fs,  " ");
-    strcpy(vm->rec.rs,  "\n");
-    strcpy(vm->rec.ofs,  " ");
-    strcpy(vm->rec.ors,  "\n");
+    vm->global_cap = 64;
+    vm->globals = calloc(vm->global_cap, sizeof(xf_Value));
+    vm->should_exit = false;
+    strcpy(vm->rec.fs, " ");
+    strcpy(vm->rec.rs, "\n");
+    strcpy(vm->rec.ofs, " ");
+    strcpy(vm->rec.ors, "\n");
     strcpy(vm->rec.ofmt, "%.6g");
-    vm->rec.out_mode       = 0;
-    vm->rec.headers        = NULL;
-    vm->rec.header_count   = 0;
-    vm->rec.current_file[0]= '\0';
-    vm->rec.last_match     = xf_val_null();
-    vm->rec.last_captures  = xf_val_null();
+
+    vm->rec.last_match = xf_val_null();
+    vm->rec.last_captures = xf_val_null();
+    vm->rec.last_err = xf_val_null();
 
     pthread_mutex_init(&vm->rec_mu, NULL);
 }
+static void inject_args(VM *vm, int argc, char **argv) {
+    xf_arr_t *arr = xf_arr_new();
+    if (!arr) return;
+
+    for (int i = 0; i < argc; i++) {
+        xf_Str *s = xf_str_new(argv[i], strlen(argv[i]));
+        xf_Value v = xf_val_ok_str(s);
+        xf_arr_push(arr, v);
+        xf_str_release(s);
+        xf_value_release(v);
+    }
+
+    xf_Value arrv = xf_val_ok_arr(arr);
+    uint32_t slot = vm_alloc_global(vm, arrv);
+    xf_arr_release(arr);
+    xf_value_release(arrv);
+
+    /* OPTIONAL: bind name "ARGS" → slot
+       If you want name lookup, you’ll hook this into compiler global map later */
+}
 
 void vm_free(VM *vm) {
+    if (!vm) return;
+
+    for (size_t i = 0; i < vm->global_count; i++) {
+        xf_value_release(vm->globals[i]);
+    }
     free(vm->globals);
+
     free(vm->rec.buf);
-    for (size_t i = 0; i < vm->rec.header_count; i++) free(vm->rec.headers[i]);
+    free(vm->rec.split_buf);
+
+    for (size_t i = 0; i < vm->rec.header_count; i++) {
+        free(vm->rec.headers[i]);
+    }
     free(vm->rec.headers);
+
     xf_value_release(vm->rec.last_match);
     xf_value_release(vm->rec.last_captures);
-    vm_redir_flush(vm);   /* close any cached redirect handles */
-    pthread_mutex_destroy(&vm->rec_mu);
-    /* rule chunks freed by interp */
+    xf_value_release(vm->rec.last_err);
+
+    if (vm->begin_chunk) {
+        chunk_free(vm->begin_chunk);
+        free(vm->begin_chunk);
+    }
+
+    if (vm->end_chunk) {
+        chunk_free(vm->end_chunk);
+        free(vm->end_chunk);
+    }
+
+    if (vm->rules) {
+        for (size_t i = 0; i < vm->rule_count; i++) {
+            if (vm->rules[i]) {
+                chunk_free(vm->rules[i]);
+                free(vm->rules[i]);
+            }
+        }
+    }
+
     free(vm->rules);
-    free(vm->patterns);
+
+    if (vm->patterns) {
+        for (size_t i = 0; i < vm->rule_count; i++) {
+            xf_value_release(vm->patterns[i]);
+        }
+        free(vm->patterns);
+    }
+
+    vm_redir_flush(vm);
+    pthread_mutex_destroy(&vm->rec_mu);
     memset(vm, 0, sizeof(*vm));
 }
 
 /* ============================================================
- * Redirect file handle cache
- * ============================================================ */
-
-/* Return (or open and cache) the FILE* for a redirect destination.
- * op: 1=write(>), 2=append(>>), 3=pipe(|)
- * Returns NULL on failure.
- * Write-mode (op==1) files are opened ONCE and kept open; subsequent
- * print statements append to the already-open file, which matches
- * POSIX awk semantics where ">" opens fresh only at program start. */
-FILE *vm_redir_open(VM *vm, const char *path, int op) {
-    /* search cache first */
-    for (size_t i = 0; i < vm->redir_count; i++) {
-        if (strcmp(vm->redir[i].path, path) == 0)
-            return vm->redir[i].fp;
-    }
-    /* not cached — open */
-    FILE *fp = NULL;
-    bool  is_pipe = (op == 3);
-    if (op == 3)      fp = popen(path, "w");
-    else if (op == 2) fp = fopen(path, "a");
-    else              fp = fopen(path, "w");
-    if (!fp) return NULL;
-    /* cache if room */
-    if (vm->redir_count < VM_REDIR_MAX) {
-        size_t n = vm->redir_count++;
-        strncpy(vm->redir[n].path, path, sizeof(vm->redir[n].path) - 1);
-        vm->redir[n].fp       = fp;
-        vm->redir[n].is_pipe  = is_pipe;
-    }
-    return fp;
-}
-
-/* Flush and close all cached redirect handles.
- * Called at program exit and between pattern-action cycles when needed. */
-void vm_redir_flush(VM *vm) {
-    for (size_t i = 0; i < vm->redir_count; i++) {
-        if (!vm->redir[i].fp) continue;
-        fflush(vm->redir[i].fp);
-        if (vm->redir[i].is_pipe) pclose(vm->redir[i].fp);
-        else                      fclose(vm->redir[i].fp);
-        vm->redir[i].fp = NULL;
-    }
-    vm->redir_count = 0;
-}
-
-
-/* ============================================================
- * Stack
+ * Stack / globals
  * ============================================================ */
 
 void vm_push(VM *vm, xf_Value v) {
@@ -343,7 +823,7 @@ void vm_push(VM *vm, xf_Value v) {
         vm_error(vm, "stack overflow");
         return;
     }
-    vm->stack[vm->stack_top++] = v;
+    vm->stack[vm->stack_top++] = xf_value_retain(v);
 }
 
 xf_Value vm_pop(VM *vm) {
@@ -359,23 +839,29 @@ xf_Value vm_peek(const VM *vm, int dist) {
     return vm->stack[vm->stack_top - 1 - dist];
 }
 
-
-/* ============================================================
- * Globals
- * ============================================================ */
-
 uint32_t vm_alloc_global(VM *vm, xf_Value init) {
     if (vm->global_count >= vm->global_cap) {
         vm->global_cap *= 2;
-        vm->globals = realloc(vm->globals, sizeof(xf_Value)*vm->global_cap);
+        vm->globals = realloc(vm->globals, sizeof(xf_Value) * vm->global_cap);
     }
-    vm->globals[vm->global_count] = init;
+    vm->globals[vm->global_count] = xf_value_retain(init);
     return (uint32_t)vm->global_count++;
 }
 
+xf_Value vm_get_global(VM *vm, uint32_t idx) {
+    if (!vm || idx >= vm->global_count) return xf_val_undef(XF_TYPE_VOID);
+    return xf_value_retain(vm->globals[idx]);
+}
+
+bool vm_set_global(VM *vm, uint32_t idx, xf_Value v) {
+    if (!vm || idx >= vm->global_count) return false;
+    xf_value_release(vm->globals[idx]);
+    vm->globals[idx] = xf_value_retain(v);
+    return true;
+}
 
 /* ============================================================
- * Error
+ * Errors
  * ============================================================ */
 
 void vm_error(VM *vm, const char *fmt, ...) {
@@ -384,120 +870,55 @@ void vm_error(VM *vm, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(vm->err_msg, sizeof(vm->err_msg), fmt, ap);
     va_end(ap);
-    fprintf(stderr, "ERR ─────────────────────────────────\n");
-    fprintf(stderr, "  %s\n", vm->err_msg);
-    if (vm->frame_count > 0) {
-        CallFrame *f = &vm->frames[vm->frame_count-1];
-        uint32_t line = f->ip < f->chunk->line_len ? f->chunk->lines[f->ip] : 0;
-        fprintf(stderr, "  at %s:%u\n", f->chunk->source, line);
-    }
-    fprintf(stderr, "─────────────────────────────────\n");
+    fprintf(stderr, "VM ERR: %s\n", vm->err_msg);
 }
 
 void vm_dump_stack(const VM *vm) {
-    printf("  stack [%zu]: ", vm->stack_top);
-    for (size_t i = 0; i < vm->stack_top && i < 8; i++) {
-        xf_value_repl_print(vm->stack[i]);
-        printf(" ");
-    }
-    printf("\n");
+    printf("stack[%zu]\n", vm->stack_top);
 }
 
+/* ============================================================
+ * Redirect stubs
+ * ============================================================ */
+
+FILE *vm_redir_open(VM *vm, const char *path, int op) {
+    (void)vm; (void)path; (void)op;
+    return NULL;
+}
+
+void vm_redir_flush(VM *vm) {
+    (void)vm;
+}
 
 /* ============================================================
  * Record splitting
  * ============================================================ */
 
-/* ============================================================
- * JSON header population
- * ============================================================ */
-
-/* Capture the current fields as column header names.
- * Call this after the first record is split when outfmt is JSON.
- * The captured strings are stripped of surrounding whitespace. */
-void vm_capture_headers(VM *vm) {
-    if (vm->rec.headers_set) return;
-    /* free any old headers */
-    for (size_t i = 0; i < vm->rec.header_count; i++) free(vm->rec.headers[i]);
-    free(vm->rec.headers);
-    vm->rec.headers      = NULL;
-    vm->rec.header_count = 0;
-
-    size_t n = vm->rec.field_count;
-    if (n == 0) { vm->rec.headers_set = true; return; }
-
-    vm->rec.headers = malloc(sizeof(char *) * n);
-    for (size_t i = 0; i < n; i++) {
-        const char *f = vm->rec.fields[i];
-        /* trim leading whitespace */
-        while (*f == ' ' || *f == '\t') f++;
-        size_t len = strlen(f);
-        /* trim trailing whitespace */
-        while (len > 0 && (f[len-1] == ' ' || f[len-1] == '\t')) len--;
-        vm->rec.headers[i] = malloc(len + 1);
-        memcpy(vm->rec.headers[i], f, len);
-        vm->rec.headers[i][len] = '\0';
-    }
-    vm->rec.header_count = n;
-    vm->rec.headers_set  = true;
-}
-
-/* ── CSV field splitter (RFC 4180) ───────────────────────────────────
- * Splits vm->rec.buf in-place into fields, honouring double-quote
- * quoting:  "" inside a quoted field becomes a literal ".
- * Returns the number of fields produced.                             */
-static size_t split_csv(VM *vm) {
-    char  *p     = vm->rec.buf;
-    size_t fc    = 0;
-    char   delim = vm->rec.fs[0] ? vm->rec.fs[0] : ',';
-
-    while (fc < FIELD_MAX - 1) {
-        if (*p == '"') {
-            /* quoted field — unescape "" → " in-place */
-            p++;
-            char *start = p, *w = p;
-            while (*p) {
-                if (p[0] == '"' && p[1] == '"') { *w++ = '"'; p += 2; }
-                else if (*p == '"')              { p++; break; }
-                else                             { *w++ = *p++; }
-            }
-            *w = '\0';
-            vm->rec.fields[fc++] = start;
-            if (*p == delim) p++;
-            else             break;
-        } else {
-            /* unquoted field */
-            char *start = p;
-            while (*p && *p != delim) p++;
-            if (*p == delim) { *p++ = '\0'; vm->rec.fields[fc++] = start; }
-            else             { vm->rec.fields[fc++] = start; break; }
-        }
-    }
-    return fc;
-}
-
 static void split_record(VM *vm, const char *rec, size_t len) {
     pthread_mutex_lock(&vm->rec_mu);
 
-    /* Reuse buffer when possible; only reallocate if it grew */
-    if (!vm->rec.buf || vm->rec.buf_len < len) {
-        free(vm->rec.buf);
-        vm->rec.buf = malloc(len + 1);
+    /* trim trailing newline / carriage return from input record */
+    while (len > 0 && (rec[len - 1] == '\n' || rec[len - 1] == '\r')) {
+        len--;
     }
+
+    /* preserve full raw record for $0 */
+    free(vm->rec.buf);
+    vm->rec.buf = malloc(len + 1);
     memcpy(vm->rec.buf, rec, len);
     vm->rec.buf[len] = '\0';
-    vm->rec.buf_len  = len;
+    vm->rec.buf_len = len;
 
-    const char *fs     = vm->rec.fs;
-    size_t      fs_len = strlen(fs);
-    size_t      fc     = 0;
+    /* separate mutable copy for field splitting */
+    free(vm->rec.split_buf);
+    vm->rec.split_buf = malloc(len + 1);
+    memcpy(vm->rec.split_buf, rec, len);
+    vm->rec.split_buf[len] = '\0';
+    vm->rec.split_buf_len = len;
 
-    if (vm->rec.in_mode == XF_OUTFMT_CSV && fs_len == 1) {
-        /* RFC 4180 quoted CSV */
-        fc = split_csv(vm);
-    } else if (fs_len == 1 && fs[0] == ' ') {
-        /* awk default: split on runs of whitespace */
-        char *p = vm->rec.buf;
+    size_t fc = 0;
+    char *p = vm->rec.split_buf;
+    if (vm->rec.fs[0] == ' ' && vm->rec.fs[1] == '\0') {
         while (*p) {
             while (*p == ' ' || *p == '\t') p++;
             if (!*p) break;
@@ -506,61 +927,69 @@ static void split_record(VM *vm, const char *rec, size_t len) {
             if (*p) *p++ = '\0';
             if (fc >= FIELD_MAX - 1) break;
         }
-    } else if (fs_len == 1) {
-        /* single-char delimiter — tight inner loop, no strncmp overhead */
-        char  sep = fs[0];
-        char *p   = vm->rec.buf;
-        vm->rec.fields[fc++] = p;
-        while (*p && fc < FIELD_MAX - 1) {
-            if (*p == sep) { *p++ = '\0'; vm->rec.fields[fc++] = p; }
-            else p++;
-        }
     } else {
-        /* multi-character delimiter */
-        char *p = vm->rec.buf;
+        char sep = vm->rec.fs[0] ? vm->rec.fs[0] : ' ';
         vm->rec.fields[fc++] = p;
         while (*p && fc < FIELD_MAX - 1) {
-            if (strncmp(p, fs, fs_len) == 0) {
-                *p = '\0'; p += fs_len;
+            if (*p == sep) {
+                *p++ = '\0';
                 vm->rec.fields[fc++] = p;
-            } else { p++; }
+            } else {
+                p++;
+            }
         }
     }
 
     vm->rec.field_count = fc;
     vm->rec.nr++;
     vm->rec.fnr++;
+
     pthread_mutex_unlock(&vm->rec_mu);
 }
+void vm_split_record(VM *vm, const char *rec, size_t len) {
+    split_record(vm, rec, len);
+}
 
+void vm_capture_headers(VM *vm) {
+    if (vm->rec.headers_set) return;
+
+    size_t n = vm->rec.field_count;
+    vm->rec.headers = calloc(n, sizeof(char *));
+    vm->rec.header_count = n;
+
+    for (size_t i = 0; i < n; i++) {
+        vm->rec.headers[i] = strdup(vm->rec.fields[i] ? vm->rec.fields[i] : "");
+    }
+
+    vm->rec.headers_set = true;
+}
 
 /* ============================================================
- * Value arithmetic helpers
+ * Small value helpers
  * ============================================================ */
 
 static bool is_truthy(xf_Value v) {
-    /* boolean states resolve without touching the data union */
-    if (v.state == XF_STATE_TRUE)  return true;
+    if (v.state == XF_STATE_TRUE) return true;
     if (v.state == XF_STATE_FALSE) return false;
     if (v.state != XF_STATE_OK) return false;
     if (v.type == XF_TYPE_BOOL) return v.data.num != 0.0;
-    if (v.type == XF_TYPE_NUM)  return v.data.num != 0.0;
-    if (v.type == XF_TYPE_STR)  return v.data.str && v.data.str->len > 0;
+    if (v.type == XF_TYPE_NUM) return v.data.num != 0.0;
+    if (v.type == XF_TYPE_STR) return v.data.str && v.data.str->len > 0;
     return true;
 }
 
-static xf_Value val_num(double n) { return xf_val_ok_num(n); }
+static xf_Value val_num(double n) {
+    return xf_val_ok_num(n);
+}
 
 static xf_Value val_add(xf_Value a, xf_Value b) {
     xf_Value na = xf_coerce_num(a);
-    if (na.state != XF_STATE_OK) return na;
-
     xf_Value nb = xf_coerce_num(b);
+    if (na.state != XF_STATE_OK) return na;
     if (nb.state != XF_STATE_OK) {
         xf_value_release(na);
         return nb;
     }
-
     xf_Value out = val_num(na.data.num + nb.data.num);
     xf_value_release(na);
     xf_value_release(nb);
@@ -569,14 +998,12 @@ static xf_Value val_add(xf_Value a, xf_Value b) {
 
 static xf_Value val_sub(xf_Value a, xf_Value b) {
     xf_Value na = xf_coerce_num(a);
-    if (na.state != XF_STATE_OK) return na;
-
     xf_Value nb = xf_coerce_num(b);
+    if (na.state != XF_STATE_OK) return na;
     if (nb.state != XF_STATE_OK) {
         xf_value_release(na);
         return nb;
     }
-
     xf_Value out = val_num(na.data.num - nb.data.num);
     xf_value_release(na);
     xf_value_release(nb);
@@ -585,14 +1012,12 @@ static xf_Value val_sub(xf_Value a, xf_Value b) {
 
 static xf_Value val_mul(xf_Value a, xf_Value b) {
     xf_Value na = xf_coerce_num(a);
-    if (na.state != XF_STATE_OK) return na;
-
     xf_Value nb = xf_coerce_num(b);
+    if (na.state != XF_STATE_OK) return na;
     if (nb.state != XF_STATE_OK) {
         xf_value_release(na);
         return nb;
     }
-
     xf_Value out = val_num(na.data.num * nb.data.num);
     xf_value_release(na);
     xf_value_release(nb);
@@ -600,10 +1025,11 @@ static xf_Value val_mul(xf_Value a, xf_Value b) {
 }
 
 static xf_Value val_div(VM *vm, xf_Value a, xf_Value b) {
-    xf_Value na = xf_coerce_num(a);
-    if (na.state != XF_STATE_OK) return na;
+    (void)vm;
 
+    xf_Value na = xf_coerce_num(a);
     xf_Value nb = xf_coerce_num(b);
+    if (na.state != XF_STATE_OK) return na;
     if (nb.state != XF_STATE_OK) {
         xf_value_release(na);
         return nb;
@@ -612,21 +1038,26 @@ static xf_Value val_div(VM *vm, xf_Value a, xf_Value b) {
     if (nb.data.num == 0.0) {
         xf_value_release(na);
         xf_value_release(nb);
-        vm_error(vm, "division by zero");
-        return xf_val_err(xf_err_new("division by zero", "<vm>", 0, 0), XF_TYPE_NUM);
+
+        xf_err_t *err = xf_err_new("division by zero", "<runtime>", 0, 0);
+        if (!err) return xf_val_nav(XF_TYPE_NUM);
+
+        xf_Value out = xf_val_err(err, XF_TYPE_NUM);
+        xf_err_release(err);
+        return out;
     }
 
-    xf_Value out = val_num(na.data.num / nb.data.num);
+    xf_Value out = xf_val_ok_num(na.data.num / nb.data.num);
     xf_value_release(na);
     xf_value_release(nb);
     return out;
 }
-
 static xf_Value val_mod(VM *vm, xf_Value a, xf_Value b) {
-    xf_Value na = xf_coerce_num(a);
-    if (na.state != XF_STATE_OK) return na;
+    (void)vm;
 
+    xf_Value na = xf_coerce_num(a);
     xf_Value nb = xf_coerce_num(b);
+    if (na.state != XF_STATE_OK) return na;
     if (nb.state != XF_STATE_OK) {
         xf_value_release(na);
         return nb;
@@ -635,26 +1066,28 @@ static xf_Value val_mod(VM *vm, xf_Value a, xf_Value b) {
     if (nb.data.num == 0.0) {
         xf_value_release(na);
         xf_value_release(nb);
-        vm_error(vm, "modulo by zero");
-        return xf_val_err(xf_err_new("modulo by zero", "<vm>", 0, 0), XF_TYPE_NUM);
+
+        xf_err_t *err = xf_err_new("modulo by zero", "<runtime>", 0, 0);
+        if (!err) return xf_val_nav(XF_TYPE_NUM);
+
+        xf_Value out = xf_val_err(err, XF_TYPE_NUM);
+        xf_err_release(err);
+        return out;
     }
 
-    xf_Value out = val_num(fmod(na.data.num, nb.data.num));
+    xf_Value out = xf_val_ok_num(fmod(na.data.num, nb.data.num));
     xf_value_release(na);
     xf_value_release(nb);
     return out;
 }
-
 static xf_Value val_pow(xf_Value a, xf_Value b) {
     xf_Value na = xf_coerce_num(a);
-    if (na.state != XF_STATE_OK) return na;
-
     xf_Value nb = xf_coerce_num(b);
+    if (na.state != XF_STATE_OK) return na;
     if (nb.state != XF_STATE_OK) {
         xf_value_release(na);
         return nb;
     }
-
     xf_Value out = val_num(pow(na.data.num, nb.data.num));
     xf_value_release(na);
     xf_value_release(nb);
@@ -663,40 +1096,29 @@ static xf_Value val_pow(xf_Value a, xf_Value b) {
 
 static xf_Value val_concat(xf_Value a, xf_Value b) {
     xf_Value sa = xf_coerce_str(a);
-    if (sa.state != XF_STATE_OK) return sa;
-
     xf_Value sb = xf_coerce_str(b);
+    if (sa.state != XF_STATE_OK) return sa;
     if (sb.state != XF_STATE_OK) {
         xf_value_release(sa);
         return sb;
     }
 
-    size_t la = sa.data.str->len, lb = sb.data.str->len;
-    char *buf = malloc(la + lb + 1);
-    if (!buf) {
-        xf_value_release(sa);
-        xf_value_release(sb);
-        return xf_val_nav(XF_TYPE_STR);
-    }
+    size_t la = sa.data.str ? sa.data.str->len : 0;
+    size_t lb = sb.data.str ? sb.data.str->len : 0;
 
-    memcpy(buf, sa.data.str->data, la);
-    memcpy(buf + la, sb.data.str->data, lb);
+    char *buf = malloc(la + lb + 1);
+    memcpy(buf, sa.data.str ? sa.data.str->data : "", la);
+    memcpy(buf + la, sb.data.str ? sb.data.str->data : "", lb);
     buf[la + lb] = '\0';
 
     xf_Str *s = xf_str_new(buf, la + lb);
     free(buf);
 
-    if (!s) {
-        xf_value_release(sa);
-        xf_value_release(sb);
-        return xf_val_nav(XF_TYPE_STR);
-    }
-
-    xf_Value r = xf_val_ok_str(s);
+    xf_Value out = xf_val_ok_str(s);
     xf_str_release(s);
     xf_value_release(sa);
     xf_value_release(sb);
-    return r;
+    return out;
 }
 
 static int val_cmp(xf_Value a, xf_Value b) {
@@ -717,7 +1139,6 @@ static int val_cmp(xf_Value a, xf_Value b) {
 
     xf_Value sa = xf_coerce_str(a);
     xf_Value sb = xf_coerce_str(b);
-
     if (sa.state == XF_STATE_OK && sb.state == XF_STATE_OK) {
         int out = strcmp(sa.data.str->data, sb.data.str->data);
         xf_value_release(sa);
@@ -731,7 +1152,7 @@ static int val_cmp(xf_Value a, xf_Value b) {
 }
 
 /* ============================================================
- * Core execution loop
+ * Execution loop
  * ============================================================ */
 
 #define READ_U8()  (frame->chunk->code[frame->ip++])
@@ -741,22 +1162,18 @@ static int val_cmp(xf_Value a, xf_Value b) {
     ((uint32_t)frame->chunk->code[frame->ip-3] << 16) | \
     ((uint32_t)frame->chunk->code[frame->ip-2] <<  8) | \
      (uint32_t)frame->chunk->code[frame->ip-1])
-#define READ_F64() (frame->ip += 8, ({ \
-    uint64_t _b = 0; \
-    for (int _i = 8; _i > 0; _i--) _b = (_b << 8) | frame->chunk->code[frame->ip - _i]; \
-    double _v; memcpy(&_v, &_b, 8); _v; }))
 
 VMResult vm_run_chunk(VM *vm, Chunk *chunk) {
+    if (!vm || !chunk) return VM_ERR;
+
     if (vm->frame_count >= VM_FRAMES_MAX) {
         vm_error(vm, "call stack overflow");
         return VM_ERR;
     }
 
     CallFrame *frame = &vm->frames[vm->frame_count++];
-    frame->chunk       = chunk;
-    frame->ip          = 0;
-    frame->local_count = 0;
-    frame->sched_state = XF_STATE_UNDEF;
+    memset(frame, 0, sizeof(*frame));
+    frame->chunk = chunk;
 
     for (;;) {
         if (frame->ip >= frame->chunk->len) break;
@@ -765,259 +1182,827 @@ VMResult vm_run_chunk(VM *vm, Chunk *chunk) {
         xf_Value a, b;
 
         switch (op) {
+            case OP_NOP:
+                break;
 
-        case OP_NOP: break;
-        case OP_HALT: goto done;
+            case OP_HALT:
+                goto done;
+        case OP_DELETE_IDX: {
+            xf_Value key = vm_pop(vm);
+            xf_Value obj = vm_pop(vm);
 
-        case OP_PUSH_NUM: {
-            uint64_t bits = 0;
-            for (int i = 0; i < 8; i++)
-                bits = (bits << 8) | frame->chunk->code[frame->ip++];
-            double v; memcpy(&v, &bits, 8);
-            vm_push(vm, val_num(v));
-            break;
-        }
-        case OP_PUSH_STR: {
-            uint32_t idx = READ_U32();
-            vm_push(vm, frame->chunk->consts[idx]);
-            break;
-        }
-        case OP_PUSH_TRUE:  vm_push(vm, xf_val_true());  break;
-        case OP_PUSH_FALSE: vm_push(vm, xf_val_false()); break;
-        case OP_PUSH_NULL:  vm_push(vm, xf_val_null()); break;
-        case OP_PUSH_UNDEF: vm_push(vm, xf_val_undef(XF_TYPE_VOID)); break;
-
-        case OP_POP:  vm_pop(vm); break;
-        case OP_DUP:  vm_push(vm, vm_peek(vm, 0)); break;
-        case OP_SWAP: {
-            xf_Value top = vm_pop(vm), sec = vm_pop(vm);
-            vm_push(vm, top); vm_push(vm, sec);
-            break;
-        }
-
-        case OP_LOAD_LOCAL: {
-            uint8_t slot = READ_U8();
-            vm_push(vm, frame->locals[slot]);
-            break;
-        }
-        case OP_STORE_LOCAL: {
-            uint8_t slot = READ_U8();
-            frame->locals[slot] = vm_peek(vm, 0);
-            if (frame->local_count <= slot) frame->local_count = slot+1;
-            break;
-        }
-        case OP_LOAD_GLOBAL: {
-            uint32_t idx = READ_U32();
-            vm_push(vm, idx < vm->global_count
-                         ? vm->globals[idx]
-                         : xf_val_undef(XF_TYPE_VOID));
-            break;
-        }
-        case OP_STORE_GLOBAL: {
-            uint32_t idx = READ_U32();
-            if (idx < vm->global_count) vm->globals[idx] = vm_peek(vm, 0);
-            break;
-        }
-
-        case OP_LOAD_FIELD: {
-            uint8_t n = READ_U8();
-            if (n == 0) {
-                xf_Str *s = xf_str_new(vm->rec.buf ? vm->rec.buf : "", vm->rec.buf_len);
-                xf_Value v = xf_val_ok_str(s); xf_str_release(s);
-                vm_push(vm, v);
-            } else if (n <= vm->rec.field_count) {
-                xf_Str *s = xf_str_from_cstr(vm->rec.fields[n-1]);
-                xf_Value v = xf_val_ok_str(s); xf_str_release(s);
-                vm_push(vm, v);
-            } else {
-                vm_push(vm, xf_val_ok_str(xf_str_from_cstr("")));
+            if (obj.state == XF_STATE_OK && obj.type == XF_TYPE_MAP && obj.data.map) {
+                xf_Value ks = xf_coerce_str(key);
+                if (ks.state == XF_STATE_OK && ks.data.str) {
+                    xf_map_delete(obj.data.map, ks.data.str);
+                }
+                xf_value_release(ks);
+            } else if (obj.state == XF_STATE_OK && obj.type == XF_TYPE_SET && obj.data.set) {
+                xf_set_delete(obj.data.set, key);
             }
+
+            xf_value_release(key);
+            xf_value_release(obj);
             break;
         }
-        case OP_STORE_FIELD: {
-            /* TODO: field assignment rebuilds $0 */
-            uint8_t _n = READ_U8(); (void)_n;
-            vm_pop(vm);
+                case OP_GET_MEMBER: {
+            uint32_t idx = READ_U32();
+
+            if (idx >= frame->chunk->const_len) {
+                vm_error(vm, "GET_MEMBER constant index out of range");
+                goto err;
+            }
+
+            xf_Value obj = vm_pop(vm);
+            xf_Value keyv = frame->chunk->consts[idx];
+
+            if (keyv.state != XF_STATE_OK || keyv.type != XF_TYPE_STR || !keyv.data.str) {
+                xf_value_release(obj);
+                vm_error(vm, "GET_MEMBER requires string field name");
+                goto err;
+            }
+
+            const char *field = keyv.data.str->data;
+            xf_Value out = xf_val_nav(XF_TYPE_VOID);
+
+            if (obj.state == XF_STATE_OK &&
+                obj.type == XF_TYPE_MODULE &&
+                obj.data.mod) {
+                out = xf_module_get(obj.data.mod, field);
+            }
+
+            xf_value_release(obj);
+            vm_push(vm, out);
+            xf_value_release(out);
             break;
         }
+            case OP_PUSH_NUM: {
+                uint64_t bits = 0;
+                for (int i = 0; i < 8; i++) bits = (bits << 8) | frame->chunk->code[frame->ip++];
+                double v;
+                memcpy(&v, &bits, 8);
+                vm_push(vm, val_num(v));
+                break;
+            }
 
-        case OP_LOAD_NR:  vm_push(vm, val_num((double)vm->rec.nr));   break;
-        case OP_LOAD_NF:  vm_push(vm, val_num((double)vm->rec.field_count)); break;
-        case OP_LOAD_FNR: vm_push(vm, val_num((double)vm->rec.fnr));  break;
-        case OP_LOAD_FS:  { xf_Str *s=xf_str_from_cstr(vm->rec.fs);  vm_push(vm,xf_val_ok_str(s));xf_str_release(s);break; }
-        case OP_LOAD_RS:  { xf_Str *s=xf_str_from_cstr(vm->rec.rs);  vm_push(vm,xf_val_ok_str(s));xf_str_release(s);break; }
-        case OP_LOAD_OFS: { xf_Str *s=xf_str_from_cstr(vm->rec.ofs); vm_push(vm,xf_val_ok_str(s));xf_str_release(s);break; }
-        case OP_LOAD_ORS: { xf_Str *s=xf_str_from_cstr(vm->rec.ors); vm_push(vm,xf_val_ok_str(s));xf_str_release(s);break; }
+            case OP_PUSH_STR: {
+                uint32_t idx = READ_U32();
+                vm_push(vm, frame->chunk->consts[idx]);
+                break;
+            }
+                    case OP_LOAD_FIELD: {
+            uint8_t idx = READ_U8();
 
-        case OP_ADD: b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_add(a,b)); break;
-        case OP_SUB: b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_sub(a,b)); break;
-        case OP_MUL: b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_mul(a,b)); break;
-        case OP_DIV: b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_div(vm,a,b)); break;
-        case OP_MOD: b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_mod(vm,a,b)); break;
-        case OP_POW: b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_pow(a,b)); break;
-        case OP_NEG: a=vm_pop(vm); {xf_Value n=xf_coerce_num(a); vm_push(vm,n.state==XF_STATE_OK?val_num(-n.data.num):n);} break;
+            if (idx == 0) {
+                xf_Value out;
+                if (vm->rec.buf) {
+                    xf_Str *s = xf_str_from_cstr(vm->rec.buf);
+                    out = xf_val_ok_str(s);
+                    xf_str_release(s);
+                } else {
+                    out = xf_val_nav(XF_TYPE_STR);
+                }
 
-        case OP_EQ:  b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_num(val_cmp(a,b)==0?1:0)); break;
-        case OP_NEQ: b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_num(val_cmp(a,b)!=0?1:0)); break;
-        case OP_LT:  b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_num(val_cmp(a,b)<0 ?1:0)); break;
-        case OP_GT:  b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_num(val_cmp(a,b)>0 ?1:0)); break;
-        case OP_LTE: b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_num(val_cmp(a,b)<=0?1:0)); break;
-        case OP_GTE: b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_num(val_cmp(a,b)>=0?1:0)); break;
-        case OP_SPACESHIP: b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_num((double)val_cmp(a,b))); break;
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
+            }
 
-        case OP_AND: b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_num(is_truthy(a)&&is_truthy(b)?1:0)); break;
-        case OP_OR:  b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_num(is_truthy(a)||is_truthy(b)?1:0)); break;
-        case OP_NOT: a=vm_pop(vm); vm_push(vm,val_num(is_truthy(a)?0:1)); break;
+            size_t field_index = (size_t)(idx - 1);
 
-        case OP_CONCAT: b=vm_pop(vm); a=vm_pop(vm); vm_push(vm,val_concat(a,b)); break;
+            xf_Value out;
+            if (field_index < vm->rec.field_count && vm->rec.fields[field_index]) {
+                xf_Str *s = xf_str_from_cstr(vm->rec.fields[field_index]);
+                out = xf_val_ok_str(s);
+                xf_str_release(s);
+            } else {
+                out = xf_val_nav(XF_TYPE_STR);
+            }
 
-        case OP_GET_STATE: a=vm_pop(vm); vm_push(vm,val_num((double)a.state)); break;
-        case OP_GET_TYPE:  a=vm_pop(vm); vm_push(vm,val_num((double)a.type));  break;
-        case OP_COALESCE:
-            b=vm_pop(vm); a=vm_pop(vm);
-            vm_push(vm, (a.state==XF_STATE_OK) ? a : b);
+            vm_push(vm, out);
+            xf_value_release(out);
             break;
-        case OP_MATCH:
-case OP_NMATCH: {
-    b = vm_pop(vm);
-    a = vm_pop(vm);
+        }
+            case OP_MAKE_TUPLE: {
+    uint16_t n = READ_U16();
 
-    xf_Value sa = xf_coerce_str(a);
-    xf_Value sb = xf_coerce_str(b);
-
-    bool found = (sa.state == XF_STATE_OK && sb.state == XF_STATE_OK)
-                 ? (strstr(sa.data.str->data, sb.data.str->data) != NULL)
-                 : false;
-
-    xf_value_release(sa);
-    xf_value_release(sb);
-
-    vm_push(vm, val_num((op == OP_MATCH) == found ? 1.0 : 0.0));
-    break;
-}
-
-case OP_PRINT: {
-    uint8_t argc = READ_U8();
-    xf_Value args[64];
-
-    for (int i = argc - 1; i >= 0; i--)
-        args[i] = vm_pop(vm);
-
-    for (int i = 0; i < argc; i++) {
-        if (i > 0) printf("%s", vm->rec.ofs);
-
-        xf_Value sv = xf_coerce_str(args[i]);
-        if (sv.state == XF_STATE_OK && sv.data.str)
-            printf("%s", sv.data.str->data);
-        else
-            printf("%s", XF_STATE_NAMES[args[i].state]);
-
-        xf_value_release(sv);
+    xf_Value *items = n ? malloc(sizeof(xf_Value) * n) : NULL;
+    if (n && !items) {
+        vm_error(vm, "failed to allocate tuple staging buffer");
+        goto err;
     }
 
-    printf("%s", vm->rec.ors);
+    for (uint16_t i = 0; i < n; i++) {
+        items[n - 1 - i] = vm_pop(vm);
+    }
+
+    xf_tuple_t *t = xf_tuple_new(items, n);
+
+    for (uint16_t i = 0; i < n; i++) {
+        xf_value_release(items[i]);
+    }
+    free(items);
+
+    if (!t) {
+        vm_error(vm, "failed to allocate tuple");
+        goto err;
+    }
+
+    xf_Value out = xf_val_ok_tuple(t);
+    xf_tuple_release(t);
+
+    vm_push(vm, out);
+    xf_value_release(out);
     break;
 }
-        case OP_JUMP: {
-            int16_t delta = (int16_t)READ_U16();
-            frame->ip += (size_t)((int)delta);
-            break;
-        }
-        case OP_JUMP_IF: {
-            int16_t delta = (int16_t)READ_U16();
-            a = vm_pop(vm);
-            if (is_truthy(a)) frame->ip += (size_t)((int)delta);
-            break;
-        }
-        case OP_JUMP_NOT: {
-            int16_t delta = (int16_t)READ_U16();
-            a = vm_pop(vm);
-            if (!is_truthy(a)) frame->ip += (size_t)((int)delta);
-            break;
-        }
-        case OP_JUMP_NAV: {
-            int16_t delta = (int16_t)READ_U16();
-            a = vm_pop(vm);
-            if (a.state==XF_STATE_NAV || a.state==XF_STATE_NULL)
-                frame->ip += (size_t)((int)delta);
-            break;
-        }
+case OP_MAKE_MAP: {
+    uint16_t n = READ_U16();
 
-        case OP_RETURN:
-            frame->return_val = vm_pop(vm);
-            goto done;
-        case OP_RETURN_NULL:
-            frame->return_val = xf_val_null();
-            goto done;
+    xf_map_t *m = xf_map_new();
+    if (!m) {
+        vm_error(vm, "failed to allocate map");
+        goto err;
+    }
 
-        case OP_EXIT:
-            vm->frame_count--;
-            return VM_EXIT;
+    xf_Value *vals = n ? malloc(sizeof(xf_Value) * n) : NULL;
+    xf_Value *keys = n ? malloc(sizeof(xf_Value) * n) : NULL;
+    if (n && (!vals || !keys)) {
+        free(vals);
+        free(keys);
+        xf_map_release(m);
+        vm_error(vm, "failed to allocate map staging buffers");
+        goto err;
+    }
 
-        case OP_NEXT_RECORD:
-            goto done;   /* signals interp to advance stream */
+    for (uint16_t i = 0; i < n; i++) {
+        vals[n - 1 - i] = vm_pop(vm);
+        keys[n - 1 - i] = vm_pop(vm);
+    }
 
-        case OP_YIELD: break;   /* preemption hint — no-op for now */
-
-        case OP_CALL:
-        case OP_SPAWN:
-        case OP_JOIN:
-        case OP_MAKE_ARR:
-        case OP_MAKE_MAP:
-        case OP_MAKE_SET:
-        case OP_GET_IDX:
-        case OP_SET_IDX:
-        case OP_DELETE_IDX:
-        case OP_SUBST:
-        case OP_TRANS:
-            /* stub — interp layer handles these */
-            break;
-
-        default:
-            vm_error(vm, "unknown opcode %d at ip=%zu", op, frame->ip-1);
+    for (uint16_t i = 0; i < n; i++) {
+        xf_Value ks = xf_coerce_str(keys[i]);
+        if (ks.state != XF_STATE_OK || !ks.data.str) {
+            for (uint16_t j = i; j < n; j++) {
+                xf_value_release(keys[j]);
+                xf_value_release(vals[j]);
+            }
+            for (uint16_t j = 0; j < i; j++) {
+                xf_value_release(keys[j]);
+                xf_value_release(vals[j]);
+            }
+            xf_value_release(ks);
+            free(keys);
+            free(vals);
+            xf_map_release(m);
+            vm_error(vm, "map key is not string-coercible");
             goto err;
         }
 
-        if (vm->had_error) goto err;
-        continue;
+        xf_map_set(m, ks.data.str, vals[i]);
 
-    err:
-        vm->frame_count--;
-        return VM_ERR;
+        xf_value_release(ks);
+        xf_value_release(keys[i]);
+        xf_value_release(vals[i]);
     }
 
-done:
+    free(keys);
+    free(vals);
+
+    xf_Value out = xf_val_ok_map(m);
+    xf_map_release(m);
+
+    vm_push(vm, out);
+    xf_value_release(out);
+    break;
+}
+case OP_GET_KEYS: {
+    xf_Value obj = vm_pop(vm);
+    xf_Value out = xf_val_nav(XF_TYPE_ARR);
+
+    if (obj.state != XF_STATE_OK) {
+        out = xf_value_retain(obj);
+    } else if (obj.type == XF_TYPE_MAP && obj.data.map) {
+        xf_arr_t *arr = xf_arr_new();
+        if (!arr) {
+            vm_error(vm, "failed to allocate key array");
+            xf_value_release(obj);
+            goto err;
+        }
+
+        xf_map_t *m = obj.data.map;
+        for (size_t i = 0; i < m->order_len; i++) {
+            xf_str_t *k = m->order[i];
+            if (!k) continue;
+
+            xf_Value kv = xf_val_ok_str(k);
+            xf_arr_push(arr, kv);
+            xf_value_release(kv);
+        }
+
+        out = xf_val_ok_arr(arr);
+        xf_arr_release(arr);
+    } else if (obj.type == XF_TYPE_SET && obj.data.set) {
+        xf_arr_t *arr = xf_set_to_arr(obj.data.set);
+        if (!arr) {
+            vm_error(vm, "failed to materialize set iteration array");
+            xf_value_release(obj);
+            goto err;
+        }
+
+        out = xf_val_ok_arr(arr);
+        xf_arr_release(arr);
+    } else {
+        out = xf_val_nav(XF_TYPE_ARR);
+    }
+
+    xf_value_release(obj);
+    vm_push(vm, out);
+    xf_value_release(out);
+    break;
+}
+case OP_MAKE_SET: {
+    uint16_t n = READ_U16();
+
+    xf_set_t *set = xf_set_new();
+    if (!set) {
+        vm_error(vm, "failed to allocate set");
+        goto err;
+    }
+
+    xf_Value *items = n ? malloc(sizeof(xf_Value) * n) : NULL;
+    if (n && !items) {
+        xf_set_release(set);
+        vm_error(vm, "failed to allocate set staging buffer");
+        goto err;
+    }
+
+    for (uint16_t i = 0; i < n; i++) {
+        items[n - 1 - i] = vm_pop(vm);
+    }
+
+    for (uint16_t i = 0; i < n; i++) {
+        if (!xf_set_add(set, items[i])) {
+            for (uint16_t j = i; j < n; j++) {
+                xf_value_release(items[j]);
+            }
+            for (uint16_t j = 0; j < i; j++) {
+                xf_value_release(items[j]);
+            }
+            free(items);
+            xf_set_release(set);
+            vm_error(vm, "failed to add set element");
+            goto err;
+        }
+        xf_value_release(items[i]);
+    }
+
+    free(items);
+
+    xf_Value out = xf_val_ok_set(set);
+    xf_set_release(set);
+
+    vm_push(vm, out);
+    xf_value_release(out);
+    break;
+}
+            case OP_PUSH_TRUE:  vm_push(vm, xf_val_true()); break;
+            case OP_PUSH_FALSE: vm_push(vm, xf_val_false()); break;
+            case OP_PUSH_NULL:  vm_push(vm, xf_val_null()); break;
+            case OP_PUSH_UNDEF: vm_push(vm, xf_val_undef(XF_TYPE_VOID)); break;
+            case OP_MAKE_ARR: {
+    uint16_t n = READ_U16();
+
+    xf_arr_t *arr = xf_arr_new();
+    if (!arr) {
+        vm_error(vm, "failed to allocate array");
+        goto err;
+    }
+
+    xf_Value *tmp = n ? malloc(sizeof(xf_Value) * n) : NULL;
+    if (n && !tmp) {
+        xf_arr_release(arr);
+        vm_error(vm, "failed to allocate array staging buffer");
+        goto err;
+    }
+
+    /* pop in reverse stack order, then push into array in source order */
+    for (uint16_t i = 0; i < n; i++) {
+        tmp[n - 1 - i] = vm_pop(vm);
+    }
+
+    for (uint16_t i = 0; i < n; i++) {
+        xf_arr_push(arr, tmp[i]);
+        xf_value_release(tmp[i]);
+    }
+
+    free(tmp);
+
+    xf_Value out = xf_val_ok_arr(arr);
+    xf_arr_release(arr);
+
+    vm_push(vm, out);
+    xf_value_release(out);
+    break;
+}
+            case OP_POP:
+                xf_value_release(vm_pop(vm));
+                break;
+
+            case OP_DUP:
+                vm_push(vm, vm_peek(vm, 0));
+                break;
+
+            case OP_SWAP: {
+                xf_Value top = vm_pop(vm);
+                xf_Value sec = vm_pop(vm);
+                vm_push(vm, top);
+                vm_push(vm, sec);
+                xf_value_release(top);
+                xf_value_release(sec);
+                break;
+            }
+
+            case OP_LOAD_GLOBAL: {
+                uint32_t idx = READ_U32();
+                vm_push(vm, idx < vm->global_count ? vm->globals[idx] : xf_val_undef(XF_TYPE_VOID));
+                break;
+            }
+
+            case OP_STORE_GLOBAL: {
+                uint32_t idx = READ_U32();
+                xf_Value v = vm_peek(vm, 0);
+                if (!vm_set_global(vm, idx, v)) vm_error(vm, "bad global slot");
+                break;
+            }
+
+
+            case OP_LOAD_NR:
+                vm_push(vm, val_num((double)vm->rec.nr));
+                break;
+            case OP_LOAD_NF:
+                vm_push(vm, val_num((double)vm->rec.field_count));
+                break;
+            case OP_LOAD_FNR:
+                vm_push(vm, val_num((double)vm->rec.fnr));
+                break;
+                    case OP_STORE_FS: {
+            xf_Value v = vm_peek(vm, 0);
+            xf_Value sv = xf_coerce_str(v);
+            if (sv.state == XF_STATE_OK && sv.data.str) {
+                strncpy(vm->rec.fs, sv.data.str->data, sizeof(vm->rec.fs) - 1);
+                vm->rec.fs[sizeof(vm->rec.fs) - 1] = '\0';
+            }
+            xf_value_release(sv);
+            break;
+        }
+
+        case OP_STORE_RS: {
+            xf_Value v = vm_peek(vm, 0);
+            xf_Value sv = xf_coerce_str(v);
+            if (sv.state == XF_STATE_OK && sv.data.str) {
+                strncpy(vm->rec.rs, sv.data.str->data, sizeof(vm->rec.rs) - 1);
+                vm->rec.rs[sizeof(vm->rec.rs) - 1] = '\0';
+            }
+            xf_value_release(sv);
+            break;
+        }
+        case OP_STORE_OFS: {
+            xf_Value v = vm_peek(vm, 0);
+            xf_Value sv = xf_coerce_str(v);
+            if (sv.state == XF_STATE_OK && sv.data.str) {
+                strncpy(vm->rec.ofs, sv.data.str->data, sizeof(vm->rec.ofs) - 1);
+                vm->rec.ofs[sizeof(vm->rec.ofs) - 1] = '\0';
+            }
+            xf_value_release(sv);
+            break;
+        }
+
+        case OP_STORE_ORS: {
+            xf_Value v = vm_peek(vm, 0);
+            xf_Value sv = xf_coerce_str(v);
+            if (sv.state == XF_STATE_OK && sv.data.str) {
+                strncpy(vm->rec.ors, sv.data.str->data, sizeof(vm->rec.ors) - 1);
+                vm->rec.ors[sizeof(vm->rec.ors) - 1] = '\0';
+            }
+            xf_value_release(sv);
+            break;
+        }
+            case OP_ADD: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_add(a,b); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_SUB: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_sub(a,b); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_MUL: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_mul(a,b); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_DIV: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_div(vm,a,b); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_MOD: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_mod(vm,a,b); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_POW: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_pow(a,b); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+
+            case OP_NEG: {
+                a = vm_pop(vm);
+                xf_Value n = xf_coerce_num(a);
+                xf_Value r = (n.state == XF_STATE_OK) ? val_num(-n.data.num) : n;
+                vm_push(vm, r);
+                xf_value_release(a);
+                if (&r != &n) xf_value_release(n);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_EQ:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(val_cmp(a,b)==0); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_NEQ: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(val_cmp(a,b)!=0); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_LT:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(val_cmp(a,b)<0); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_GT:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(val_cmp(a,b)>0); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_LTE: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(val_cmp(a,b)<=0); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_GTE: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(val_cmp(a,b)>=0); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_SPACESHIP: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num((double)val_cmp(a,b)); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+
+            case OP_AND: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(is_truthy(a) && is_truthy(b)); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_OR:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(is_truthy(a) || is_truthy(b)); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_NOT: a = vm_pop(vm); { xf_Value r = val_num(!is_truthy(a)); vm_push(vm,r); xf_value_release(a); xf_value_release(r); } break;
+
+            case OP_CONCAT: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_concat(a,b); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+
+            case OP_MATCH:
+            case OP_NMATCH: {
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                xf_Value sa = xf_coerce_str(a);
+                xf_Value sb = xf_coerce_str(b);
+                bool found = (sa.state == XF_STATE_OK && sb.state == XF_STATE_OK &&
+                              sa.data.str && sb.data.str &&
+                              strstr(sa.data.str->data, sb.data.str->data) != NULL);
+                xf_Value r = val_num((op == OP_MATCH) == found);
+                vm_push(vm, r);
+                xf_value_release(a);
+                xf_value_release(b);
+                xf_value_release(sa);
+                xf_value_release(sb);
+                xf_value_release(r);
+                break;
+            }
+
+            case OP_COALESCE:
+                b = vm_pop(vm);
+                a = vm_pop(vm);
+                if (a.state == XF_STATE_OK) vm_push(vm, a);
+                else vm_push(vm, b);
+                xf_value_release(a);
+                xf_value_release(b);
+                break;
+
+            case OP_PRINT: {
+                uint8_t argc = READ_U8();
+                xf_Value args[64];
+
+                for (int i = argc - 1; i >= 0; i--) args[i] = vm_pop(vm);
+
+                for (int i = 0; i < argc; i++) {
+                    if (i > 0) printf("%s", vm->rec.ofs);
+                    xf_Value sv = xf_coerce_str(args[i]);
+                    if (sv.state == XF_STATE_OK && sv.data.str) printf("%s", sv.data.str->data);
+                    else printf("%s", XF_STATE_NAMES[args[i].state]);
+                    xf_value_release(sv);
+                    xf_value_release(args[i]);
+                }
+                printf("%s", vm->rec.ors);
+                break;
+            }
+
+            case OP_JUMP: {
+                int16_t delta = (int16_t)READ_U16();
+                frame->ip += (size_t)((int)delta);
+                break;
+            }
+
+            case OP_JUMP_IF: {
+                int16_t delta = (int16_t)READ_U16();
+                a = vm_pop(vm);
+                if (is_truthy(a)) frame->ip += (size_t)((int)delta);
+                xf_value_release(a);
+                break;
+            }
+
+            case OP_JUMP_NOT: {
+                int16_t delta = (int16_t)READ_U16();
+                a = vm_pop(vm);
+                if (!is_truthy(a)) frame->ip += (size_t)((int)delta);
+                xf_value_release(a);
+                break;
+            }
+
+            case OP_JUMP_NAV: {
+                int16_t delta = (int16_t)READ_U16();
+                a = vm_pop(vm);
+                if (a.state == XF_STATE_NAV || a.state == XF_STATE_NULL) {
+                    frame->ip += (size_t)((int)delta);
+                }
+                xf_value_release(a);
+                break;
+            }
+
+            case OP_RETURN:
+                frame->return_val = vm_pop(vm);
+                goto done;
+
+            case OP_RETURN_NULL:
+                frame->return_val = xf_val_null();
+                goto done;
+            case OP_EXIT:
+                vm->should_exit = true;
+                goto done;
+
+
+            case OP_NEXT_RECORD:
+                goto done;
+            case OP_GET_IDX: {
+    xf_Value key = vm_pop(vm);
+    xf_Value obj = vm_pop(vm);
+    xf_Value out = xf_val_nav(XF_TYPE_VOID);
+
+    if (obj.state != XF_STATE_OK) {
+        out = xf_value_retain(obj);
+    } else if (key.state != XF_STATE_OK) {
+        out = xf_value_retain(key);
+    } else if (obj.type == XF_TYPE_ARR) {
+        xf_Value nk = xf_coerce_num(key);
+        if (nk.state == XF_STATE_OK && obj.data.arr) {
+            long idx = (long)nk.data.num;
+            if (idx >= 0 && (size_t)idx < obj.data.arr->len) {
+                out = xf_arr_get(obj.data.arr, (size_t)idx);
+            } else {
+                out = xf_val_nav(XF_TYPE_VOID);
+            }
+        } else {
+            out = xf_val_nav(XF_TYPE_VOID);
+        }
+        xf_value_release(nk);
+    } else if (obj.type == XF_TYPE_TUPLE) {
+        xf_Value nk = xf_coerce_num(key);
+        if (nk.state == XF_STATE_OK && obj.data.tuple) {
+            long idx = (long)nk.data.num;
+            if (idx >= 0 && (size_t)idx < xf_tuple_len(obj.data.tuple)) {
+                out = xf_tuple_get(obj.data.tuple, (size_t)idx);
+            } else {
+                out = xf_val_nav(XF_TYPE_VOID);
+            }
+        } else {
+            out = xf_val_nav(XF_TYPE_VOID);
+        }
+        xf_value_release(nk);
+    } else if (obj.type == XF_TYPE_MAP) {
+        xf_Value ks = xf_coerce_str(key);
+        if (ks.state == XF_STATE_OK && ks.data.str && obj.data.map) {
+            out = xf_map_get(obj.data.map, ks.data.str);
+        } else {
+            out = xf_val_nav(XF_TYPE_VOID);
+        }
+        xf_value_release(ks);
+    } else if (obj.type == XF_TYPE_STR) {
+        xf_Value nk = xf_coerce_num(key);
+        if (nk.state == XF_STATE_OK && obj.data.str) {
+            long idx = (long)nk.data.num;
+            if (idx >= 0 && (size_t)idx < obj.data.str->len) {
+                char ch[2] = { obj.data.str->data[idx], '\0' };
+                xf_Str *s = xf_str_from_cstr(ch);
+                out = xf_val_ok_str(s);
+                xf_str_release(s);
+            } else {
+                out = xf_val_nav(XF_TYPE_STR);
+            }
+        } else {
+            out = xf_val_nav(XF_TYPE_STR);
+        }
+        xf_value_release(nk);
+    } else {
+        out = xf_val_nav(XF_TYPE_VOID);
+    }
+
+    xf_value_release(key);
+    xf_value_release(obj);
+    vm_push(vm, out);
+    xf_value_release(out);
+    break;
+}
+
+case OP_GET_STATE: {
+    xf_Value v = vm_pop(vm);
+    uint8_t st = (v.state < XF_STATE_COUNT) ? v.state : XF_STATE_OK;
+    const char *name = XF_STATE_NAMES[st];
+
+    xf_Str *s = xf_str_from_cstr(name);
+    xf_Value out = xf_val_ok_str(s);
+    xf_str_release(s);
+
+    xf_value_release(v);
+    vm_push(vm, out);
+    xf_value_release(out);
+    break;
+}
+
+case OP_GET_TYPE: {
+    xf_Value v = vm_pop(vm);
+    uint8_t t = XF_STATE_IS_BOOL(v.state) ? XF_TYPE_BOOL : v.type;
+    if (t >= XF_TYPE_COUNT) t = XF_TYPE_VOID;
+
+    const char *name = XF_TYPE_NAMES[t];
+    xf_Str *s = xf_str_from_cstr(name);
+    xf_Value out = xf_val_ok_str(s);
+    xf_str_release(s);
+
+    xf_value_release(v);
+    vm_push(vm, out);
+    xf_value_release(out);
+    break;
+}
+
+case OP_GET_LEN: {
+    xf_Value v = vm_pop(vm);
+    xf_Value out;
+
+    if (v.state != XF_STATE_OK) {
+        out = xf_value_retain(v);
+    } else {
+        switch (v.type) {
+            case XF_TYPE_STR:
+                out = xf_val_ok_num(v.data.str ? (double)v.data.str->len : 0.0);
+                break;
+            case XF_TYPE_ARR:
+                out = xf_val_ok_num(v.data.arr ? (double)v.data.arr->len : 0.0);
+                break;
+            case XF_TYPE_TUPLE:
+                out = xf_val_ok_num(v.data.tuple ? (double)xf_tuple_len(v.data.tuple) : 0.0);
+                break;
+            case XF_TYPE_MAP:
+                out = xf_val_ok_num(v.data.map ? (double)xf_map_count(v.data.map) : 0.0);
+                break;
+            case XF_TYPE_SET:
+                out = xf_val_ok_num(v.data.set ? (double)xf_set_count(v.data.set) : 0.0);
+                break;
+            default:
+                out = xf_val_nav(XF_TYPE_NUM);
+                break;
+        }
+    }
+
+    xf_value_release(v);
+    vm_push(vm, out);
+    xf_value_release(out);
+    break;
+}
+case OP_STORE_LOCAL: {
+    uint8_t slot = READ_U8();
+    xf_Value v = vm_peek(vm, 0);
+
+    xf_value_release(frame->locals[slot]);
+    frame->locals[slot] = xf_value_retain(v);
+
+    if (frame->local_count <= slot) frame->local_count = slot + 1;
+    break;
+}
+        case OP_PRINTF: {
+            uint8_t argc = READ_U8();
+            xf_Value args[64];
+
+            if (argc > 64) {
+                vm_error(vm, "printf: too many args");
+                goto err;
+            }
+
+            for (int i = (int)argc - 1; i >= 0; i--) {
+                args[i] = vm_pop(vm);
+            }
+
+            if (argc == 0) {
+                break;
+            }
+
+            xf_Value fmtv = xf_coerce_str(args[0]);
+            if (fmtv.state != XF_STATE_OK || !fmtv.data.str) {
+                xf_value_release(fmtv);
+                for (int i = 0; i < (int)argc; i++) xf_value_release(args[i]);
+                vm_error(vm, "printf format must be a string");
+                goto err;
+            }
+
+            const char *fmt = fmtv.data.str->data;
+            size_t argi = 1;
+
+            for (size_t i = 0; fmt[i] != '\0'; i++) {
+                if (fmt[i] == '%' && fmt[i + 1] != '\0') {
+                    char spec = fmt[i + 1];
+
+                    if (spec == '%') {
+                        putchar('%');
+                        i++;
+                        continue;
+                    }
+
+                    if (argi >= argc) {
+                        putchar('%');
+                        putchar(spec);
+                        i++;
+                        continue;
+                    }
+
+                    xf_Value sv = xf_coerce_str(args[argi]);
+                    if (sv.state == XF_STATE_OK && sv.data.str) {
+                        fputs(sv.data.str->data, stdout);
+                    } else {
+                        fputs(XF_STATE_NAMES[args[argi].state], stdout);
+                    }
+                    xf_value_release(sv);
+
+                    argi++;
+                    i++;
+                    continue;
+                }
+
+                putchar((unsigned char)fmt[i]);
+            }
+
+            xf_value_release(fmtv);
+            for (int i = 0; i < (int)argc; i++) {
+                xf_value_release(args[i]);
+            }
+            break;
+        }
+case OP_CALL: {
+            uint8_t argc = READ_U8();
+
+            xf_Value args[64];
+            if (argc > 64) {
+                vm_error(vm, "too many call args");
+                goto err;
+            }
+
+            for (int i = (int)argc - 1; i >= 0; i--) {
+                args[i] = vm_pop(vm);
+            }
+
+            xf_Value callee = vm_pop(vm);
+
+            if (callee.state != XF_STATE_OK ||
+                callee.type  != XF_TYPE_FN ||
+                !callee.data.fn) {
+                for (size_t i = 0; i < argc; i++) xf_value_release(args[i]);
+                xf_value_release(callee);
+                vm_error(vm, "attempt to call non-function");
+                goto err;
+            }
+
+            xf_fn_t *fn = callee.data.fn;
+            xf_Value ret = xf_val_null();
+
+            if (fn->is_native && fn->native_v) {
+                ret = fn->native_v(args, argc);
+            } else {
+                Chunk *fn_chunk = (Chunk *)fn->body;
+                ret = vm_call_compiled_fn(vm, fn_chunk, args, argc);
+            }
+
+            for (size_t i = 0; i < argc; i++) xf_value_release(args[i]);
+            xf_value_release(callee);
+
+            vm_push(vm, ret);
+            xf_value_release(ret);
+            break;
+        }
+            case OP_SPAWN:
+            case OP_JOIN:
+            case OP_SUBST:
+            case OP_TRANS:
+            case OP_LOAD_LOCAL:
+            case OP_STORE_FIELD:
+            case OP_YIELD:
+                vm_error(vm, "opcode not implemented yet: %s", opcode_name(op));
+                goto err;
+
+            default:
+                vm_error(vm, "unknown opcode %d", op);
+                goto err;
+        }
+
+        if (vm->had_error) goto err;
+    }
+
+done: {
+    xf_Value ret = frame->return_val;
     vm->frame_count--;
+
+    if (vm->frame_count > 0) {
+        vm_push(vm, ret);
+        xf_value_release(ret);
+        return vm->had_error ? VM_ERR : VM_OK;
+    }
+
+    xf_value_release(ret);
     return vm->had_error ? VM_ERR : VM_OK;
 }
-
-VMResult vm_feed_record(VM *vm, const char *rec, size_t len) {
-    split_record(vm, rec, len);
-
-    /* JSON mode: capture first record as column headers, skip rule eval */
-    if (vm->rec.out_mode == XF_OUTFMT_JSON && !vm->rec.headers_set) {
-        vm_capture_headers(vm);
-        return VM_OK;
-    }
-
-    for (size_t i = 0; i < vm->rule_count; i++) {
-        /* pattern check */
-        if (vm->patterns) {
-            xf_Value pat = vm->patterns[i];
-            if (pat.state == XF_STATE_OK) {
-                /* TODO: full pattern eval — for now skip non-null patterns */
-            }
-        }
-        VMResult r = vm_run_chunk(vm, vm->rules[i]);
-        if (r == VM_EXIT) return VM_EXIT;
-        if (r == VM_ERR)  return VM_ERR;
-    }
-    return VM_OK;
+err:
+    vm->frame_count--;
+    return VM_ERR;
 }
 
-void vm_split_record(VM *vm, const char *rec, size_t len) {
-    split_record(vm, rec, len);
-}
+/* ============================================================
+ * Begin/rule/end
+ * ============================================================ */
 
 VMResult vm_run_begin(VM *vm) {
     if (!vm->begin_chunk) return VM_OK;
@@ -1029,69 +2014,45 @@ VMResult vm_run_end(VM *vm) {
     return vm_run_chunk(vm, vm->end_chunk);
 }
 
+VMResult vm_feed_record(VM *vm, const char *rec, size_t len) {
+        if (vm->should_exit) return VM_OK;
+    split_record(vm, rec, len);
+
+    if (vm->rec.out_mode == XF_OUTFMT_JSON && !vm->rec.headers_set) {
+        vm_capture_headers(vm);
+        return VM_OK;
+    }
+
+    for (size_t i = 0; i < vm->rule_count; i++) {
+        VMResult r = vm_run_chunk(vm, vm->rules[i]);
+        if (r == VM_EXIT) return VM_EXIT;
+        if (r == VM_ERR) return VM_ERR;
+    }
+
+    return VM_OK;
+}
+
 /* ============================================================
- * Record context snapshot
- * Used by worker threads to get a stable private copy of the
- * current record without holding rec_mu during fn execution.
+ * Record snapshot stubs
  * ============================================================ */
 
 void vm_rec_snapshot(VM *vm, RecordCtx *snap) {
-    pthread_mutex_lock(&vm->rec_mu);
-
-    /* scalar / fixed-size fields — plain copy */
-    snap->buf_len      = vm->rec.buf_len;
-    snap->field_count  = vm->rec.field_count;
-    snap->nr           = vm->rec.nr;
-    snap->fnr          = vm->rec.fnr;
-    snap->out_mode     = vm->rec.out_mode;
-    snap->in_mode      = vm->rec.in_mode;
-    snap->headers_set  = vm->rec.headers_set;
-    memcpy(snap->fs,   vm->rec.fs,   sizeof(snap->fs));
-    memcpy(snap->rs,   vm->rec.rs,   sizeof(snap->rs));
-    memcpy(snap->ofs,  vm->rec.ofs,  sizeof(snap->ofs));
-    memcpy(snap->ors,  vm->rec.ors,  sizeof(snap->ors));
-    memcpy(snap->ofmt, vm->rec.ofmt, sizeof(snap->ofmt));
-    memcpy(snap->current_file, vm->rec.current_file, sizeof(snap->current_file));
-
-    /* deep copy buf and re-point fields into the new buf */
-    if (vm->rec.buf && vm->rec.buf_len > 0) {
-        snap->buf = malloc(vm->rec.buf_len + 1);
-        memcpy(snap->buf, vm->rec.buf, vm->rec.buf_len + 1);
-        for (size_t i = 0; i < vm->rec.field_count; i++) {
-            if (vm->rec.fields[i])
-                snap->fields[i] = snap->buf + (vm->rec.fields[i] - vm->rec.buf);
-            else
-                snap->fields[i] = NULL;
-        }
-    } else {
-        snap->buf = NULL;
-        memset(snap->fields, 0, sizeof(snap->fields));
-    }
-
-    /* deep copy headers */
-    if (vm->rec.headers && vm->rec.header_count > 0) {
-        snap->headers = malloc(sizeof(char *) * vm->rec.header_count);
-        snap->header_count = vm->rec.header_count;
-        for (size_t i = 0; i < vm->rec.header_count; i++)
-            snap->headers[i] = vm->rec.headers[i] ? strdup(vm->rec.headers[i]) : NULL;
-    } else {
-        snap->headers      = NULL;
-        snap->header_count = 0;
-    }
-
-    /* retain ref-counted xf_Values */
-    snap->last_match    = xf_value_retain(vm->rec.last_match);
-    snap->last_captures = xf_value_retain(vm->rec.last_captures);
-    snap->last_err      = xf_val_null();
-
-    pthread_mutex_unlock(&vm->rec_mu);
+    (void)vm;
+    memset(snap, 0, sizeof(*snap));
 }
 
 void vm_rec_snapshot_free(RecordCtx *snap) {
+    if (!snap) return;
     free(snap->buf);
-    for (size_t i = 0; i < snap->header_count; i++) free(snap->headers[i]);
-    free(snap->headers);
+    if (snap->headers) {
+        for (size_t i = 0; i < snap->header_count; i++) free(snap->headers[i]);
+        free(snap->headers);
+    }
     xf_value_release(snap->last_match);
     xf_value_release(snap->last_captures);
+    xf_value_release(snap->last_err);
     memset(snap, 0, sizeof(*snap));
+}
+xf_Value vm_call_function_chunk(VM *vm, Chunk *chunk, xf_Value *args, size_t argc) {
+    return vm_call_compiled_fn(vm, chunk, args, argc);
 }
