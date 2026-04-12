@@ -18,36 +18,26 @@ static bool compile_while_stmt(Interp *it, Chunk *c, Stmt *s);
 static bool compile_for_stmt(Interp *it, Chunk *c, Stmt *s);
 static bool compile_rule_pattern(Interp *it, Chunk *c, Expr *pattern);
 static uint32_t compile_global_name(Interp *it, xf_Str *name);
-typedef struct {
-    xf_Str  *name;
-    uint32_t slot;
-} GlobalBinding;
-typedef struct {
-    xf_Str  *name;
-    uint8_t  type;
-    uint8_t  slot;
-} LocalBinding;
+#define MAX_LOOP_DEPTH       64
+#define MAX_BREAK_PATCHES   512
+#define MAX_CONTINUE_DEPTH    64
+#define MAX_CONTINUE_PATCHES 512
 
-typedef struct {
-    LocalBinding locals[256];
-    size_t       count;
-    uint8_t      return_type;
-} FnCompileCtx;
-static int g_compile_depth = 0;
-static bool g_interp_preserve_bindings = false;
-static FnCompileCtx *g_fn_ctx = NULL;
-        #define MAX_CONTINUE_DEPTH    64
-#define MAX_CONTINUE_PATCHES  512
+static _Thread_local int g_compile_depth = 0;
+static _Thread_local bool g_interp_preserve_bindings = false;
+static _Thread_local FnCompileCtx *g_fn_ctx = NULL;
 
-typedef struct {
-    size_t target;
-    bool   is_for_loop;
-    size_t patches[MAX_CONTINUE_PATCHES];
-    size_t patch_count;
-} ContinueCtx;
+static _Thread_local ContinueCtx g_continue_stack[MAX_CONTINUE_DEPTH];
+static _Thread_local int         g_continue_depth = 0;
 
-static ContinueCtx g_continue_stack[MAX_CONTINUE_DEPTH];
-static int         g_continue_depth = 0;
+static _Thread_local GlobalBinding *g_compiler_globals = NULL;
+static _Thread_local size_t g_compiler_globals_count = 0;
+static _Thread_local size_t g_compiler_globals_cap   = 0;
+
+static _Thread_local uint32_t g_hidden_counter = 0;
+
+static _Thread_local BreakCtx g_break_stack[MAX_LOOP_DEPTH];
+static _Thread_local int      g_break_depth = 0;
 
 static bool continue_push(size_t target, bool is_for_loop) {
     if (g_continue_depth >= MAX_CONTINUE_DEPTH) return false;
@@ -155,9 +145,6 @@ static xf_fn_t *build_compiled_fn(xf_Str *name,
 
     return f;
 }
-static GlobalBinding *g_compiler_globals = NULL;
-static size_t g_compiler_globals_count = 0;
-static size_t g_compiler_globals_cap   = 0;
 static const char *stmt_kind_name(StmtKind k) {
     switch (k) {
         case STMT_BLOCK: return "STMT_BLOCK";
@@ -277,23 +264,13 @@ static int compiler_global_find_str(xf_Str *name) {
     }
     return -1;
 }
-static uint32_t g_hidden_counter = 0;
 
 /* ── loop break/continue patch lists ────────────────────────────
  * Each nested loop pushes an entry.  STMT_BREAK appends to the
  * top entry; after the loop's back-jump we patch them all to the
  * instruction right after the loop.
  * ──────────────────────────────────────────────────────────────*/
-#define MAX_LOOP_DEPTH   64
-#define MAX_BREAK_PATCHES 512
 
-typedef struct {
-    size_t patches[MAX_BREAK_PATCHES];
-    size_t count;
-} BreakCtx;
-
-static BreakCtx g_break_stack[MAX_LOOP_DEPTH];
-static int      g_break_depth = 0;
 
 static void break_push(void) {
     if (g_break_depth < MAX_LOOP_DEPTH) {
@@ -453,7 +430,9 @@ static uint8_t infer_expr_type(Interp *it, Expr *e) {
             return XF_TYPE_VOID;
     }
 }
-void interp_reset_global_bindings(void) {
+void interp_reset_global_bindings(Interp *it) {
+    if (!it) return;
+
     for (size_t i = 0; i < g_compiler_globals_count; i++) {
         xf_str_release(g_compiler_globals[i].name);
     }
@@ -479,7 +458,7 @@ bool interp_compile_program(Interp *it, Program *prog) {
 bool ok = false;
 bool top_level_compile = (g_compile_depth == 0);
 if (top_level_compile && !g_interp_preserve_bindings) {
-    interp_reset_global_bindings();
+    interp_reset_global_bindings(it);
 }
     g_compile_depth++;
 
