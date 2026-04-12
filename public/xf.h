@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define XF_VERSION "0.9.10"
+#define XF_VERSION "1.0.0"
 
 typedef struct xf_State xf_State;
 
