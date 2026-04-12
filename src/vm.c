@@ -9,7 +9,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdarg.h>
-
+#include <regex.h>
 /* ============================================================
  * Chunk
  * ============================================================ */
@@ -1545,24 +1545,33 @@ VMResult vm_run_chunk(VM *vm, Chunk *chunk) {
 
             case OP_HALT:
                 goto done;
-        case OP_DELETE_IDX: {
-            xf_Value key = vm_pop(vm);
-            xf_Value obj = vm_pop(vm);
+            case OP_DELETE_IDX: {
+    xf_Value key = vm_pop(vm);
+    xf_Value obj = vm_pop(vm);
 
-            if (obj.state == XF_STATE_OK && obj.type == XF_TYPE_MAP && obj.data.map) {
-                xf_Value ks = xf_coerce_str(key);
-                if (ks.state == XF_STATE_OK && ks.data.str) {
-                    xf_map_delete(obj.data.map, ks.data.str);
-                }
-                xf_value_release(ks);
-            } else if (obj.state == XF_STATE_OK && obj.type == XF_TYPE_SET && obj.data.set) {
-                xf_set_delete(obj.data.set, key);
+    if (obj.state == XF_STATE_OK && obj.type == XF_TYPE_ARR && obj.data.arr) {
+        xf_Value nk = xf_coerce_num(key);
+        if (nk.state == XF_STATE_OK) {
+            double n = nk.data.num;
+            if (n >= 0 && (size_t)n < obj.data.arr->len) {
+                xf_arr_delete(obj.data.arr, (size_t)n);
             }
-
-            xf_value_release(key);
-            xf_value_release(obj);
-            break;
         }
+        xf_value_release(nk);
+    } else if (obj.state == XF_STATE_OK && obj.type == XF_TYPE_MAP && obj.data.map) {
+        xf_Value ks = xf_coerce_str(key);
+        if (ks.state == XF_STATE_OK && ks.data.str) {
+            xf_map_delete(obj.data.map, ks.data.str);
+        }
+        xf_value_release(ks);
+    } else if (obj.state == XF_STATE_OK && obj.type == XF_TYPE_SET && obj.data.set) {
+        xf_set_delete(obj.data.set, key);
+    }
+
+    xf_value_release(key);
+    xf_value_release(obj);
+    break;
+}
                     case OP_SET_IDX: {
                 /* current compiler emits: obj, key, value, DUP(value), SET_IDX */
                 xf_Value retv = vm_pop(vm);   /* duplicated assigned value */
@@ -2021,32 +2030,47 @@ case OP_STORE_GLOBAL: {
 
             case OP_CONCAT: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_concat(a,b); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
 
-case OP_MATCH: {
-    b = vm_pop(vm);   /* pattern */
-    a = vm_pop(vm);   /* subject */
-
-    bool ok = false;
-    /* keep your existing regex/string match logic here, just compute ok */
-
-    xf_Value r = ok ? xf_val_true() : xf_val_false();
-    vm_push(vm, r);
-    xf_value_release(a);
-    xf_value_release(b);
-    xf_value_release(r);
-    break;
-}
-
+            case OP_MATCH:
 case OP_NMATCH: {
     b = vm_pop(vm);
     a = vm_pop(vm);
 
-    bool ok = false;
-    /* same existing match logic, compute ok */
+    xf_Value sa = xf_coerce_str(a);
+    bool found = false;
 
-    xf_Value r = ok ? xf_val_false() : xf_val_true();
+    if (sa.state == XF_STATE_OK && sa.type == XF_TYPE_STR && sa.data.str &&
+        b.state == XF_STATE_OK) {
+        const char *pat = NULL;
+        int cflags = REG_EXTENDED;
+
+        if (b.type == XF_TYPE_REGEX && b.data.re && b.data.re->pattern) {
+            pat = b.data.re->pattern->data;
+            if (b.data.re->flags & XF_RE_ICASE)     cflags |= REG_ICASE;
+            if (b.data.re->flags & XF_RE_MULTILINE) cflags |= REG_NEWLINE;
+        } else {
+            xf_Value sb = xf_coerce_str(b);
+            if (sb.state == XF_STATE_OK && sb.type == XF_TYPE_STR && sb.data.str) {
+                pat = sb.data.str->data;
+            }
+            xf_value_release(sb);
+        }
+
+        if (pat) {
+            regex_t re;
+            int rc = regcomp(&re, pat, cflags);
+            if (rc == 0) {
+                found = (regexec(&re, sa.data.str->data, 0, NULL, 0) == 0);
+                regfree(&re);
+            }
+        }
+    }
+
+    xf_Value r = ((op == OP_MATCH) == found) ? xf_val_true() : xf_val_false();
     vm_push(vm, r);
+
     xf_value_release(a);
     xf_value_release(b);
+    xf_value_release(sa);
     xf_value_release(r);
     break;
 }

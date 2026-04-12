@@ -715,6 +715,24 @@ Expr *parse_unary(Parser *p) {
             return ast_spawn_expr(call, tok->loc);
         }
 
+        case TK_LPAREN: {
+            if (parser_peek(p, 1)->kind == TK_STAR &&
+                parser_peek(p, 2)->kind == TK_RPAREN) {
+                Loc loc = tok->loc;
+
+                parser_advance(p); /* ( */
+                parser_advance(p); /* * */
+                parser_advance(p); /* ) */
+
+                Expr *operand = parse_unary(p);
+                if (!operand) return NULL;
+
+                return make_call1_named("regex", operand, loc);
+            }
+
+            return parse_flow_postfix(p);
+        }
+
         default:
             return parse_flow_postfix(p);
     }
@@ -764,16 +782,44 @@ Expr *parse_flow_postfix(Parser *p) {
     if (!expr) return NULL;
 
     for (;;) {
-        if (parser_match(p, TK_POP_ARROW)) {
-            Token *op = parser_previous(p);
-            expr = make_call1_named("pop", expr, op->loc);
-            if (!expr) return NULL;
-            continue;
+        if (parser_check(p, TK_POP_ARROW)) {
+            TokenKind k = parser_peek(p, 1)->kind;
+
+            bool has_rhs =
+                k != TK_EOF &&
+                k != TK_NEWLINE &&
+                k != TK_SEMICOLON &&
+                k != TK_RBRACE &&
+                k != TK_RPAREN &&
+                k != TK_RBRACKET &&
+                k != TK_COMMA &&
+                k != TK_COLON;
+
+            if (!has_rhs) {
+                Token *op = parser_advance(p);
+                expr = make_call1_named("pop", expr, op->loc);
+                if (!expr) return NULL;
+                continue;
+            }
         }
 
         if (parser_match(p, TK_SHIFT_ARROW)) {
             Token *op = parser_previous(p);
             expr = make_call1_named("shift", expr, op->loc);
+            if (!expr) return NULL;
+            continue;
+        }
+
+        if (parser_match(p, TK_EXPAND_ARRAY)) {
+            Token *op = parser_previous(p);
+            expr = make_call1_named("expand", expr, op->loc);
+            if (!expr) return NULL;
+            continue;
+        }
+
+        if (parser_match(p, TK_FLATTEN_ASSIGN)) {
+            Token *op = parser_previous(p);
+            expr = make_call1_named("flatten", expr, op->loc);
             if (!expr) return NULL;
             continue;
         }
@@ -1201,6 +1247,32 @@ Expr *parse_sugar(Parser *p) {
             }
 
             expr = make_call2_named("unshift", right, expr, op->loc);
+            if (!expr) return NULL;
+            continue;
+        }
+
+        if (parser_match(p, TK_MERGE_GT)) {
+            Token *op = parser_previous(p);
+            Expr *right = parse_ternary(p);
+            if (!right) {
+                ast_expr_free(expr);
+                return NULL;
+            }
+
+            expr = make_call2_named("merge", expr, right, op->loc);
+            if (!expr) return NULL;
+            continue;
+        }
+
+        if (parser_match(p, TK_SPLIT_LT3)) {
+            Token *op = parser_previous(p);
+            Expr *right = parse_ternary(p);
+            if (!right) {
+                ast_expr_free(expr);
+                return NULL;
+            }
+
+            expr = make_call2_named("split", expr, right, op->loc);
             if (!expr) return NULL;
             continue;
         }

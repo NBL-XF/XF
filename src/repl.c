@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <readline/readline.h>
+#include <readline/history.h>
 
 #include "../include/core.h"
 #include "../include/lexer.h"
@@ -10,6 +12,7 @@
 #include "../include/vm.h"
 #include "../include/value.h"
 #include "../include/interp.h"
+#define VERSION "1.0.0"
 
 static void bind_runtime_specials(Interp *it) {
     if (!it || !it->vm) return;
@@ -213,35 +216,61 @@ int xf_run_repl(void) {
     it0.syms = &syms;
     bind_runtime_specials(&it0);
 
-    printf("xf repl  (:quit to exit)\n");
+    puts("              *****:          -**********              ");
+    puts("               ******:       -************             ");
+    puts("                 ******     **************             ");
+    puts("                  ******   *******-::::::.             ");
+    puts("                   +****** *****                       ");
+    puts("                    ******* ***                        ");
+    puts("                     ******=  .*****                   ");
+    puts("                      ******= ******                   ");
+    puts("                       ****** =******                  ");
+    puts("                    *   ******                         ");
+    puts("                  *****  *******                       ");
+    puts("                ********   *******                     ");
+    puts("              ********       ******                    ");
+    puts("              *******         *******                  ");
+    puts("              ******           *****:                  ");
+    printf("xf repl v%s  (:quit to exit)\n", VERSION);
 
-    char line[4096];
-    while (1) {
-        printf(">> ");
-        fflush(stdout);
+    using_history();
 
-        if (!fgets(line, sizeof(line), stdin)) {
-            printf("\n");
+    char *line;
+    while ((line = readline(">> ")) != NULL) {
+        /* strip trailing whitespace */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' '))
+            line[--len] = '\0';
+
+        if (len == 0) {
+            free(line);
+            continue;
+        }
+
+        if (strcmp(line, ":quit") == 0 || strcmp(line, ":q") == 0) {
+            free(line);
             break;
         }
 
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-            line[--len] = '\0';
-        }
-
-        if (len == 0) continue;
-        if (strcmp(line, ":quit") == 0 || strcmp(line, ":q") == 0) break;
         if (strcmp(line, ":stack") == 0) {
             vm_dump_stack(&vm);
+            free(line);
             continue;
         }
+
+        /* add non-duplicate entries to history */
+        HIST_ENTRY *prev = history_length > 0 ? history_get(history_base + history_length - 1) : NULL;
+        if (!prev || strcmp(prev->line, line) != 0)
+            add_history(line);
 
         vm.had_error = false;
         memset(vm.err_msg, 0, sizeof(vm.err_msg));
 
         xf_repl_eval_line(&vm, &syms, line);
+        free(line);
     }
+
+    if (!line) printf("\n"); /* handle Ctrl+D cleanly */
 
     xf_repl_clear_eval_artifacts(&vm);
     sym_free(&syms);

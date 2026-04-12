@@ -1,15 +1,11 @@
 .DEFAULT_GOAL := all
-
 CC      = /opt/homebrew/opt/llvm/bin/clang
 AR      = /opt/homebrew/opt/llvm/bin/llvm-ar
-
 WARNFLAGS    = -Wall -Wextra -Wpedantic -std=c11
 DEBUGFLAGS   = -O1 -g -fsanitize=address,leak,undefined -fno-omit-frame-pointer
 THREADFLAGS  = -O0 -g -fsanitize=thread -fno-omit-frame-pointer
 RELEASEFLAGS = -O3
-
 MODE ?= release
-
 ifeq ($(MODE),debug)
 	CFLAGS  = $(DEBUGFLAGS) $(WARNFLAGS)
 	LDFLAGS = -fsanitize=address,leak,undefined
@@ -20,18 +16,14 @@ else
 	CFLAGS  = $(RELEASEFLAGS) $(WARNFLAGS)
 	LDFLAGS =
 endif
-
-LDLIBS  ?= -lm -lpthread
+LDLIBS  ?= -lm -lpthread -lreadline
 PREFIX  ?= /usr/local
 DESTDIR ?=
-
 OBJDIR  = obj/$(MODE)
 BINDIR  = bin/$(MODE)
 LIBDIR  = lib/$(MODE)
-
 BIN     = $(BINDIR)/xf
 LIBXF   = $(LIBDIR)/static/libxf.a
-
 CORE_SRCS = \
 	src/core.c \
 	src/core/helpers.c \
@@ -45,7 +37,6 @@ CORE_SRCS = \
 	src/core/edit.c \
 	src/core/process.c \
 	src/core/img.c
-
 RUNTIME_SRCS = \
 	src/ast.c \
 	src/interp.c \
@@ -55,22 +46,17 @@ RUNTIME_SRCS = \
 	src/value.c \
 	src/vm.c \
 	$(CORE_SRCS)
-
 # Optional later:
 # lib/driver.c
 # lib/api.c
 CLI_SRCS = \
 	src/main.c \
 	src/repl.c
-
 RUNTIME_OBJS = $(patsubst %.c,$(OBJDIR)/%.o,$(RUNTIME_SRCS))
 CLI_OBJS     = $(patsubst %.c,$(OBJDIR)/%.o,$(CLI_SRCS))
-
 all: $(LIBXF) $(BIN)
-
 # Keep this only if the header really exists and is required
 $(patsubst %.c,$(OBJDIR)/%.o,$(CORE_SRCS)): src/core/internal.h
-
 run: $(BIN)
 ifeq ($(MODE),debug)
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
@@ -80,19 +66,15 @@ ifeq ($(MODE),debug)
 else
 	$(BIN) -r tests/torture.xf
 endif
-
 $(LIBXF): $(RUNTIME_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
-
 $(BIN): $(CLI_OBJS) $(LIBXF)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ $(CLI_OBJS) $(LIBXF) $(LDFLAGS) $(LDLIBS)
-
 $(OBJDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
-
 install: $(LIBXF) $(BIN)
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -d $(DESTDIR)$(PREFIX)/lib
@@ -102,13 +84,10 @@ install: $(LIBXF) $(BIN)
 	install -m 644 include/core.h include/value.h include/symTable.h \
 	               lib/driver.h \
 	               $(DESTDIR)$(PREFIX)/include/xf/
-
 uninstall:
 	rm -f  $(DESTDIR)$(PREFIX)/bin/xf
 	rm -f  $(DESTDIR)$(PREFIX)/lib/libxf.a
 	rm -rf $(DESTDIR)$(PREFIX)/include/xf
-
 clean:
 	rm -rf obj/* bin/*
-
 .PHONY: all run install uninstall clean

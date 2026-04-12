@@ -488,15 +488,13 @@ static void skip_ws(Lexer * l) {
       break;
 
     case '\n':
-      if (l -> mode == XF_SRC_REPL &&
-        l -> brace_depth == 0 &&
-        l -> paren_depth == 0 &&
-        l -> bracket_depth == 0) {
+      if (l->brace_depth == 0 &&
+          l->paren_depth == 0 &&
+          l->bracket_depth == 0) {
         return;
       }
       advance(l);
       break;
-
     case '#':
       while (!at_end(l) && peek(l) != '\n') advance(l);
       break;
@@ -906,15 +904,16 @@ static Token * next(Lexer * l) {
   if (at_end(l))
     return append_token(l, make_tok(l, TK_EOF, l -> pos, cur_loc(l)));
 
-  if (l -> mode == XF_SRC_REPL && peek(l) == '\n' &&
-    l -> brace_depth == 0 && l -> paren_depth == 0 && l -> bracket_depth == 0) {
+  if (peek(l) == '\n' &&
+      l->brace_depth == 0 &&
+      l->paren_depth == 0 &&
+      l->bracket_depth == 0) {
     Loc loc = cur_loc(l);
-    size_t start = l -> pos;
+    size_t start = l->pos;
     advance(l);
-    l -> after_value = false;
+    l->after_value = false;
     return append_token(l, make_tok(l, TK_NEWLINE, start, loc));
   }
-
   Loc loc = cur_loc(l);
   size_t start = l -> pos;
   char c = advance(l);
