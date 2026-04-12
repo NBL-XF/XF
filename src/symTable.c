@@ -359,28 +359,411 @@ uint8_t sym_fn_return_type(const SymTable *st) {
 /* ============================================================
  * Built-in registration
  * ============================================================ */
+/* ============================================================
+ * Native builtins (minimal collection set)
+ * ============================================================ */
 
+static xf_value_t builtin_push(xf_value_t *args, size_t argc) {
+    if (!args || argc != 2) return xf_val_nav(XF_TYPE_VOID);
+
+    xf_value_t coll = args[0];
+    xf_value_t val  = args[1];
+
+    if (coll.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_VOID);
+
+    if (coll.type == XF_TYPE_ARR && coll.data.arr) {
+        xf_arr_push(coll.data.arr, xf_value_retain(val));
+        return xf_val_void(xf_val_null());
+    }
+
+    if (coll.type == XF_TYPE_SET && coll.data.set) {
+        if (!xf_set_add(coll.data.set, xf_value_retain(val))) {
+            return xf_val_nav(XF_TYPE_VOID);
+        }
+        return xf_val_void(xf_val_null());
+    }
+
+    return xf_val_nav(XF_TYPE_VOID);
+}
+
+static xf_value_t builtin_pop(xf_value_t *args, size_t argc) {
+    if (!args || argc != 1) return xf_val_nav(XF_TYPE_VOID);
+
+    xf_value_t coll = args[0];
+    if (coll.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_VOID);
+
+    if (coll.type == XF_TYPE_ARR && coll.data.arr) {
+        return xf_arr_pop(coll.data.arr);
+    }
+
+    return xf_val_nav(XF_TYPE_VOID);
+}
+
+static xf_value_t builtin_shift(xf_value_t *args, size_t argc) {
+    if (!args || argc != 1) return xf_val_nav(XF_TYPE_VOID);
+
+    xf_value_t coll = args[0];
+    if (coll.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_VOID);
+
+    if (coll.type == XF_TYPE_ARR && coll.data.arr) {
+        return xf_arr_shift(coll.data.arr);
+    }
+
+    return xf_val_nav(XF_TYPE_VOID);
+}
+
+static xf_value_t builtin_unshift(xf_value_t *args, size_t argc) {
+    if (!args || argc != 2) return xf_val_nav(XF_TYPE_VOID);
+
+    xf_value_t coll = args[0];
+    xf_value_t val  = args[1];
+
+    if (coll.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_VOID);
+
+    if (coll.type == XF_TYPE_ARR && coll.data.arr) {
+        xf_arr_unshift(coll.data.arr, xf_value_retain(val));
+        return xf_val_void(xf_val_null());
+    }
+
+    return xf_val_nav(XF_TYPE_VOID);
+}
+
+static xf_value_t builtin_remove(xf_value_t *args, size_t argc) {
+    if (!args || argc != 2) return xf_val_nav(XF_TYPE_VOID);
+
+    xf_value_t coll = args[0];
+    xf_value_t key  = args[1];
+
+    if (coll.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_VOID);
+
+    if (coll.type == XF_TYPE_ARR && coll.data.arr) {
+        xf_value_t idxv = xf_coerce_num(key);
+        if (idxv.state != XF_STATE_OK) {
+            xf_value_release(idxv);
+            return xf_val_nav(XF_TYPE_VOID);
+        }
+
+        double n = idxv.data.num;
+        xf_value_release(idxv);
+
+        if (n < 0) return xf_val_nav(XF_TYPE_VOID);
+
+        xf_arr_delete(coll.data.arr, (size_t)n);
+        return xf_val_void(xf_val_null());
+    }
+
+    if (coll.type == XF_TYPE_MAP && coll.data.map) {
+        xf_value_t ks = xf_coerce_str(key);
+        if (ks.state != XF_STATE_OK || ks.type != XF_TYPE_STR || !ks.data.str) {
+            xf_value_release(ks);
+            return xf_val_nav(XF_TYPE_VOID);
+        }
+
+        xf_map_delete(coll.data.map, ks.data.str);
+        xf_value_release(ks);
+        return xf_val_void(xf_val_null());
+    }
+
+    if (coll.type == XF_TYPE_SET && coll.data.set) {
+        xf_set_delete(coll.data.set, key);
+        return xf_val_void(xf_val_null());
+    }
+
+    return xf_val_nav(XF_TYPE_VOID);
+}
+
+static xf_value_t builtin_has(xf_value_t *args, size_t argc) {
+    if (!args || argc != 2) return xf_val_nav(XF_TYPE_BOOL);
+
+    xf_value_t coll = args[0];
+    xf_value_t key  = args[1];
+
+    if (coll.state != XF_STATE_OK) return xf_val_false();
+
+    if (coll.type == XF_TYPE_MAP && coll.data.map) {
+        xf_value_t ks = xf_coerce_str(key);
+        if (ks.state != XF_STATE_OK || ks.type != XF_TYPE_STR || !ks.data.str) {
+            xf_value_release(ks);
+            return xf_val_false();
+        }
+
+        xf_value_t found = xf_map_get(coll.data.map, ks.data.str);
+        xf_value_release(ks);
+
+        bool ok = (found.state != XF_STATE_NAV);
+        xf_value_release(found);
+        return xf_val_ok_bool(ok);
+    }
+
+    if (coll.type == XF_TYPE_SET && coll.data.set) {
+        return xf_val_ok_bool(xf_set_has(coll.data.set, key));
+    }
+
+    if (coll.type == XF_TYPE_ARR && coll.data.arr) {
+        xf_value_t idxv = xf_coerce_num(key);
+        if (idxv.state != XF_STATE_OK) {
+            xf_value_release(idxv);
+            return xf_val_false();
+        }
+
+        double n = idxv.data.num;
+        xf_value_release(idxv);
+
+        bool ok = (n >= 0) && ((size_t)n < coll.data.arr->len);
+        return xf_val_ok_bool(ok);
+    }
+
+    return xf_val_false();
+}
+
+static xf_value_t builtin_keys(xf_value_t *args, size_t argc) {
+    if (!args || argc != 1) return xf_val_nav(XF_TYPE_ARR);
+
+    xf_value_t coll = args[0];
+    if (coll.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_ARR);
+
+    xf_arr_t *out = xf_arr_new();
+    if (!out) return xf_val_nav(XF_TYPE_ARR);
+
+    if (coll.type == XF_TYPE_MAP && coll.data.map) {
+        xf_map_t *m = coll.data.map;
+        for (size_t i = 0; i < m->order_len; i++) {
+            xf_str_t *k = m->order[i];
+            if (!k) continue;
+
+            xf_value_t kv = xf_val_ok_str(k);
+            xf_arr_push(out, kv);
+            xf_value_release(kv);
+        }
+
+        xf_value_t rv = xf_val_ok_arr(out);
+        xf_arr_release(out);
+        return rv;
+    }
+
+    xf_arr_release(out);
+    return xf_val_nav(XF_TYPE_ARR);
+}
+
+static xf_value_t builtin_values(xf_value_t *args, size_t argc) {
+    if (!args || argc != 1) return xf_val_nav(XF_TYPE_ARR);
+
+    xf_value_t coll = args[0];
+    if (coll.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_ARR);
+
+    xf_arr_t *out = xf_arr_new();
+    if (!out) return xf_val_nav(XF_TYPE_ARR);
+
+    if (coll.type == XF_TYPE_MAP && coll.data.map) {
+        xf_map_t *m = coll.data.map;
+        for (size_t i = 0; i < m->order_len; i++) {
+            xf_str_t *k = m->order[i];
+            if (!k) continue;
+
+            xf_value_t vv = xf_map_get(m, k);
+            xf_arr_push(out, vv);
+            xf_value_release(vv);
+        }
+
+        xf_value_t rv = xf_val_ok_arr(out);
+        xf_arr_release(out);
+        return rv;
+    }
+
+    xf_arr_release(out);
+    return xf_val_nav(XF_TYPE_ARR);
+}
+static xf_value_t builtin_len(xf_value_t *args, size_t argc) {
+    if (!args || argc != 1) return xf_val_nav(XF_TYPE_NUM);
+
+    xf_value_t v = args[0];
+    if (v.state != XF_STATE_OK) return xf_value_retain(v);
+
+    switch (v.type) {
+        case XF_TYPE_STR:
+            return xf_val_ok_num(v.data.str ? (double)v.data.str->len : 0.0);
+
+        case XF_TYPE_ARR:
+            return xf_val_ok_num(v.data.arr ? (double)v.data.arr->len : 0.0);
+
+        case XF_TYPE_TUPLE:
+            return xf_val_ok_num(v.data.tuple ? (double)xf_tuple_len(v.data.tuple) : 0.0);
+
+        case XF_TYPE_MAP:
+            return xf_val_ok_num(v.data.map ? (double)xf_map_count(v.data.map) : 0.0);
+
+        case XF_TYPE_SET:
+            return xf_val_ok_num(v.data.set ? (double)xf_set_count(v.data.set) : 0.0);
+
+        default:
+            return xf_val_nav(XF_TYPE_NUM);
+    }
+}
+static xf_value_t builtin_filter(xf_value_t *args, size_t argc) {
+    if (!args || argc != 2) return xf_val_nav(XF_TYPE_ARR);
+
+    xf_value_t coll = args[0];
+    xf_value_t pred = args[1];
+
+    if (coll.state != XF_STATE_OK || coll.type != XF_TYPE_ARR || !coll.data.arr) {
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    if (pred.state != XF_STATE_OK || pred.type != XF_TYPE_FN || !pred.data.fn) {
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    xf_arr_t *out = xf_arr_new();
+    if (!out) return xf_val_nav(XF_TYPE_ARR);
+
+    for (size_t i = 0; i < coll.data.arr->len; i++) {
+        xf_value_t argv[1];
+        argv[0] = xf_value_retain(coll.data.arr->items[i]);
+
+        xf_value_t keep = pred.data.fn->native_v
+            ? pred.data.fn->native_v(argv, 1)
+            : xf_val_nav(XF_TYPE_BOOL);
+
+        xf_value_release(argv[0]);
+
+        bool truthy =
+            (keep.state == XF_STATE_TRUE) ||
+            (keep.state == XF_STATE_OK && keep.type == XF_TYPE_NUM && keep.data.num != 0);
+
+        if (truthy) {
+            xf_arr_push(out, coll.data.arr->items[i]);
+        }
+
+        xf_value_release(keep);
+    }
+
+    xf_value_t rv = xf_val_ok_arr(out);
+    xf_arr_release(out);
+    return rv;
+}
+
+static xf_value_t builtin_transform(xf_value_t *args, size_t argc) {
+    if (!args || argc != 2) return xf_val_nav(XF_TYPE_ARR);
+
+    xf_value_t coll = args[0];
+    xf_value_t fn   = args[1];
+
+    if (coll.state != XF_STATE_OK || coll.type != XF_TYPE_ARR || !coll.data.arr) {
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    if (fn.state != XF_STATE_OK || fn.type != XF_TYPE_FN || !fn.data.fn) {
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    xf_arr_t *out = xf_arr_new();
+    if (!out) return xf_val_nav(XF_TYPE_ARR);
+
+    for (size_t i = 0; i < coll.data.arr->len; i++) {
+        xf_value_t argv[1];
+        argv[0] = xf_value_retain(coll.data.arr->items[i]);
+
+        xf_value_t mapped = fn.data.fn->native_v
+            ? fn.data.fn->native_v(argv, 1)
+            : xf_val_nav(XF_TYPE_VOID);
+
+        xf_value_release(argv[0]);
+        xf_arr_push(out, mapped);
+        xf_value_release(mapped);
+    }
+
+    xf_value_t rv = xf_val_ok_arr(out);
+    xf_arr_release(out);
+    return rv;
+}
+static xf_value_t builtin_print_fn(xf_value_t *args, size_t argc) {
+    if (!args || argc == 0) {
+        printf("\n");
+        return xf_val_void(xf_val_null());
+    }
+
+    for (size_t i = 0; i < argc; i++) {
+        if (i) printf(" ");
+        xf_value_print(args[i]);
+    }
+    printf("\n");
+
+    return xf_value_retain(args[argc - 1]);
+}
 static const char *const k_builtins[] = {
     "sin", "cos", "sqrt", "abs", "int",
     "len", "split", "sub", "gsub", "match", "substr", "index",
     "toupper", "tolower", "trim", "sprintf", "column",
-    "getline", "close", "flush",
+    "getline", "close", "flush","filter","transform",
     "push", "pop", "shift", "unshift", "remove", "has", "keys", "values",
     "read", "lines", "write", "append",
-    "system", "time", "rand", "srand", "exit",
+    "system", "time", "rand", "srand", "exit","print"
 };
 
 #define BUILTIN_COUNT (sizeof(k_builtins) / sizeof(k_builtins[0]))
 
 void sym_register_builtins(SymTable *st) {
+    if (!st) return;
+
+    /* real collection builtins */
+    xf_value_t filter_v    = xf_val_native_fn("filter",    XF_TYPE_ARR, builtin_filter);
+xf_value_t transform_v = xf_val_native_fn("transform", XF_TYPE_ARR, builtin_transform);
+    xf_value_t push_v    = xf_val_native_fn("push",    XF_TYPE_VOID, builtin_push);
+    xf_value_t pop_v     = xf_val_native_fn("pop",     XF_TYPE_VOID, builtin_pop);
+    xf_value_t len_v = xf_val_native_fn("len", XF_TYPE_NUM, builtin_len);
+sym_define_builtin(st, "len", XF_TYPE_FN, len_v);
+xf_value_release(len_v);
+    xf_value_t shift_v   = xf_val_native_fn("shift",   XF_TYPE_VOID, builtin_shift);
+    xf_value_t unshift_v = xf_val_native_fn("unshift", XF_TYPE_VOID, builtin_unshift);
+    xf_value_t remove_v  = xf_val_native_fn("remove",  XF_TYPE_VOID, builtin_remove);
+    xf_value_t has_v     = xf_val_native_fn("has",     XF_TYPE_BOOL, builtin_has);
+    xf_value_t keys_v    = xf_val_native_fn("keys",    XF_TYPE_ARR,  builtin_keys);
+    xf_value_t values_v  = xf_val_native_fn("values",  XF_TYPE_ARR,  builtin_values);
+    xf_value_t print_v   = xf_val_native_fn("print", XF_TYPE_VOID, builtin_print_fn);
+sym_define_builtin(st, "filter",    XF_TYPE_FN, filter_v);
+sym_define_builtin(st, "transform", XF_TYPE_FN, transform_v);
+    sym_define_builtin(st, "push",    XF_TYPE_FN, push_v);
+    sym_define_builtin(st, "pop",     XF_TYPE_FN, pop_v);
+    sym_define_builtin(st, "shift",   XF_TYPE_FN, shift_v);
+    sym_define_builtin(st, "unshift", XF_TYPE_FN, unshift_v);
+    sym_define_builtin(st, "remove",  XF_TYPE_FN, remove_v);
+    sym_define_builtin(st, "has",     XF_TYPE_FN, has_v);
+    sym_define_builtin(st, "keys",    XF_TYPE_FN, keys_v);
+    sym_define_builtin(st, "values",  XF_TYPE_FN, values_v);
+    sym_define_builtin(st, "print", XF_TYPE_FN, print_v);
+    xf_value_release(push_v);
+    xf_value_release(pop_v);
+    xf_value_release(shift_v);
+    xf_value_release(unshift_v);
+    xf_value_release(filter_v);
+xf_value_release(transform_v);
+    xf_value_release(remove_v);
+    xf_value_release(has_v);
+    xf_value_release(keys_v);
+    xf_value_release(values_v);
+    xf_value_release(print_v);
+    /* keep the rest as placeholders for now */
     xf_Value fn_undef = xf_val_undef(XF_TYPE_FN);
 
     for (size_t i = 0; i < BUILTIN_COUNT; i++) {
-        sym_define_builtin(st, k_builtins[i], XF_TYPE_FN, fn_undef);
+        const char *name = k_builtins[i];
+
+        if (strcmp(name, "push")    == 0 ||
+            strcmp(name, "pop")     == 0 ||
+            strcmp(name, "len") == 0 ||
+            strcmp(name, "shift")   == 0 ||
+            strcmp(name, "unshift") == 0 ||
+            strcmp(name, "remove")  == 0 ||
+            strcmp(name, "has")     == 0 ||
+            strcmp(name, "keys")    == 0 ||
+            strcmp(name, "print") == 0 ||
+            strcmp(name, "values")  == 0) {
+            continue;
+        }
+
+        sym_define_builtin(st, name, XF_TYPE_FN, fn_undef);
     }
 }
-
-
 /* ============================================================
  * Debug
  * ============================================================ */

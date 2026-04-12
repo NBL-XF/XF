@@ -34,7 +34,45 @@ typedef struct {
     uint8_t      return_type;
 } FnCompileCtx;
 static int g_compile_depth = 0;
+static bool g_interp_preserve_bindings = false;
 static FnCompileCtx *g_fn_ctx = NULL;
+        #define MAX_CONTINUE_DEPTH    64
+#define MAX_CONTINUE_PATCHES  512
+
+typedef struct {
+    size_t target;
+    bool   is_for_loop;
+    size_t patches[MAX_CONTINUE_PATCHES];
+    size_t patch_count;
+} ContinueCtx;
+
+static ContinueCtx g_continue_stack[MAX_CONTINUE_DEPTH];
+static int         g_continue_depth = 0;
+
+static bool continue_push(size_t target, bool is_for_loop) {
+    if (g_continue_depth >= MAX_CONTINUE_DEPTH) return false;
+    g_continue_stack[g_continue_depth].target = target;
+    g_continue_stack[g_continue_depth].is_for_loop = is_for_loop;
+    g_continue_stack[g_continue_depth].patch_count = 0;
+    g_continue_depth++;
+    return true;
+}
+
+static void continue_set_target(size_t target) {
+    if (g_continue_depth <= 0) return;
+    g_continue_stack[g_continue_depth - 1].target = target;
+}
+static void continue_pop(Chunk *c) {
+    if (g_continue_depth <= 0) return;
+    g_continue_depth--;
+    ContinueCtx *ctx = &g_continue_stack[g_continue_depth];
+    for (size_t i = 0; i < ctx->patch_count; i++) {
+        size_t jump_pos = ctx->patches[i];
+        int32_t delta = (int32_t)ctx->target - (int32_t)(jump_pos + 2);
+        chunk_patch_jump(c, jump_pos, (int16_t)delta);
+    }
+    ctx->patch_count = 0;
+}
 static int fn_local_find(xf_Str *name) {
     if (!g_fn_ctx || !name) return -1;
 
@@ -69,6 +107,20 @@ static void fn_ctx_cleanup(FnCompileCtx *ctx) {
         ctx->locals[i].name = NULL;
     }
     ctx->count = 0;
+}
+static bool compile_call_expr(Interp *it, Chunk *c, Expr *call) {
+    if (!call || call->kind != EXPR_CALL) {
+        fprintf(stderr, "compile_call_expr: expected EXPR_CALL\n");
+        return false;
+    }
+
+    if (!compile_expr(it, c, call->as.call.callee)) return false;
+
+    for (size_t i = 0; i < call->as.call.argc; i++) {
+        if (!compile_expr(it, c, call->as.call.args[i])) return false;
+    }
+
+    return true;
 }
 static xf_fn_t *build_compiled_fn(xf_Str *name,
                                   uint8_t return_type,
@@ -227,6 +279,53 @@ static int compiler_global_find_str(xf_Str *name) {
 }
 static uint32_t g_hidden_counter = 0;
 
+/* ── loop break/continue patch lists ────────────────────────────
+ * Each nested loop pushes an entry.  STMT_BREAK appends to the
+ * top entry; after the loop's back-jump we patch them all to the
+ * instruction right after the loop.
+ * ──────────────────────────────────────────────────────────────*/
+#define MAX_LOOP_DEPTH   64
+#define MAX_BREAK_PATCHES 512
+
+typedef struct {
+    size_t patches[MAX_BREAK_PATCHES];
+    size_t count;
+} BreakCtx;
+
+static BreakCtx g_break_stack[MAX_LOOP_DEPTH];
+static int      g_break_depth = 0;
+
+static void break_push(void) {
+    if (g_break_depth < MAX_LOOP_DEPTH) {
+        g_break_stack[g_break_depth].count = 0;
+        g_break_depth++;
+    }
+}
+
+static void break_pop(Chunk *c) {
+    if (g_break_depth <= 0) return;
+    g_break_depth--;
+    BreakCtx *bctx = &g_break_stack[g_break_depth];
+    for (size_t i = 0; i < bctx->count; i++) {
+        patch_jump_here(c, bctx->patches[i]);
+    }
+    bctx->count = 0;
+}
+
+static bool break_emit(Chunk *c, uint32_t line) {
+    if (g_break_depth <= 0) {
+        fprintf(stderr, "compile_stmt: 'break' outside loop\n");
+        return false;
+    }
+    BreakCtx *bctx = &g_break_stack[g_break_depth - 1];
+    if (bctx->count >= MAX_BREAK_PATCHES) {
+        fprintf(stderr, "compile_stmt: too many breaks in one loop\n");
+        return false;
+    }
+    bctx->patches[bctx->count++] = emit_jump(c, OP_JUMP, line);
+    return true;
+}
+
 static uint32_t bind_hidden_global(Interp *it, const char *prefix) {
     char buf[64];
     snprintf(buf, sizeof(buf), "__xf_%s_%u", prefix, (unsigned)g_hidden_counter++);
@@ -268,14 +367,23 @@ uint32_t interp_bind_global_name(Interp *it, xf_Str *name) {
     xf_Str *copy = xf_str_retain(name);
     if (!copy) return UINT32_MAX;
 
-    xf_Value init = xf_val_undef(XF_TYPE_VOID);
+    xf_Value init;
+    memset(&init, 0, sizeof(init));
 
     if (it->syms) {
         Symbol *sym = sym_lookup_str(it->syms, name);
-        if (sym && sym->is_defined) {
-            xf_value_release(init);
-            init = xf_value_retain(sym->value);
+
+        if (sym) {
+            if (sym->is_defined) {
+                init = xf_value_retain(sym->value);
+            } else {
+                init = xf_val_undef(sym->type ? sym->type : XF_TYPE_VOID);
+            }
+        } else {
+            init = xf_val_undet(XF_TYPE_VOID);
         }
+    } else {
+        init = xf_val_undet(XF_TYPE_VOID);
     }
 
     uint32_t slot = vm_alloc_global(it->vm, init);
@@ -287,7 +395,6 @@ uint32_t interp_bind_global_name(Interp *it, xf_Str *name) {
 
     return slot;
 }
-
 uint32_t interp_bind_global_cstr(Interp *it, const char *name) {
     if (!it || !it->vm || !name) return UINT32_MAX;
 
@@ -309,6 +416,7 @@ uint32_t interp_bind_global_cstr(Interp *it, const char *name) {
 
     xf_Value init = xf_val_undef(XF_TYPE_VOID);
     uint32_t slot = vm_alloc_global(it->vm, init);
+    xf_value_release(init);
 
     g_compiler_globals[g_compiler_globals_count].name = copy;
     g_compiler_globals[g_compiler_globals_count].slot = slot;
@@ -359,14 +467,20 @@ static void patch_jump_here(Chunk *c, size_t jump_pos) {
     int32_t delta = (int32_t)after - (int32_t)(jump_pos + 2);
     chunk_patch_jump(c, jump_pos, (int16_t)delta);
 }
+bool interp_compile_program_repl(Interp *it, Program *prog) {
+    bool saved = g_interp_preserve_bindings;
+    g_interp_preserve_bindings = true;
+    bool ok = interp_compile_program(it, prog);
+    g_interp_preserve_bindings = saved;
+    return ok;
+}
 bool interp_compile_program(Interp *it, Program *prog) {
     if (!it || !it->vm || !prog) return false;
-
-    bool ok = false;
-    bool top_level_compile = (g_compile_depth == 0);
-    if (top_level_compile) {
-        interp_reset_global_bindings();
-    }
+bool ok = false;
+bool top_level_compile = (g_compile_depth == 0);
+if (top_level_compile && !g_interp_preserve_bindings) {
+    interp_reset_global_bindings();
+}
     g_compile_depth++;
 
     VM *vm = it->vm;
@@ -416,30 +530,48 @@ bool interp_compile_program(Interp *it, Program *prog) {
         TopLevel *tl = prog->items[i];
 
         switch (tl->kind) {
-            case TOP_FN: {
-                xf_fn_t *fn = compile_named_function(it,
-                                                     tl->as.fn.name,
-                                                     tl->as.fn.return_type,
-                                                     tl->as.fn.params,
-                                                     tl->as.fn.param_count,
-                                                     tl->as.fn.body,
-                                                     tl->loc);
-                if (!fn) goto done;
+        case TOP_FN: {
+    xf_fn_t *fn = compile_named_function(it,
+                                         tl->as.fn.name,
+                                         tl->as.fn.return_type,
+                                         tl->as.fn.params,
+                                         tl->as.fn.param_count,
+                                         tl->as.fn.body,
+                                         tl->loc);
+    if (!fn) goto done;
 
-                xf_Value fv = xf_val_ok_fn(fn);
-                xf_fn_release(fn);
+    xf_Value fv = xf_val_ok_fn(fn);
+    xf_fn_release(fn);
 
-                uint32_t slot = compile_global_name(it, tl->as.fn.name);
-                if (slot == UINT32_MAX) {
-                    xf_value_release(fv);
-                    goto done;
-                }
+    uint32_t slot = compile_global_name(it, tl->as.fn.name);
+    if (slot == UINT32_MAX) {
+        xf_value_release(fv);
+        goto done;
+    }
 
-                vm_set_global(vm, slot, fv);
-                xf_value_release(fv);
-                break;
-            }
+    vm_set_global(vm, slot, fv);
 
+    if (it->syms) {
+        Symbol *sym = sym_lookup_str(it->syms, tl->as.fn.name);
+        if (!sym) {
+            sym = sym_declare(it->syms,
+                              tl->as.fn.name,
+                              SYM_FN,
+                              XF_TYPE_FN,
+                              tl->loc);
+        }
+        if (sym) {
+            xf_value_release(sym->value);
+            sym->value      = xf_value_retain(fv);
+            sym->type       = XF_TYPE_FN;
+            sym->is_const   = true;
+            sym->is_defined = true;
+        }
+    }
+
+    xf_value_release(fv);
+    break;
+}
             case TOP_BEGIN: {
                 if (!vm->begin_chunk) {
                     vm->begin_chunk = calloc(1, sizeof(Chunk));
@@ -574,7 +706,40 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
                 if (!compile_stmt(it, c, s->as.block.stmts[i])) return false;
             }
             return true;
+                case STMT_SPAWN: {
+            if (!s->as.spawn.call || s->as.spawn.call->kind != EXPR_CALL) {
+                fprintf(stderr, "compile_stmt: spawn expects call at %u:%u\n",
+                        s->loc.line, s->loc.col);
+                return false;
+            }
 
+            Expr tmp = {0};
+            tmp.kind = EXPR_SPAWN;
+            tmp.loc  = s->loc;
+            tmp.as.spawn_expr.call = s->as.spawn.call;
+
+            if (!compile_expr(it, c, &tmp)) return false;
+
+            /* statement-form spawn discards returned handle */
+            chunk_write(c, OP_POP, s->loc.line);
+            return true;
+        }
+
+        case STMT_JOIN: {
+            if (!s->as.join.handle) {
+                fprintf(stderr, "compile_stmt: join expects handle expression at %u:%u\n",
+                        s->loc.line, s->loc.col);
+                return false;
+            }
+
+            if (!compile_expr(it, c, s->as.join.handle)) return false;
+
+            chunk_write(c, OP_JOIN, s->loc.line);
+
+            /* statement-form join discards joined result */
+            chunk_write(c, OP_POP, s->loc.line);
+            return true;
+        }
         case STMT_EXPR:
             if (!compile_expr(it, c, s->as.expr.expr)) return false;
             chunk_write(c, OP_POP, s->loc.line);
@@ -639,11 +804,27 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
             chunk_write(c, (uint8_t)argc, s->loc.line);
             return true;
         }
-
         case STMT_NEXT:
+    if (g_continue_depth > 0) {
+        ContinueCtx *cctx = &g_continue_stack[g_continue_depth - 1];
+        if (cctx->is_for_loop) {
+            if (cctx->patch_count >= MAX_CONTINUE_PATCHES) {
+                fprintf(stderr, "compile_stmt: too many next/continue sites in one loop\n");
+                return false;
+            }
+            cctx->patches[cctx->patch_count++] = emit_jump(c, OP_JUMP, s->loc.line);
+            return true;
+        }
+
+        chunk_write(c, OP_JUMP, s->loc.line);
+        int32_t delta = (int32_t)cctx->target - (int32_t)(c->len + 2);
+        chunk_write_u16(c, (uint16_t)(int16_t)delta, s->loc.line);
+        return true;
+    }
+
     chunk_write(c, OP_NEXT_RECORD, s->loc.line);
     return true;
-        case STMT_VAR_DECL: {
+    case STMT_VAR_DECL: {
     if (it->syms) {
         Symbol *sym = sym_lookup_local_str(it->syms, s->as.var_decl.name);
         if (!sym) {
@@ -654,17 +835,21 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
                               s->loc);
         }
         if (sym) {
-            sym->type = s->as.var_decl.type;
-            sym->is_defined = true;
-        }
+    sym->type = s->as.var_decl.type;
+    sym->is_defined = (s->as.var_decl.init != NULL);
+}
     }
 
-    if (s->as.var_decl.init) {
-        if (!compile_expr(it, c, s->as.var_decl.init)) return false;
-    } else {
-        chunk_write(c, OP_PUSH_UNDEF, s->loc.line);
-    }
+if (s->as.var_decl.init) {
+    if (!compile_expr(it, c, s->as.var_decl.init)) return false;
+} else {
+    xf_Value v = xf_val_undef(s->as.var_decl.type);
+    uint32_t idx = chunk_add_const(c, v);
+    xf_value_release(v);
 
+    chunk_write(c, OP_PUSH_CONST, s->loc.line);
+    chunk_write_u32(c, idx, s->loc.line);
+}
     if (g_fn_ctx) {
         int slot = fn_local_add(s->as.var_decl.name, s->as.var_decl.type);
         if (slot < 0) return false;
@@ -723,7 +908,7 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
                 chunk_write(c, OP_RETURN_NULL, s->loc.line);
             }
             return true;
-        case STMT_FN_DECL: {
+         case STMT_FN_DECL: {
     xf_fn_t *fn = compile_named_function(it,
                                          s->as.fn_decl.name,
                                          s->as.fn_decl.return_type,
@@ -743,6 +928,25 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
     }
 
     vm_set_global(it->vm, slot, fv);
+
+    if (it->syms) {
+        Symbol *sym = sym_lookup_str(it->syms, s->as.fn_decl.name);
+        if (!sym) {
+            sym = sym_declare(it->syms,
+                              s->as.fn_decl.name,
+                              SYM_FN,
+                              XF_TYPE_FN,
+                              s->loc);
+        }
+        if (sym) {
+            xf_value_release(sym->value);
+            sym->value      = xf_value_retain(fv);
+            sym->type       = XF_TYPE_FN;
+            sym->is_const   = true;
+            sym->is_defined = true;
+        }
+    }
+
     xf_value_release(fv);
     return true;
 }
@@ -815,17 +1019,19 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
             return true;
         }
         case STMT_BREAK:
-        case STMT_JOIN:
-        case STMT_SPAWN:
+            return break_emit(c, s->loc.line);
+
         case STMT_SUBST:
         case STMT_TRANS:
         default:
         fprintf(stderr, "compile_stmt: unimplemented %s at %u:%u\n",
                     stmt_kind_name(s->kind), s->loc.line, s->loc.col);
+        return false;
     }
+    return false; /* unreachable but silences compiler warning */
 }
 static bool compile_expr(Interp *it, Chunk *c, Expr *e) {
-    if (!e) return false;
+    if (!it || !c || !e) return false;
 
     switch (e->kind) {
         case EXPR_NUM:
@@ -834,339 +1040,228 @@ static bool compile_expr(Interp *it, Chunk *c, Expr *e) {
             return true;
 
         case EXPR_STR: {
-            uint32_t idx = chunk_add_const(c, xf_val_ok_str(e->as.str.value));
+            xf_Value sv = xf_val_ok_str(e->as.str.value);
+            uint32_t idx = chunk_add_const(c, sv);
+            xf_value_release(sv);
+
             chunk_write(c, OP_PUSH_STR, e->loc.line);
             chunk_write_u32(c, idx, e->loc.line);
             return true;
         }
+
+        case EXPR_REGEX: {
+            /* For tonight, compile regex literals as plain string patterns.
+               This matches the current VM OP_MATCH / OP_NMATCH behavior,
+               which is string-based, not compiled-regex-based. */
+            xf_Value sv = xf_val_ok_str(e->as.regex.pattern);
+            uint32_t idx = chunk_add_const(c, sv);
+            xf_value_release(sv);
+
+            chunk_write(c, OP_PUSH_STR, e->loc.line);
+            chunk_write_u32(c, idx, e->loc.line);
+            return true;
+        }
+
+        case EXPR_FN: {
+            static uint32_t anon_counter = 0;
+
+            char namebuf[64];
+            snprintf(namebuf, sizeof(namebuf), "__anon_fn_%u", (unsigned)anon_counter++);
+
+            xf_Str *anon_name = xf_str_from_cstr(namebuf);
+            if (!anon_name) return false;
+
+            xf_fn_t *fn = compile_named_function(it,
+                                                 anon_name,
+                                                 e->as.fn.return_type,
+                                                 e->as.fn.params,
+                                                 e->as.fn.param_count,
+                                                 e->as.fn.body,
+                                                 e->loc);
+            xf_str_release(anon_name);
+            if (!fn) return false;
+
+            xf_Value fv = xf_val_ok_fn(fn);
+            xf_fn_release(fn);
+
+            uint32_t idx = chunk_add_const(c, fv);
+            xf_value_release(fv);
+
+            chunk_write(c, OP_PUSH_CONST, e->loc.line);
+            chunk_write_u32(c, idx, e->loc.line);
+            return true;
+        }
+
+        case EXPR_STATE_LIT: {
+            switch (e->as.state_lit.state) {
+                case XF_STATE_TRUE:
+                    chunk_write(c, OP_PUSH_TRUE, e->loc.line);
+                    return true;
+
+                case XF_STATE_FALSE:
+                    chunk_write(c, OP_PUSH_FALSE, e->loc.line);
+                    return true;
+
+                case XF_STATE_NULL:
+                    chunk_write(c, OP_PUSH_NULL, e->loc.line);
+                    return true;
+
+                case XF_STATE_UNDEF:
+                    chunk_write(c, OP_PUSH_UNDEF, e->loc.line);
+                    return true;
+
+                case XF_STATE_VOID: {
+                    xf_Value v = xf_val_void(xf_val_null());
+                    uint32_t idx = chunk_add_const(c, v);
+                    xf_value_release(v);
+                    chunk_write(c, OP_PUSH_CONST, e->loc.line);
+                    chunk_write_u32(c, idx, e->loc.line);
+                    return true;
+                }
+
+                case XF_STATE_NAV: {
+                    xf_Value v = xf_val_nav(XF_TYPE_VOID);
+                    uint32_t idx = chunk_add_const(c, v);
+                    xf_value_release(v);
+                    chunk_write(c, OP_PUSH_CONST, e->loc.line);
+                    chunk_write_u32(c, idx, e->loc.line);
+                    return true;
+                }
+
+                case XF_STATE_UNDET: {
+                    xf_Value v = xf_val_undet(XF_TYPE_VOID);
+                    uint32_t idx = chunk_add_const(c, v);
+                    xf_value_release(v);
+                    chunk_write(c, OP_PUSH_CONST, e->loc.line);
+                    chunk_write_u32(c, idx, e->loc.line);
+                    return true;
+                }
+
+                case XF_STATE_OK: {
+                    xf_Value v = xf_val_ok_num(0);
+                    uint32_t idx = chunk_add_const(c, v);
+                    xf_value_release(v);
+                    chunk_write(c, OP_PUSH_CONST, e->loc.line);
+                    chunk_write_u32(c, idx, e->loc.line);
+                    return true;
+                }
+case XF_STATE_ERR: {
+    xf_err_t *err = xf_err_new("ERR literal", "<literal>", e->loc.line, e->loc.col);
+    if (!err) return false;
+
+    xf_Value v = xf_val_err(err, XF_TYPE_VOID);
+
+    /* v now owns the retained error; drop our constructor reference once */
+    xf_err_release(err);
+
+    uint32_t idx = chunk_add_const(c, v);
+    xf_value_release(v);
+
+    chunk_write(c, OP_PUSH_CONST, e->loc.line);
+    chunk_write_u32(c, idx, e->loc.line);
+    return true;
+}
+
+                default:
+                    fprintf(stderr,
+                            "compile_expr: EXPR_STATE_LIT state not implemented at %u:%u\n",
+                            e->loc.line, e->loc.col);
+                    return false;
+            }
+        }
+
         case EXPR_SVAR: {
-    switch (e->as.var_ref.var) {
-        case TK_VAR_NR:
-            chunk_write(c, OP_LOAD_NR, e->loc.line);
-            return true;
-        case TK_VAR_NF:
-            chunk_write(c, OP_LOAD_NF, e->loc.line);
-            return true;
-        case TK_VAR_FNR:
-            chunk_write(c, OP_LOAD_FNR, e->loc.line);
-            return true;
-        case TK_VAR_FS:
-            chunk_write(c, OP_LOAD_FS, e->loc.line);
-            return true;
-        case TK_VAR_RS:
-            chunk_write(c, OP_LOAD_RS, e->loc.line);
-            return true;
-        case TK_VAR_OFS:
-            chunk_write(c, OP_LOAD_OFS, e->loc.line);
-            return true;
-        case TK_VAR_ORS:
-            chunk_write(c, OP_LOAD_ORS, e->loc.line);
-            return true;
+            switch (e->as.var_ref.var) {
+                case TK_VAR_NR:   chunk_write(c, OP_LOAD_NR, e->loc.line);  return true;
+                case TK_VAR_NF:   chunk_write(c, OP_LOAD_NF, e->loc.line);  return true;
+                case TK_VAR_FNR:  chunk_write(c, OP_LOAD_FNR, e->loc.line); return true;
+                case TK_VAR_FS:   chunk_write(c, OP_LOAD_FS, e->loc.line);  return true;
+                case TK_VAR_RS:   chunk_write(c, OP_LOAD_RS, e->loc.line);  return true;
+                case TK_VAR_OFS:  chunk_write(c, OP_LOAD_OFS, e->loc.line); return true;
+                case TK_VAR_ORS:  chunk_write(c, OP_LOAD_ORS, e->loc.line); return true;
 
-        /* these can be added later if/when their runtime path is wired */
-        case TK_VAR_OFMT:
-        case TK_VAR_FILE:
-        case TK_VAR_MATCH:
-        case TK_VAR_CAPS:
-        case TK_VAR_ERR:
-            fprintf(stderr,
-                    "compile_expr: stream var token not implemented yet (%d) at %u:%u\n",
-                    (int)e->as.var_ref.var, e->loc.line, e->loc.col);
-            return false;
+                case TK_VAR_OFMT: {
+                    uint32_t slot = interp_bind_global_cstr(it, "OFMT");
+                    if (slot == UINT32_MAX) return false;
+                    chunk_write(c, OP_LOAD_GLOBAL, e->loc.line);
+                    chunk_write_u32(c, slot, e->loc.line);
+                    return true;
+                }
 
-        default:
-            fprintf(stderr,
-                    "compile_expr: unsupported EXPR_SVAR token %d at %u:%u\n",
-                    (int)e->as.var_ref.var, e->loc.line, e->loc.col);
-            return false;
-    }
-}
+                case TK_VAR_FILE: {
+                    uint32_t slot = interp_bind_global_cstr(it, "file");
+                    if (slot == UINT32_MAX) return false;
+                    chunk_write(c, OP_LOAD_GLOBAL, e->loc.line);
+                    chunk_write_u32(c, slot, e->loc.line);
+                    return true;
+                }
+
+                case TK_VAR_MATCH: {
+                    uint32_t slot = interp_bind_global_cstr(it, "match");
+                    if (slot == UINT32_MAX) return false;
+                    chunk_write(c, OP_LOAD_GLOBAL, e->loc.line);
+                    chunk_write_u32(c, slot, e->loc.line);
+                    return true;
+                }
+
+                case TK_VAR_CAPS: {
+                    uint32_t slot = interp_bind_global_cstr(it, "captures");
+                    if (slot == UINT32_MAX) return false;
+                    chunk_write(c, OP_LOAD_GLOBAL, e->loc.line);
+                    chunk_write_u32(c, slot, e->loc.line);
+                    return true;
+                }
+
+                case TK_VAR_ERR: {
+                    uint32_t slot = interp_bind_global_cstr(it, "err");
+                    if (slot == UINT32_MAX) return false;
+                    chunk_write(c, OP_LOAD_GLOBAL, e->loc.line);
+                    chunk_write_u32(c, slot, e->loc.line);
+                    return true;
+                }
+
+                default:
+                    fprintf(stderr,
+                            "compile_expr: unsupported EXPR_SVAR token %d at %u:%u\n",
+                            (int)e->as.var_ref.var, e->loc.line, e->loc.col);
+                    return false;
+            }
+        }
+
+        case EXPR_IVAR: {
+            switch (e->as.var_ref.var) {
+                case TK_VAR_NR:   chunk_write(c, OP_LOAD_NR, e->loc.line);  return true;
+                case TK_VAR_NF:   chunk_write(c, OP_LOAD_NF, e->loc.line);  return true;
+                case TK_VAR_FNR:  chunk_write(c, OP_LOAD_FNR, e->loc.line); return true;
+                case TK_VAR_FS:   chunk_write(c, OP_LOAD_FS, e->loc.line);  return true;
+                case TK_VAR_RS:   chunk_write(c, OP_LOAD_RS, e->loc.line);  return true;
+                case TK_VAR_OFS:  chunk_write(c, OP_LOAD_OFS, e->loc.line); return true;
+                case TK_VAR_ORS:  chunk_write(c, OP_LOAD_ORS, e->loc.line); return true;
+
+                default:
+                    fprintf(stderr,
+                            "compile_expr: unsupported record var token %d at %u:%u\n",
+                            (int)e->as.var_ref.var, e->loc.line, e->loc.col);
+                    return false;
+            }
+        }
+
         case EXPR_TUPLE_LIT: {
-    size_t n = e->as.list_lit.count;
-
-    for (size_t i = 0; i < n; i++) {
-        if (!compile_expr(it, c, e->as.list_lit.items[i])) return false;
-    }
-
-    chunk_write(c, OP_MAKE_TUPLE, e->loc.line);
-    chunk_write_u16(c, (uint16_t)n, e->loc.line);
-    return true;
-}
-case EXPR_FIELD: {
-    chunk_write(c, OP_LOAD_FIELD, e->loc.line);
-    chunk_write(c, (uint8_t)e->as.field.index, e->loc.line);
-    return true;
-}
-
-case EXPR_IVAR: {
-    switch (e->as.var_ref.var) {
-        case TK_VAR_NR:
-            chunk_write(c, OP_LOAD_NR, e->loc.line);
+            size_t n = e->as.list_lit.count;
+            for (size_t i = 0; i < n; i++) {
+                if (!compile_expr(it, c, e->as.list_lit.items[i])) return false;
+            }
+            chunk_write(c, OP_MAKE_TUPLE, e->loc.line);
+            chunk_write_u16(c, (uint16_t)n, e->loc.line);
             return true;
-        case TK_VAR_NF:
-            chunk_write(c, OP_LOAD_NF, e->loc.line);
-            return true;
-        case TK_VAR_FNR:
-            chunk_write(c, OP_LOAD_FNR, e->loc.line);
-            return true;
-        case TK_VAR_FS:
-            chunk_write(c, OP_LOAD_FS, e->loc.line);
-            return true;
-        case TK_VAR_RS:
-            chunk_write(c, OP_LOAD_RS, e->loc.line);
-            return true;
-        case TK_VAR_OFS:
-            chunk_write(c, OP_LOAD_OFS, e->loc.line);
-            return true;
-        case TK_VAR_ORS:
-            chunk_write(c, OP_LOAD_ORS, e->loc.line);
-            return true;
-        default:
-            fprintf(stderr, "compile_expr: unsupported record var token %d at %u:%u\n",
-                    (int)e->as.var_ref.var, e->loc.line, e->loc.col);
-            return false;
-    }
-}
-case EXPR_COALESCE: {
-    if (!compile_expr(it, c, e->as.coalesce.left)) return false;
-
-    chunk_write(c, OP_DUP, e->loc.line);
-    chunk_write(c, OP_GET_STATE, e->loc.line);
-
-    /* compare state string to "OK" */
-    xf_Str *ok_s = xf_str_from_cstr("OK");
-    if (!ok_s) return false;
-    xf_Value ok_v = xf_val_ok_str(ok_s);
-    xf_str_release(ok_s);
-
-    uint32_t ok_idx = chunk_add_const(c, ok_v);
-    xf_value_release(ok_v);
-
-    chunk_write(c, OP_PUSH_STR, e->loc.line);
-    chunk_write_u32(c, ok_idx, e->loc.line);
-    chunk_write(c, OP_EQ, e->loc.line);
-
-    size_t use_left = emit_jump(c, OP_JUMP_IF, e->loc.line);
-
-    /* left was not OK: discard duplicate + original left */
-    chunk_write(c, OP_POP, e->loc.line);
-    chunk_write(c, OP_POP, e->loc.line);
-
-    if (!compile_expr(it, c, e->as.coalesce.right)) return false;
-
-    size_t done = emit_jump(c, OP_JUMP, e->loc.line);
-
-    /* left was OK: discard duplicate state-check path result, keep original left */
-    patch_jump_here(c, use_left);
-    chunk_write(c, OP_POP, e->loc.line);
-
-    patch_jump_here(c, done);
-    return true;
-}
-case EXPR_WALRUS: {
-    if (!compile_expr(it, c, e->as.walrus.value)) return false;
-
-    /* expression result should remain on stack */
-    chunk_write(c, OP_DUP, e->loc.line);
-
-    if (g_fn_ctx) {
-        int local_slot = fn_local_find(e->as.walrus.name);
-        if (local_slot < 0) {
-            uint8_t decl_type = e->as.walrus.type ? e->as.walrus.type : XF_TYPE_VOID;
-            local_slot = fn_local_add(e->as.walrus.name, decl_type);
-            if (local_slot < 0) return false;
         }
 
-        chunk_write(c, OP_STORE_LOCAL, e->loc.line);
-        chunk_write(c, (uint8_t)local_slot, e->loc.line);
-        return true;
-    }
+        case EXPR_FIELD:
+            chunk_write(c, OP_LOAD_FIELD, e->loc.line);
+            chunk_write(c, (uint8_t)e->as.field.index, e->loc.line);
+            return true;
 
-    if (it->syms) {
-        Symbol *sym = sym_lookup_local_str(it->syms, e->as.walrus.name);
-        if (!sym) {
-            uint8_t decl_type = e->as.walrus.type ? e->as.walrus.type : XF_TYPE_VOID;
-            sym = sym_declare(it->syms,
-                              e->as.walrus.name,
-                              SYM_VAR,
-                              decl_type,
-                              e->loc);
-        }
-        if (sym) {
-            if (e->as.walrus.type) sym->type = e->as.walrus.type;
-            sym->is_defined = true;
-        }
-    }
-
-    uint32_t slot = compile_global_name(it, e->as.walrus.name);
-    if (slot == UINT32_MAX) return false;
-
-    chunk_write(c, OP_STORE_GLOBAL, e->loc.line);
-    chunk_write_u32(c, slot, e->loc.line);
-    return true;
-}
-case EXPR_MAP_LIT: {
-    size_t n = e->as.map_lit.count;
-
-    for (size_t i = 0; i < n; i++) {
-        if (!compile_expr(it, c, e->as.map_lit.keys[i])) return false;
-        if (!compile_expr(it, c, e->as.map_lit.vals[i])) return false;
-    }
-
-    chunk_write(c, OP_MAKE_MAP, e->loc.line);
-    chunk_write_u16(c, (uint16_t)n, e->loc.line);
-    return true;
-}
-
-case EXPR_SET_LIT: {
-    size_t n = e->as.list_lit.count;
-
-    for (size_t i = 0; i < n; i++) {
-        if (!compile_expr(it, c, e->as.list_lit.items[i])) return false;
-    }
-
-    chunk_write(c, OP_MAKE_SET, e->loc.line);
-    chunk_write_u16(c, (uint16_t)n, e->loc.line);
-    return true;
-}
-        case EXPR_SUBSCRIPT: {
-    if (!compile_expr(it, c, e->as.subscript.obj)) return false;
-    if (!compile_expr(it, c, e->as.subscript.key)) return false;
-
-    chunk_write(c, OP_GET_IDX, e->loc.line);
-    return true;
-}
-case EXPR_ARR_LIT: {
-    size_t n = e->as.list_lit.count;
-
-    for (size_t i = 0; i < n; i++) {
-        if (!compile_expr(it, c, e->as.list_lit.items[i])) return false;
-    }
-
-    chunk_write(c, OP_MAKE_ARR, e->loc.line);
-    chunk_write_u16(c, (uint16_t)n, e->loc.line);
-    return true;
-}
-case EXPR_STATE: {
-    if (!compile_expr(it, c, e->as.introspect.operand)) return false;
-    chunk_write(c, OP_GET_STATE, e->loc.line);
-    return true;
-}
-
-case EXPR_TYPE: {
-    if (!compile_expr(it, c, e->as.introspect.operand)) return false;
-    chunk_write(c, OP_GET_TYPE, e->loc.line);
-    return true;
-}
-
-case EXPR_LEN: {
-    if (!compile_expr(it, c, e->as.introspect.operand)) return false;
-    chunk_write(c, OP_GET_LEN, e->loc.line);
-    return true;
-}
-case EXPR_ASSIGN: {
-    AssignOp op = e->as.assign.op;
-    Expr *target = e->as.assign.target;
-    Expr *value  = e->as.assign.value;
-        if (target->kind == EXPR_SVAR || target->kind == EXPR_IVAR) {
-        TokenKind vk = target->as.var_ref.var;
-
-        if (op != ASSIGNOP_EQ) {
-            fprintf(stderr,
-                    "compile_expr: only '=' is supported for stream var assignment at %u:%u\n",
-                    e->loc.line, e->loc.col);
-            return false;
-        }
-
-        if (!compile_expr(it, c, value)) return false;
-
-        /* assignment expression leaves value on stack */
-        chunk_write(c, OP_DUP, e->loc.line);
-
-        switch (vk) {
-            case TK_VAR_FS:
-                chunk_write(c, OP_STORE_FS, e->loc.line);
-                return true;
-            case TK_VAR_RS:
-                chunk_write(c, OP_STORE_RS, e->loc.line);
-                return true;
-            case TK_VAR_OFS:
-                chunk_write(c, OP_STORE_OFS, e->loc.line);
-                return true;
-            case TK_VAR_ORS:
-                chunk_write(c, OP_STORE_ORS, e->loc.line);
-                return true;
-            default:
-                fprintf(stderr,
-                        "compile_expr: stream var assignment not supported for token %d at %u:%u\n",
-                        (int)vk, e->loc.line, e->loc.col);
-                return false;
-        }
-    }
-    if (!target || target->kind != EXPR_IDENT) {
-        fprintf(stderr, "compile_expr: assignment target kind not implemented at %u:%u\n",
-                e->loc.line, e->loc.col);
-        return false;
-    }
-
-    int local_slot = fn_local_find(target->as.ident.name);
-
-    if (op == ASSIGNOP_EQ) {
-        if (!compile_expr(it, c, value)) return false;
-
-        chunk_write(c, OP_DUP, e->loc.line);
-
-        if (local_slot >= 0) {
-            chunk_write(c, OP_STORE_LOCAL, e->loc.line);
-            chunk_write(c, (uint8_t)local_slot, e->loc.line);
-        } else {
-            uint32_t slot = compile_global_name(it, target->as.ident.name);
-            if (slot == UINT32_MAX) return false;
-            chunk_write(c, OP_STORE_GLOBAL, e->loc.line);
-            chunk_write_u32(c, slot, e->loc.line);
-        }
-        return true;
-    }
-
-    if (local_slot >= 0) {
-        chunk_write(c, OP_LOAD_LOCAL, e->loc.line);
-        chunk_write(c, (uint8_t)local_slot, e->loc.line);
-    } else {
-        uint32_t slot = compile_global_name(it, target->as.ident.name);
-        if (slot == UINT32_MAX) return false;
-        chunk_write(c, OP_LOAD_GLOBAL, e->loc.line);
-        chunk_write_u32(c, slot, e->loc.line);
-    }
-
-    if (!compile_expr(it, c, value)) return false;
-
-    switch (op) {
-        case ASSIGNOP_ADD:    chunk_write(c, OP_ADD, e->loc.line); break;
-        case ASSIGNOP_SUB:    chunk_write(c, OP_SUB, e->loc.line); break;
-        case ASSIGNOP_MUL:    chunk_write(c, OP_MUL, e->loc.line); break;
-        case ASSIGNOP_DIV:    chunk_write(c, OP_DIV, e->loc.line); break;
-        case ASSIGNOP_MOD:    chunk_write(c, OP_MOD, e->loc.line); break;
-        case ASSIGNOP_CONCAT: chunk_write(c, OP_CONCAT, e->loc.line); break;
-        default:
-            fprintf(stderr, "compile_expr: assignment op not implemented at %u:%u\n",
-                    e->loc.line, e->loc.col);
-            return false;
-    }
-
-    chunk_write(c, OP_DUP, e->loc.line);
-
-    if (local_slot >= 0) {
-        chunk_write(c, OP_STORE_LOCAL, e->loc.line);
-        chunk_write(c, (uint8_t)local_slot, e->loc.line);
-    } else {
-        uint32_t slot = compile_global_name(it, target->as.ident.name);
-        if (slot == UINT32_MAX) return false;
-        chunk_write(c, OP_STORE_GLOBAL, e->loc.line);
-        chunk_write_u32(c, slot, e->loc.line);
-    }
-    return true;
-}
-case EXPR_CALL: {
+        case EXPR_CALL: {
     if (!compile_expr(it, c, e->as.call.callee)) return false;
 
     for (size_t i = 0; i < e->as.call.argc; i++) {
@@ -1177,22 +1272,366 @@ case EXPR_CALL: {
     chunk_write(c, (uint8_t)e->as.call.argc, e->loc.line);
     return true;
 }
-case EXPR_IDENT: {
-    int local_slot = fn_local_find(e->as.ident.name);
-    if (local_slot >= 0) {
-        chunk_write(c, OP_LOAD_LOCAL, e->loc.line);
-        chunk_write(c, (uint8_t)local_slot, e->loc.line);
-        return true;
+
+case EXPR_SPAWN: {
+    Expr *call = e->as.spawn_expr.call;
+    if (!call || call->kind != EXPR_CALL) {
+        fprintf(stderr, "compile_expr: spawn expects call expression at %u:%u\n",
+                e->loc.line, e->loc.col);
+        return false;
     }
 
-    uint32_t slot = compile_global_name(it, e->as.ident.name);
-    if (slot == UINT32_MAX) return false;
+    if (!compile_expr(it, c, call->as.call.callee)) return false;
 
-    chunk_write(c, OP_LOAD_GLOBAL, e->loc.line);
-    chunk_write_u32(c, slot, e->loc.line);
+    for (size_t i = 0; i < call->as.call.argc; i++) {
+        if (!compile_expr(it, c, call->as.call.args[i])) return false;
+    }
+
+    chunk_write(c, OP_SPAWN, e->loc.line);
+    chunk_write(c, (uint8_t)call->as.call.argc, e->loc.line);
     return true;
 }
-                case EXPR_MEMBER: {
+case EXPR_PIPE_FN: {
+    Expr *left  = e->as.pipe_fn.left;
+    Expr *right = e->as.pipe_fn.right;
+
+    if (!left || !right) {
+        fprintf(stderr, "compile_expr: invalid pipe fn at %u:%u\n",
+                e->loc.line, e->loc.col);
+        return false;
+    }
+
+    switch (right->kind) {
+        case EXPR_IDENT:
+        case EXPR_MEMBER: {
+            if (!compile_expr(it, c, right)) return false;
+            if (!compile_expr(it, c, left)) return false;
+
+            chunk_write(c, OP_CALL, e->loc.line);
+            chunk_write(c, 1, e->loc.line);
+            return true;
+        }
+
+        case EXPR_CALL: {
+            if (!compile_expr(it, c, right->as.call.callee)) return false;
+            if (!compile_expr(it, c, left)) return false;
+
+            for (size_t i = 0; i < right->as.call.argc; i++) {
+                if (!compile_expr(it, c, right->as.call.args[i])) return false;
+            }
+
+            size_t argc = right->as.call.argc + 1;
+            if (argc > 255) {
+                fprintf(stderr, "compile_expr: too many pipe call args at %u:%u\n",
+                        e->loc.line, e->loc.col);
+                return false;
+            }
+
+            chunk_write(c, OP_CALL, e->loc.line);
+            chunk_write(c, (uint8_t)argc, e->loc.line);
+            return true;
+        }
+
+        default:
+            fprintf(stderr,
+                    "compile_expr: pipe rhs must be function, member, or call at %u:%u\n",
+                    e->loc.line, e->loc.col);
+            return false;
+    }
+}
+        case EXPR_COALESCE: {
+            if (!compile_expr(it, c, e->as.coalesce.left)) return false;
+
+            /* stack: [left] */
+            chunk_write(c, OP_DUP, e->loc.line);        /* [left, left] */
+            chunk_write(c, OP_GET_STATE, e->loc.line);  /* [left, state] */
+
+            xf_Str *ok_s = xf_str_from_cstr("OK");
+            if (!ok_s) return false;
+            xf_Value ok_v = xf_val_ok_str(ok_s);
+            xf_str_release(ok_s);
+
+            uint32_t ok_idx = chunk_add_const(c, ok_v);
+            xf_value_release(ok_v);
+
+            chunk_write(c, OP_PUSH_STR, e->loc.line);   /* [left, state, "OK"] */
+            chunk_write_u32(c, ok_idx, e->loc.line);
+            chunk_write(c, OP_EQ, e->loc.line);         /* [left, bool] */
+
+            size_t use_left = emit_jump(c, OP_JUMP_IF, e->loc.line);
+            /* OP_JUMP_IF pops bool, so false path stack is just [left] */
+
+            chunk_write(c, OP_POP, e->loc.line);        /* discard bad left */
+
+            if (!compile_expr(it, c, e->as.coalesce.right)) return false;
+
+            size_t done = emit_jump(c, OP_JUMP, e->loc.line);
+
+            patch_jump_here(c, use_left);
+            /* true path already has [left] on stack; do nothing */
+
+            patch_jump_here(c, done);
+            return true;
+        }
+
+        case EXPR_TERNARY: {
+            if (!compile_expr(it, c, e->as.ternary.cond)) return false;
+
+            size_t jump_false = emit_jump(c, OP_JUMP_NOT, e->loc.line);
+
+            if (!compile_expr(it, c, e->as.ternary.then_branch)) return false;
+
+            size_t jump_done = emit_jump(c, OP_JUMP, e->loc.line);
+
+            patch_jump_here(c, jump_false);
+
+            if (!compile_expr(it, c, e->as.ternary.else_branch)) return false;
+
+            patch_jump_here(c, jump_done);
+            return true;
+        }
+
+        case EXPR_WALRUS: {
+            if (!compile_expr(it, c, e->as.walrus.value)) return false;
+
+            chunk_write(c, OP_DUP, e->loc.line);
+
+            if (g_fn_ctx) {
+                int local_slot = fn_local_find(e->as.walrus.name);
+                if (local_slot < 0) {
+                    uint8_t decl_type = e->as.walrus.type ? e->as.walrus.type : XF_TYPE_VOID;
+                    local_slot = fn_local_add(e->as.walrus.name, decl_type);
+                    if (local_slot < 0) return false;
+                }
+
+                chunk_write(c, OP_STORE_LOCAL, e->loc.line);
+                chunk_write(c, (uint8_t)local_slot, e->loc.line);
+                return true;
+            }
+
+            if (it->syms) {
+                Symbol *sym = sym_lookup_local_str(it->syms, e->as.walrus.name);
+                if (!sym) {
+                    uint8_t decl_type = e->as.walrus.type ? e->as.walrus.type : XF_TYPE_VOID;
+                    sym = sym_declare(it->syms,
+                                      e->as.walrus.name,
+                                      SYM_VAR,
+                                      decl_type,
+                                      e->loc);
+                }
+                if (sym) {
+                    if (e->as.walrus.type) sym->type = e->as.walrus.type;
+                    sym->is_defined = true;
+                }
+            }
+
+            uint32_t slot = compile_global_name(it, e->as.walrus.name);
+            if (slot == UINT32_MAX) return false;
+
+            chunk_write(c, OP_STORE_GLOBAL, e->loc.line);
+            chunk_write_u32(c, slot, e->loc.line);
+            return true;
+        }
+
+        case EXPR_MAP_LIT: {
+            size_t n = e->as.map_lit.count;
+            for (size_t i = 0; i < n; i++) {
+                if (!compile_expr(it, c, e->as.map_lit.keys[i])) return false;
+                if (!compile_expr(it, c, e->as.map_lit.vals[i])) return false;
+            }
+
+            chunk_write(c, OP_MAKE_MAP, e->loc.line);
+            chunk_write_u16(c, (uint16_t)n, e->loc.line);
+            return true;
+        }
+
+        case EXPR_SET_LIT: {
+            size_t n = e->as.list_lit.count;
+            for (size_t i = 0; i < n; i++) {
+                if (!compile_expr(it, c, e->as.list_lit.items[i])) return false;
+            }
+
+            chunk_write(c, OP_MAKE_SET, e->loc.line);
+            chunk_write_u16(c, (uint16_t)n, e->loc.line);
+            return true;
+        }
+
+        case EXPR_SUBSCRIPT:
+            if (!compile_expr(it, c, e->as.subscript.obj)) return false;
+            if (!compile_expr(it, c, e->as.subscript.key)) return false;
+            chunk_write(c, OP_GET_IDX, e->loc.line);
+            return true;
+
+        case EXPR_ARR_LIT: {
+            size_t n = e->as.list_lit.count;
+            for (size_t i = 0; i < n; i++) {
+                if (!compile_expr(it, c, e->as.list_lit.items[i])) return false;
+            }
+
+            chunk_write(c, OP_MAKE_ARR, e->loc.line);
+            chunk_write_u16(c, (uint16_t)n, e->loc.line);
+            return true;
+        }
+
+        case EXPR_STATE:
+            if (!compile_expr(it, c, e->as.introspect.operand)) return false;
+            chunk_write(c, OP_GET_STATE, e->loc.line);
+            return true;
+
+        case EXPR_TYPE:
+            if (!compile_expr(it, c, e->as.introspect.operand)) return false;
+            chunk_write(c, OP_GET_TYPE, e->loc.line);
+            return true;
+
+        case EXPR_LEN:
+            if (!compile_expr(it, c, e->as.introspect.operand)) return false;
+            chunk_write(c, OP_GET_LEN, e->loc.line);
+            return true;
+
+        case EXPR_CAST:
+            /* No dedicated VM cast opcode yet.
+               For tonight, compile the operand and let runtime coercions happen
+               through the existing arithmetic/string/member/call paths. */
+            return compile_expr(it, c, e->as.cast.operand);
+
+        case EXPR_ASSIGN: {
+            AssignOp op = e->as.assign.op;
+            Expr *target = e->as.assign.target;
+            Expr *value  = e->as.assign.value;
+
+            if (target->kind == EXPR_SVAR || target->kind == EXPR_IVAR) {
+                TokenKind vk = target->as.var_ref.var;
+
+                if (op != ASSIGNOP_EQ) {
+                    fprintf(stderr,
+                            "compile_expr: only '=' is supported for stream var assignment at %u:%u\n",
+                            e->loc.line, e->loc.col);
+                    return false;
+                }
+
+                if (!compile_expr(it, c, value)) return false;
+                chunk_write(c, OP_DUP, e->loc.line);
+
+                switch (vk) {
+                    case TK_VAR_FS:  chunk_write(c, OP_STORE_FS, e->loc.line);  return true;
+                    case TK_VAR_RS:  chunk_write(c, OP_STORE_RS, e->loc.line);  return true;
+                    case TK_VAR_OFS: chunk_write(c, OP_STORE_OFS, e->loc.line); return true;
+                    case TK_VAR_ORS: chunk_write(c, OP_STORE_ORS, e->loc.line); return true;
+                    case TK_VAR_OFMT: {
+                        uint32_t slot = interp_bind_global_cstr(it, "OFMT");
+                        if (slot == UINT32_MAX) return false;
+                        chunk_write(c, OP_STORE_GLOBAL, e->loc.line);
+                        chunk_write_u32(c, slot, e->loc.line);
+                        return true;
+                    }
+                    default:
+                        fprintf(stderr,
+                                "compile_expr: stream var assignment not supported for token %d at %u:%u\n",
+                                (int)vk, e->loc.line, e->loc.col);
+                        return false;
+                }
+            }
+
+            if (target && target->kind == EXPR_SUBSCRIPT) {
+                if (op != ASSIGNOP_EQ) {
+                    fprintf(stderr,
+                            "compile_expr: only '=' is supported for subscript assignment at %u:%u\n",
+                            e->loc.line, e->loc.col);
+                    return false;
+                }
+
+                if (!compile_expr(it, c, target->as.subscript.obj)) return false;
+                if (!compile_expr(it, c, target->as.subscript.key)) return false;
+                if (!compile_expr(it, c, value)) return false;
+
+                chunk_write(c, OP_DUP, e->loc.line);
+                chunk_write(c, OP_SET_IDX, e->loc.line);
+                return true;
+            }
+
+            if (!target || target->kind != EXPR_IDENT) {
+                fprintf(stderr,
+                        "compile_expr: assignment target kind not implemented at %u:%u\n",
+                        e->loc.line, e->loc.col);
+                return false;
+            }
+
+            int local_slot = fn_local_find(target->as.ident.name);
+
+            if (op == ASSIGNOP_EQ) {
+                if (!compile_expr(it, c, value)) return false;
+
+                chunk_write(c, OP_DUP, e->loc.line);
+
+                if (local_slot >= 0) {
+                    chunk_write(c, OP_STORE_LOCAL, e->loc.line);
+                    chunk_write(c, (uint8_t)local_slot, e->loc.line);
+                } else {
+                    uint32_t slot = compile_global_name(it, target->as.ident.name);
+                    if (slot == UINT32_MAX) return false;
+                    chunk_write(c, OP_STORE_GLOBAL, e->loc.line);
+                    chunk_write_u32(c, slot, e->loc.line);
+                }
+                return true;
+            }
+
+            if (local_slot >= 0) {
+                chunk_write(c, OP_LOAD_LOCAL, e->loc.line);
+                chunk_write(c, (uint8_t)local_slot, e->loc.line);
+            } else {
+                uint32_t slot = compile_global_name(it, target->as.ident.name);
+                if (slot == UINT32_MAX) return false;
+                chunk_write(c, OP_LOAD_GLOBAL, e->loc.line);
+                chunk_write_u32(c, slot, e->loc.line);
+            }
+
+            if (!compile_expr(it, c, value)) return false;
+
+            switch (op) {
+                case ASSIGNOP_ADD:    chunk_write(c, OP_ADD, e->loc.line);    break;
+                case ASSIGNOP_SUB:    chunk_write(c, OP_SUB, e->loc.line);    break;
+                case ASSIGNOP_MUL:    chunk_write(c, OP_MUL, e->loc.line);    break;
+                case ASSIGNOP_DIV:    chunk_write(c, OP_DIV, e->loc.line);    break;
+                case ASSIGNOP_MOD:    chunk_write(c, OP_MOD, e->loc.line);    break;
+                case ASSIGNOP_CONCAT: chunk_write(c, OP_CONCAT, e->loc.line); break;
+                default:
+                    fprintf(stderr,
+                            "compile_expr: assignment op not implemented at %u:%u\n",
+                            e->loc.line, e->loc.col);
+                    return false;
+            }
+
+            chunk_write(c, OP_DUP, e->loc.line);
+
+            if (local_slot >= 0) {
+                chunk_write(c, OP_STORE_LOCAL, e->loc.line);
+                chunk_write(c, (uint8_t)local_slot, e->loc.line);
+            } else {
+                uint32_t slot = compile_global_name(it, target->as.ident.name);
+                if (slot == UINT32_MAX) return false;
+                chunk_write(c, OP_STORE_GLOBAL, e->loc.line);
+                chunk_write_u32(c, slot, e->loc.line);
+            }
+            return true;
+        }
+
+        case EXPR_IDENT: {
+            int local_slot = fn_local_find(e->as.ident.name);
+            if (local_slot >= 0) {
+                chunk_write(c, OP_LOAD_LOCAL, e->loc.line);
+                chunk_write(c, (uint8_t)local_slot, e->loc.line);
+                return true;
+            }
+
+            uint32_t slot = compile_global_name(it, e->as.ident.name);
+            if (slot == UINT32_MAX) return false;
+
+            chunk_write(c, OP_LOAD_GLOBAL, e->loc.line);
+            chunk_write_u32(c, slot, e->loc.line);
+            return true;
+        }
+
+        case EXPR_MEMBER: {
             if (!compile_expr(it, c, e->as.member.obj)) return false;
 
             xf_Value fv = xf_val_ok_str(e->as.member.field);
@@ -1203,46 +1642,165 @@ case EXPR_IDENT: {
             chunk_write_u32(c, idx, e->loc.line);
             return true;
         }
-        case EXPR_BINARY:
+
+case EXPR_BINARY: {
+    switch (e->as.binary.op) {
+        case BINOP_AND: {
+            if (!compile_expr(it, c, e->as.binary.left)) return false;
+
+            size_t eval_rhs = emit_jump(c, OP_JUMP_IF, e->loc.line);
+            chunk_write(c, OP_PUSH_FALSE, e->loc.line);
+            size_t done = emit_jump(c, OP_JUMP, e->loc.line);
+
+            patch_jump_here(c, eval_rhs);
+            if (!compile_expr(it, c, e->as.binary.right)) return false;
+            chunk_write(c, OP_NOT, e->loc.line);
+            chunk_write(c, OP_NOT, e->loc.line);
+
+            patch_jump_here(c, done);
+            return true;
+        }
+
+        case BINOP_OR: {
+            if (!compile_expr(it, c, e->as.binary.left)) return false;
+
+            size_t eval_rhs = emit_jump(c, OP_JUMP_NOT, e->loc.line);
+            chunk_write(c, OP_PUSH_TRUE, e->loc.line);
+            size_t done = emit_jump(c, OP_JUMP, e->loc.line);
+
+            patch_jump_here(c, eval_rhs);
+            if (!compile_expr(it, c, e->as.binary.right)) return false;
+            chunk_write(c, OP_NOT, e->loc.line);
+            chunk_write(c, OP_NOT, e->loc.line);
+
+            patch_jump_here(c, done);
+            return true;
+        }
+
+        default:
             if (!compile_expr(it, c, e->as.binary.left)) return false;
             if (!compile_expr(it, c, e->as.binary.right)) return false;
 
             switch (e->as.binary.op) {
-                case BINOP_ADD:       chunk_write(c, OP_ADD, e->loc.line); return true;
-                case BINOP_SUB:       chunk_write(c, OP_SUB, e->loc.line); return true;
-                case BINOP_MUL:       chunk_write(c, OP_MUL, e->loc.line); return true;
-                case BINOP_DIV:       chunk_write(c, OP_DIV, e->loc.line); return true;
-                case BINOP_MOD:       chunk_write(c, OP_MOD, e->loc.line); return true;
-                case BINOP_POW:       chunk_write(c, OP_POW, e->loc.line); return true;
-                case BINOP_EQ:        chunk_write(c, OP_EQ, e->loc.line); return true;
-                case BINOP_NEQ:       chunk_write(c, OP_NEQ, e->loc.line); return true;
-                case BINOP_LT:        chunk_write(c, OP_LT, e->loc.line); return true;
-                case BINOP_GT:        chunk_write(c, OP_GT, e->loc.line); return true;
-                case BINOP_LTE:       chunk_write(c, OP_LTE, e->loc.line); return true;
-                case BINOP_GTE:       chunk_write(c, OP_GTE, e->loc.line); return true;
+                case BINOP_ADD:       chunk_write(c, OP_ADD, e->loc.line);       return true;
+                case BINOP_SUB:       chunk_write(c, OP_SUB, e->loc.line);       return true;
+                case BINOP_MUL:       chunk_write(c, OP_MUL, e->loc.line);       return true;
+                case BINOP_DIV:       chunk_write(c, OP_DIV, e->loc.line);       return true;
+                case BINOP_MOD:       chunk_write(c, OP_MOD, e->loc.line);       return true;
+                case BINOP_POW:       chunk_write(c, OP_POW, e->loc.line);       return true;
+                case BINOP_EQ:        chunk_write(c, OP_EQ, e->loc.line);        return true;
+                case BINOP_NEQ:       chunk_write(c, OP_NEQ, e->loc.line);       return true;
+                case BINOP_LT:        chunk_write(c, OP_LT, e->loc.line);        return true;
+                case BINOP_GT:        chunk_write(c, OP_GT, e->loc.line);        return true;
+                case BINOP_LTE:       chunk_write(c, OP_LTE, e->loc.line);       return true;
+                case BINOP_GTE:       chunk_write(c, OP_GTE, e->loc.line);       return true;
                 case BINOP_SPACESHIP: chunk_write(c, OP_SPACESHIP, e->loc.line); return true;
-                case BINOP_AND:       chunk_write(c, OP_AND, e->loc.line); return true;
-                case BINOP_OR:        chunk_write(c, OP_OR, e->loc.line); return true;
-                case BINOP_CONCAT:    chunk_write(c, OP_CONCAT, e->loc.line); return true;
-                case BINOP_MATCH:     chunk_write(c, OP_MATCH, e->loc.line); return true;
-                case BINOP_NMATCH:    chunk_write(c, OP_NMATCH, e->loc.line); return true;
-                default: return false;
-            }
+                case BINOP_CONCAT:    chunk_write(c, OP_CONCAT, e->loc.line);    return true;
+                case BINOP_MATCH:     chunk_write(c, OP_MATCH, e->loc.line);     return true;
+                case BINOP_NMATCH:    chunk_write(c, OP_NMATCH, e->loc.line);    return true;
 
-        case EXPR_UNARY:
-            if (!compile_expr(it, c, e->as.unary.operand)) return false;
-
-            switch (e->as.unary.op) {
-                case UNOP_NEG: chunk_write(c, OP_NEG, e->loc.line); return true;
-                case UNOP_NOT: chunk_write(c, OP_NOT, e->loc.line); return true;
-                default: return false;
+                default:
+                    fprintf(stderr,
+                            "compile_expr: binary op not implemented at %u:%u\n",
+                            e->loc.line, e->loc.col);
+                    return false;
             }
-                    default:
-            fprintf(stderr, "compile_expr: unimplemented %s at %u:%u\n",
+    }
+}
+
+            case EXPR_UNARY: {
+    UnOp op = e->as.unary.op;
+    Expr *operand = e->as.unary.operand;
+
+    if (!operand) {
+        fprintf(stderr, "compile_expr: null unary operand at %u:%u\n",
+                e->loc.line, e->loc.col);
+        return false;
+    }
+
+    if (op == UNOP_NEG) {
+        if (!compile_expr(it, c, operand)) return false;
+        chunk_write(c, OP_NEG, e->loc.line);
+        return true;
+    }
+
+    if (op == UNOP_NOT) {
+        if (!compile_expr(it, c, operand)) return false;
+        chunk_write(c, OP_NOT, e->loc.line);
+        return true;
+    }
+
+    /* ++x / --x / x++ / x-- */
+    if (operand->kind != EXPR_IDENT) {
+        fprintf(stderr,
+                "compile_expr: unary inc/dec only supports identifiers at %u:%u\n",
+                e->loc.line, e->loc.col);
+        return false;
+    }
+
+    int local_slot = fn_local_find(operand->as.ident.name);
+    bool is_inc  = (op == UNOP_PRE_INC || op == UNOP_POST_INC);
+    bool is_post = (op == UNOP_POST_INC || op == UNOP_POST_DEC);
+
+    if (local_slot >= 0) {
+        chunk_write(c, OP_LOAD_LOCAL, e->loc.line);
+        chunk_write(c, (uint8_t)local_slot, e->loc.line);
+    } else {
+        uint32_t slot = compile_global_name(it, operand->as.ident.name);
+        if (slot == UINT32_MAX) return false;
+        chunk_write(c, OP_LOAD_GLOBAL, e->loc.line);
+        chunk_write_u32(c, slot, e->loc.line);
+    }
+
+    /* save original for post-inc/post-dec */
+    if (is_post) {
+        chunk_write(c, OP_DUP, e->loc.line);
+    }
+
+    chunk_write(c, OP_PUSH_NUM, e->loc.line);
+    chunk_write_f64(c, 1.0, e->loc.line);
+    chunk_write(c, is_inc ? OP_ADD : OP_SUB, e->loc.line);
+
+    /* save updated value into the target */
+    chunk_write(c, OP_DUP, e->loc.line);
+
+    if (local_slot >= 0) {
+        chunk_write(c, OP_STORE_LOCAL, e->loc.line);
+        chunk_write(c, (uint8_t)local_slot, e->loc.line);
+    } else {
+        uint32_t slot = compile_global_name(it, operand->as.ident.name);
+        if (slot == UINT32_MAX) return false;
+        chunk_write(c, OP_STORE_GLOBAL, e->loc.line);
+        chunk_write_u32(c, slot, e->loc.line);
+    }
+
+    if (is_post) {
+        /* stack is [old, new]; swap then pop => leave old */
+        chunk_write(c, OP_SWAP, e->loc.line);
+        chunk_write(c, OP_POP, e->loc.line);
+    }
+
+    return true;
+}
+
+        case EXPR_VALUE: {
+            uint32_t idx = chunk_add_const(c, e->as.value.value);
+            chunk_write(c, OP_PUSH_CONST, e->loc.line);
+            chunk_write_u32(c, idx, e->loc.line);
+            return true;
+        }
+
+        case EXPR_SPREAD:
+            fprintf(stderr,
+                    "compile_expr: unimplemented %s at %u:%u\n",
                     expr_kind_name(e->kind), e->loc.line, e->loc.col);
             return false;
 
-
+        default:
+            fprintf(stderr,
+                    "compile_expr: unimplemented %s at %u:%u\n",
+                    expr_kind_name(e->kind), e->loc.line, e->loc.col);
+            return false;
     }
 }
 static bool compile_if_stmt(Interp *it, Chunk *c, Stmt *s) {
@@ -1283,13 +1841,18 @@ static bool compile_while_stmt(Interp *it, Chunk *c, Stmt *s) {
     if (!compile_expr(it, c, s->as.while_stmt.cond)) return false;
     size_t jump_not = emit_jump(c, OP_JUMP_NOT, s->loc.line);
 
-    if (!compile_stmt(it, c, s->as.while_stmt.body)) return false;
+    break_push();
+    if (!compile_stmt(it, c, s->as.while_stmt.body)) {
+        break_pop(c); /* patch any breaks even on failure to avoid leak */
+        return false;
+    }
 
     chunk_write(c, OP_JUMP, s->loc.line);
     int32_t back = (int32_t)loop_start - (int32_t)(c->len + 2);
     chunk_write_u16(c, (uint16_t)(int16_t)back, s->loc.line);
 
     patch_jump_here(c, jump_not);
+    break_pop(c); /* patch all break jumps to here (after the loop) */
     return true;
 }
 static bool compile_for_stmt(Interp *it, Chunk *c, Stmt *s) {
@@ -1368,67 +1931,63 @@ static bool compile_for_stmt(Interp *it, Chunk *c, Stmt *s) {
 
     size_t loop_top = c->len;
 
-    /* condition: idx < coll.len */
+    /* condition: idx < len(coll) */
     chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
     chunk_write_u32(c, idx_slot, s->loc.line);
-
     chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
     chunk_write_u32(c, coll_slot, s->loc.line);
     chunk_write(c, OP_GET_LEN, s->loc.line);
-
     chunk_write(c, OP_LT, s->loc.line);
 
     size_t exit_jump = emit_jump(c, OP_JUMP_NOT, s->loc.line);
 
-    /*
-     * Bind loop variables
-     */
-    if (is_map_or_set) {
-        /* current item from iterable view: coll_slot[idx] */
+    break_push();
+    if (!continue_push(0, true)) {
+        break_pop(c);
+        return false;
+    }
+
+    if (is_map) {
+        /*
+         * coll_slot = keys(src)
+         * key = coll[idx]
+         * val = src[key]
+         */
         chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
         chunk_write_u32(c, coll_slot, s->loc.line);
         chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
         chunk_write_u32(c, idx_slot, s->loc.line);
         chunk_write(c, OP_GET_IDX, s->loc.line);
 
-        if (is_map) {
-            /*
-             * At this point stack top is the current key.
-             *
-             * for (x in m):
-             *   bind x = key
-             *
-             * for ((k, v) in m):
-             *   bind k = key
-             *   bind v = src_map[key]
-             */
-            if (iter_key) {
-                /* duplicate key so one copy goes to k and one is used for m[key] */
-                chunk_write(c, OP_DUP, s->loc.line);
-                chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
-                chunk_write_u32(c, key_slot, s->loc.line);
-            }
+        if (iter_key) {
+            chunk_write(c, OP_DUP, s->loc.line);
+            chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+            chunk_write_u32(c, key_slot, s->loc.line);
+        }
 
-            if (iter_key) {
-                /* value = src_map[key] */
-                chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
-                chunk_write_u32(c, src_slot, s->loc.line);
-                chunk_write(c, OP_SWAP, s->loc.line);
-                chunk_write(c, OP_GET_IDX, s->loc.line);
-                chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
-                chunk_write_u32(c, val_slot, s->loc.line);
-            } else {
-                /* single-bind map iteration yields keys */
-                chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
-                chunk_write_u32(c, val_slot, s->loc.line);
-            }
+        if (iter_key) {
+            chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
+            chunk_write_u32(c, src_slot, s->loc.line);
+            chunk_write(c, OP_SWAP, s->loc.line);
+            chunk_write(c, OP_GET_IDX, s->loc.line);
+            chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+            chunk_write_u32(c, val_slot, s->loc.line);
         } else {
-            /* set iteration yields elements directly */
+            /* single-bind map iteration yields keys */
             chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
             chunk_write_u32(c, val_slot, s->loc.line);
         }
+    } else if (is_set) {
+        /* set iteration yields elements directly */
+        chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
+        chunk_write_u32(c, coll_slot, s->loc.line);
+        chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
+        chunk_write_u32(c, idx_slot, s->loc.line);
+        chunk_write(c, OP_GET_IDX, s->loc.line);
+        chunk_write(c, OP_STORE_GLOBAL, s->loc.line);
+        chunk_write_u32(c, val_slot, s->loc.line);
     } else {
-        /* arrays / tuples / strings use numeric index iteration */
+        /* array / tuple / string iteration */
         if (iter_key) {
             chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
             chunk_write_u32(c, idx_slot, s->loc.line);
@@ -1445,7 +2004,13 @@ static bool compile_for_stmt(Interp *it, Chunk *c, Stmt *s) {
         chunk_write_u32(c, val_slot, s->loc.line);
     }
 
-    if (!compile_stmt(it, c, body)) return false;
+    if (!compile_stmt(it, c, body)) {
+        continue_pop(c);
+        break_pop(c);
+        return false;
+    }
+
+    continue_set_target(c->len);
 
     /* idx = idx + 1 */
     chunk_write(c, OP_LOAD_GLOBAL, s->loc.line);
@@ -1458,6 +2023,8 @@ static bool compile_for_stmt(Interp *it, Chunk *c, Stmt *s) {
 
     emit_loop_back_jump(c, loop_top, s->loc.line);
     patch_jump_here(c, exit_jump);
+    continue_pop(c);
+    break_pop(c);
     return true;
 }
 static bool compile_for_short_stmt(Interp *it, Chunk *c, Stmt *s) {
@@ -1489,4 +2056,7 @@ xf_Value interp_exec_xf_fn_bridge(void *vm_ptr, void *syms_ptr,
     VM *vm = (VM *)vm_ptr;
     Chunk *chunk = (Chunk *)fn->body;
 return vm_call_function_chunk(vm, chunk, args, argc);
+}
+bool interp_compile_expr_repl(Interp *it, Chunk *c, Expr *e) {
+    return compile_expr(it, c, e);
 }

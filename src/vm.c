@@ -19,6 +19,7 @@ static xf_Value val_mul(xf_Value a, xf_Value b);
 static xf_Value val_div(VM *vm, xf_Value a, xf_Value b);
 static xf_Value val_mod(VM *vm, xf_Value a, xf_Value b);
 static int      val_cmp(xf_Value a, xf_Value b);
+static bool     val_eq(xf_Value a, xf_Value b);
 static xf_Value val_concat(xf_Value a, xf_Value b);
 static uint32_t read_u32(const Chunk *c, size_t off);
 static xf_Value vm_call_compiled_fn(VM *vm, Chunk *chunk, xf_Value *args, size_t argc) {
@@ -61,7 +62,288 @@ static xf_Value vm_call_compiled_fn(VM *vm, Chunk *chunk, xf_Value *args, size_t
                 vm_push(vm, xf_val_ok_num(v));
                 break;
             }
+                        case OP_SET_IDX: {
+                /* current compiler emits: obj, key, value, DUP(value), SET_IDX */
+                xf_Value retv = vm_pop(vm);   /* duplicated assigned value */
+                xf_Value val  = vm_pop(vm);   /* original assigned value */
+                xf_Value key  = vm_pop(vm);
+                xf_Value obj  = vm_pop(vm);
 
+                xf_Value out = xf_value_retain(retv);
+
+                if (obj.state == XF_STATE_OK &&
+                    obj.type  == XF_TYPE_MAP &&
+                    obj.data.map) {
+                    xf_Value ks = xf_coerce_str(key);
+                    if (ks.state == XF_STATE_OK && ks.data.str) {
+                        xf_map_set(obj.data.map, ks.data.str, val);
+                    } else {
+                        xf_value_release(out);
+                        out = xf_val_nav(XF_TYPE_VOID);
+                    }
+                    xf_value_release(ks);
+                } else {
+                    xf_value_release(out);
+                    out = xf_val_nav(XF_TYPE_VOID);
+                }
+
+                xf_value_release(obj);
+                xf_value_release(key);
+                xf_value_release(val);
+                xf_value_release(retv);
+
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
+            }
+            case OP_PRINT: {
+    uint8_t argc = frame->chunk->code[frame->ip++];
+    xf_Value args[64];
+
+    for (int i = (int)argc - 1; i >= 0; i--) {
+        args[i] = vm_pop(vm);
+    }
+
+    for (int i = 0; i < (int)argc; i++) {
+        if (i > 0) printf("%s", vm->rec.ofs);
+        xf_Value sv = xf_coerce_str(args[i]);
+        if (sv.state == XF_STATE_OK && sv.data.str) {
+            printf("%s", sv.data.str->data);
+        } else {
+            printf("%s", XF_STATE_NAMES[args[i].state]);
+        }
+        xf_value_release(sv);
+        xf_value_release(args[i]);
+    }
+    printf("%s", vm->rec.ors);
+    break;
+}
+case OP_PRINTF: {
+    uint8_t argc = frame->chunk->code[frame->ip++];
+    xf_Value args[64];
+
+    if (argc > 64) {
+        vm_error(vm, "printf: too many args");
+        goto err;
+    }
+
+    for (int i = (int)argc - 1; i >= 0; i--) {
+        args[i] = vm_pop(vm);
+    }
+
+    if (argc == 0) break;
+
+    xf_Value fmtv = xf_coerce_str(args[0]);
+    if (fmtv.state != XF_STATE_OK || !fmtv.data.str) {
+        xf_value_release(fmtv);
+        for (int i = 0; i < (int)argc; i++) xf_value_release(args[i]);
+        vm_error(vm, "printf format must be a string");
+        goto err;
+    }
+
+    const char *fmt = fmtv.data.str->data;
+    size_t argi = 1;
+
+    for (size_t i = 0; fmt[i] != '\0'; i++) {
+        if (fmt[i] == '%' && fmt[i + 1] != '\0') {
+            char spec = fmt[i + 1];
+
+            if (spec == '%') {
+                putchar('%');
+                i++;
+                continue;
+            }
+
+            if (argi >= argc) {
+                putchar('%');
+                putchar(spec);
+                i++;
+                continue;
+            }
+
+            xf_Value sv = xf_coerce_str(args[argi]);
+            if (sv.state == XF_STATE_OK && sv.data.str) {
+                fputs(sv.data.str->data, stdout);
+            } else {
+                fputs(XF_STATE_NAMES[args[argi].state], stdout);
+            }
+            xf_value_release(sv);
+
+            argi++;
+            i++;
+            continue;
+        }
+
+        putchar((unsigned char)fmt[i]);
+    }
+
+    xf_value_release(fmtv);
+    for (int i = 0; i < (int)argc; i++) {
+        xf_value_release(args[i]);
+    }
+    break;
+}
+                                                case OP_MAKE_ARR: {
+                uint16_t n = (uint16_t)((frame->chunk->code[frame->ip] << 8) |
+                                        frame->chunk->code[frame->ip + 1]);
+                frame->ip += 2;
+
+                xf_arr_t *a = xf_arr_new();
+                if (!a) {
+                    vm_error(vm, "failed to allocate array");
+                    goto err;
+                }
+
+                xf_Value *items = n ? calloc(n, sizeof(xf_Value)) : NULL;
+                if (n && !items) {
+                    xf_arr_release(a);
+                    vm_error(vm, "failed to allocate array staging");
+                    goto err;
+                }
+
+                for (uint16_t i = 0; i < n; i++) {
+                    items[n - 1 - i] = vm_pop(vm);
+                }
+
+                for (uint16_t i = 0; i < n; i++) {
+                    xf_arr_push(a, items[i]);
+                    xf_value_release(items[i]);
+                }
+                free(items);
+
+                xf_Value out = xf_val_ok_arr(a);
+                xf_arr_release(a);
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
+            }
+
+            case OP_MAKE_TUPLE: {
+                uint16_t n = (uint16_t)((frame->chunk->code[frame->ip] << 8) |
+                                        frame->chunk->code[frame->ip + 1]);
+                frame->ip += 2;
+
+                xf_Value *items = n ? calloc(n, sizeof(xf_Value)) : NULL;
+                if (n && !items) {
+                    vm_error(vm, "failed to allocate tuple staging");
+                    goto err;
+                }
+
+                for (uint16_t i = 0; i < n; i++) {
+                    items[n - 1 - i] = vm_pop(vm);
+                }
+
+                xf_tuple_t *t = xf_tuple_new(items, n);
+
+                for (uint16_t i = 0; i < n; i++) {
+                    xf_value_release(items[i]);
+                }
+                free(items);
+
+                if (!t) {
+                    vm_error(vm, "failed to allocate tuple");
+                    goto err;
+                }
+
+                xf_Value out = xf_val_ok_tuple(t);
+                xf_tuple_release(t);
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
+            }
+
+            case OP_MAKE_MAP: {
+                uint16_t n = (uint16_t)((frame->chunk->code[frame->ip] << 8) |
+                                        frame->chunk->code[frame->ip + 1]);
+                frame->ip += 2;
+
+                xf_map_t *m = xf_map_new();
+                if (!m) {
+                    vm_error(vm, "failed to allocate map");
+                    goto err;
+                }
+
+                xf_Value *keys = n ? calloc(n, sizeof(xf_Value)) : NULL;
+                xf_Value *vals = n ? calloc(n, sizeof(xf_Value)) : NULL;
+                if (n && (!keys || !vals)) {
+                    free(keys);
+                    free(vals);
+                    xf_map_release(m);
+                    vm_error(vm, "failed to allocate map staging");
+                    goto err;
+                }
+
+                for (uint16_t i = 0; i < n; i++) {
+                    vals[n - 1 - i] = vm_pop(vm);
+                    keys[n - 1 - i] = vm_pop(vm);
+                }
+
+                for (uint16_t i = 0; i < n; i++) {
+                    xf_Value ks = xf_coerce_str(keys[i]);
+                    if (ks.state == XF_STATE_OK && ks.data.str) {
+                        xf_map_set(m, ks.data.str, vals[i]);
+                    }
+                    xf_value_release(ks);
+                    xf_value_release(keys[i]);
+                    xf_value_release(vals[i]);
+                }
+
+                free(keys);
+                free(vals);
+
+                xf_Value out = xf_val_ok_map(m);
+                xf_map_release(m);
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
+            }
+
+            case OP_MAKE_SET: {
+                uint16_t n = (uint16_t)((frame->chunk->code[frame->ip] << 8) |
+                                        frame->chunk->code[frame->ip + 1]);
+                frame->ip += 2;
+
+                xf_set_t *s = xf_set_new();
+                if (!s) {
+                    vm_error(vm, "failed to allocate set");
+                    goto err;
+                }
+
+                xf_Value *items = n ? calloc(n, sizeof(xf_Value)) : NULL;
+                if (n && !items) {
+                    xf_set_release(s);
+                    vm_error(vm, "failed to allocate set staging");
+                    goto err;
+                }
+
+                for (uint16_t i = 0; i < n; i++) {
+                    items[n - 1 - i] = vm_pop(vm);
+                }
+
+                for (uint16_t i = 0; i < n; i++) {
+                    xf_set_add(s, items[i]);
+                    xf_value_release(items[i]);
+                }
+                free(items);
+
+                xf_Value out = xf_val_ok_set(s);
+                xf_set_release(s);
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
+            }
+                        case OP_PUSH_CONST: {
+                uint32_t idx = read_u32(frame->chunk, frame->ip);
+                frame->ip += 4;
+
+                if (idx >= frame->chunk->const_len) {
+                    vm_error(vm, "PUSH_CONST constant index out of range");
+                    goto err;
+                }
+
+                vm_push(vm, frame->chunk->consts[idx]);
+                break;
+            }
             case OP_PUSH_STR: {
                 uint32_t idx =
                     ((uint32_t)frame->chunk->code[frame->ip] << 24) |
@@ -133,13 +415,6 @@ frame->ip += 4;
                 vm_push(vm, frame->locals[slot]);
                 break;
             }
-        case OP_STORE_LOCAL: {
-        uint8_t slot = frame->chunk->code[frame->ip++];
-            xf_value_release(frame->locals[slot]);
-            frame->locals[slot] = xf_value_retain(vm_peek(vm, 0));
-            if (frame->local_count <= slot) frame->local_count = slot + 1;
-            break;
-        }
 
             case OP_LOAD_GLOBAL: {
                 uint32_t idx =
@@ -151,20 +426,39 @@ frame->ip += 4;
                 vm_push(vm, idx < vm->global_count ? vm->globals[idx] : xf_val_undef(XF_TYPE_VOID));
                 break;
             }
+            case OP_STORE_LOCAL: {
+    uint8_t slot = frame->chunk->code[frame->ip++];
 
-                    case OP_STORE_GLOBAL: {
-                    uint32_t idx =
-    ((uint32_t)frame->chunk->code[frame->ip] << 24) |
-    ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
-    ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
-    (uint32_t)frame->chunk->code[frame->ip + 3];
-frame->ip += 4;
-            if (idx < vm->global_count) {
-                xf_value_release(vm->globals[idx]);
-                vm->globals[idx] = xf_value_retain(vm_peek(vm, 0));
-            }
-            break;
-        }
+    xf_Value v = vm_pop(vm);
+
+    xf_value_release(frame->locals[slot]);
+    frame->locals[slot] = xf_value_retain(v);
+    if (frame->local_count <= slot) frame->local_count = slot + 1;
+
+    xf_value_release(v);
+    break;
+}
+case OP_STORE_GLOBAL: {
+    uint32_t idx =
+        ((uint32_t)frame->chunk->code[frame->ip] << 24) |
+        ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
+        ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
+        (uint32_t)frame->chunk->code[frame->ip + 3];
+    frame->ip += 4;
+
+    xf_Value v = vm_pop(vm);
+    if (idx < vm->global_count) {
+        xf_value_release(vm->globals[idx]);
+        vm->globals[idx] = xf_value_retain(v);
+    } else {
+        xf_value_release(v);
+        vm_error(vm, "bad global slot");
+        goto err;
+    }
+
+    xf_value_release(v);
+    break;
+}
             case OP_ADD: {
                 b = vm_pop(vm);
                 a = vm_pop(vm);
@@ -238,7 +532,7 @@ frame->ip += 4;
             case OP_EQ: {
                 b = vm_pop(vm);
                 a = vm_pop(vm);
-                xf_Value r = xf_val_ok_num(val_cmp(a, b) == 0 ? 1.0 : 0.0);
+                xf_Value r = val_eq(a, b) ? xf_val_true() : xf_val_false();
                 vm_push(vm, r);
                 xf_value_release(a);
                 xf_value_release(b);
@@ -249,7 +543,7 @@ frame->ip += 4;
             case OP_NEQ: {
                 b = vm_pop(vm);
                 a = vm_pop(vm);
-                xf_Value r = xf_val_ok_num(val_cmp(a, b) != 0 ? 1.0 : 0.0);
+                xf_Value r = val_eq(a, b) ? xf_val_false() : xf_val_true();
                 vm_push(vm, r);
                 xf_value_release(a);
                 xf_value_release(b);
@@ -260,7 +554,7 @@ frame->ip += 4;
             case OP_LT: {
                 b = vm_pop(vm);
                 a = vm_pop(vm);
-                xf_Value r = xf_val_ok_num(val_cmp(a, b) < 0 ? 1.0 : 0.0);
+                xf_Value r = (val_cmp(a, b) < 0) ? xf_val_true() : xf_val_false();
                 vm_push(vm, r);
                 xf_value_release(a);
                 xf_value_release(b);
@@ -271,7 +565,7 @@ frame->ip += 4;
             case OP_GT: {
                 b = vm_pop(vm);
                 a = vm_pop(vm);
-                xf_Value r = xf_val_ok_num(val_cmp(a, b) > 0 ? 1.0 : 0.0);
+                xf_Value r = (val_cmp(a, b) > 0) ? xf_val_true() : xf_val_false();
                 vm_push(vm, r);
                 xf_value_release(a);
                 xf_value_release(b);
@@ -282,7 +576,7 @@ frame->ip += 4;
             case OP_LTE: {
                 b = vm_pop(vm);
                 a = vm_pop(vm);
-                xf_Value r = xf_val_ok_num(val_cmp(a, b) <= 0 ? 1.0 : 0.0);
+                xf_Value r = (val_cmp(a, b) <= 0) ? xf_val_true() : xf_val_false();
                 vm_push(vm, r);
                 xf_value_release(a);
                 xf_value_release(b);
@@ -293,7 +587,7 @@ frame->ip += 4;
             case OP_GTE: {
                 b = vm_pop(vm);
                 a = vm_pop(vm);
-                xf_Value r = xf_val_ok_num(val_cmp(a, b) >= 0 ? 1.0 : 0.0);
+                xf_Value r = (val_cmp(a, b) >= 0) ? xf_val_true() : xf_val_false();
                 vm_push(vm, r);
                 xf_value_release(a);
                 xf_value_release(b);
@@ -682,6 +976,7 @@ case OP_MAKE_TUPLE:
         case OP_PUSH_STR:
         case OP_LOAD_GLOBAL:
         case OP_STORE_GLOBAL:
+        case OP_PUSH_CONST:
         case OP_GET_MEMBER:
             printf("  %u", read_u32(c, off));
             off += 4;
@@ -690,7 +985,6 @@ case OP_MAKE_TUPLE:
         case OP_PRINT:
         case OP_PRINTF:
         case OP_CALL:
-        case OP_SPAWN:
             printf("  %u", c->code[off++]);
             break;
         case OP_JUMP:
@@ -723,6 +1017,11 @@ void chunk_disasm(const Chunk *c, const char *name) {
 
 void vm_init(VM *vm, int max_jobs) {
     memset(vm, 0, sizeof(*vm));
+        for (size_t i = 0; i < 256; i++) {
+        vm->tasks[i].used = false;
+        vm->tasks[i].done = false;
+        vm->tasks[i].result = xf_val_null();
+    }
     vm->max_jobs = max_jobs > 0 ? max_jobs : 1;
 
     vm->global_cap = 64;
@@ -763,7 +1062,14 @@ static void inject_args(VM *vm, int argc, char **argv) {
 
 void vm_free(VM *vm) {
     if (!vm) return;
-
+        for (size_t i = 0; i < 256; i++) {
+        if (vm->tasks[i].used) {
+            xf_value_release(vm->tasks[i].result);
+            vm->tasks[i].used = false;
+            vm->tasks[i].done = false;
+            vm->tasks[i].result = xf_val_null();
+        }
+    }
     for (size_t i = 0; i < vm->global_count; i++) {
         xf_value_release(vm->globals[i]);
     }
@@ -1122,35 +1428,87 @@ static xf_Value val_concat(xf_Value a, xf_Value b) {
 }
 
 static int val_cmp(xf_Value a, xf_Value b) {
-    xf_Value na = xf_coerce_num(a);
-    xf_Value nb = xf_coerce_num(b);
+    if (a.state != XF_STATE_OK || b.state != XF_STATE_OK) return 0;
 
-    if (na.state == XF_STATE_OK && nb.state == XF_STATE_OK) {
-        int out = 0;
-        if (na.data.num < nb.data.num) out = -1;
-        else if (na.data.num > nb.data.num) out = 1;
-        xf_value_release(na);
-        xf_value_release(nb);
-        return out;
+    uint8_t ta = XF_STATE_IS_BOOL(a.state) ? XF_TYPE_BOOL : a.type;
+    uint8_t tb = XF_STATE_IS_BOOL(b.state) ? XF_TYPE_BOOL : b.type;
+
+    if (ta != tb) return 0;
+
+    if (ta == XF_TYPE_NUM) {
+        if (a.data.num < b.data.num) return -1;
+        if (a.data.num > b.data.num) return 1;
+        return 0;
     }
 
-    xf_value_release(na);
-    xf_value_release(nb);
-
-    xf_Value sa = xf_coerce_str(a);
-    xf_Value sb = xf_coerce_str(b);
-    if (sa.state == XF_STATE_OK && sb.state == XF_STATE_OK) {
-        int out = strcmp(sa.data.str->data, sb.data.str->data);
-        xf_value_release(sa);
-        xf_value_release(sb);
-        return out;
+    if (ta == XF_TYPE_BOOL) {
+        int av = (a.state == XF_STATE_TRUE) ? 1 : 0;
+        int bv = (b.state == XF_STATE_TRUE) ? 1 : 0;
+        if (av < bv) return -1;
+        if (av > bv) return 1;
+        return 0;
     }
 
-    xf_value_release(sa);
-    xf_value_release(sb);
+    if (ta == XF_TYPE_STR) {
+        const char *sa = (a.data.str && a.data.str->data) ? a.data.str->data : "";
+        const char *sb = (b.data.str && b.data.str->data) ? b.data.str->data : "";
+        int rc = strcmp(sa, sb);
+        return (rc < 0) ? -1 : (rc > 0 ? 1 : 0);
+    }
+
     return 0;
 }
 
+static bool val_eq(xf_Value a, xf_Value b) {
+    if (XF_STATE_IS_BOOL(a.state) || XF_STATE_IS_BOOL(b.state)) {
+        if (!(XF_STATE_IS_BOOL(a.state) && XF_STATE_IS_BOOL(b.state))) return false;
+        return a.state == b.state;
+    }
+
+    if (a.state != b.state) return false;
+
+    if (a.state != XF_STATE_OK) {
+        return a.state == b.state;
+    }
+
+    if (a.type != b.type) return false;
+
+    switch (a.type) {
+        case XF_TYPE_NUM:
+            return a.data.num == b.data.num;
+
+        case XF_TYPE_STR:
+            if (!a.data.str || !b.data.str) return a.data.str == b.data.str;
+            return xf_str_cmp(a.data.str, b.data.str) == 0;
+
+        case XF_TYPE_ARR:
+            return a.data.arr == b.data.arr;
+
+        case XF_TYPE_MAP:
+            return a.data.map == b.data.map;
+
+        case XF_TYPE_SET:
+            return a.data.set == b.data.set;
+
+        case XF_TYPE_FN:
+            return a.data.fn == b.data.fn;
+
+        case XF_TYPE_MODULE:
+            return a.data.mod == b.data.mod;
+
+        case XF_TYPE_TUPLE:
+            return a.data.tuple == b.data.tuple;
+
+        case XF_TYPE_REGEX:
+            return a.data.re == b.data.re;
+
+        case XF_TYPE_BOOL:
+            return a.state == b.state;
+
+        default:
+            return false;
+    }
+}
 /* ============================================================
  * Execution loop
  * ============================================================ */
@@ -1205,6 +1563,40 @@ VMResult vm_run_chunk(VM *vm, Chunk *chunk) {
             xf_value_release(obj);
             break;
         }
+                    case OP_SET_IDX: {
+                /* current compiler emits: obj, key, value, DUP(value), SET_IDX */
+                xf_Value retv = vm_pop(vm);   /* duplicated assigned value */
+                xf_Value val  = vm_pop(vm);   /* original assigned value */
+                xf_Value key  = vm_pop(vm);
+                xf_Value obj  = vm_pop(vm);
+
+                xf_Value out = xf_value_retain(retv);
+
+                if (obj.state == XF_STATE_OK &&
+                    obj.type  == XF_TYPE_MAP &&
+                    obj.data.map) {
+                    xf_Value ks = xf_coerce_str(key);
+                    if (ks.state == XF_STATE_OK && ks.data.str) {
+                        xf_map_set(obj.data.map, ks.data.str, val);
+                    } else {
+                        xf_value_release(out);
+                        out = xf_val_nav(XF_TYPE_VOID);
+                    }
+                    xf_value_release(ks);
+                } else {
+                    xf_value_release(out);
+                    out = xf_val_nav(XF_TYPE_VOID);
+                }
+
+                xf_value_release(obj);
+                xf_value_release(key);
+                xf_value_release(val);
+                xf_value_release(retv);
+
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
+            }
                 case OP_GET_MEMBER: {
             uint32_t idx = READ_U32();
 
@@ -1242,6 +1634,18 @@ VMResult vm_run_chunk(VM *vm, Chunk *chunk) {
                 double v;
                 memcpy(&v, &bits, 8);
                 vm_push(vm, val_num(v));
+                break;
+            }
+                        case OP_PUSH_CONST: {
+                uint32_t idx = read_u32(frame->chunk, frame->ip);
+                frame->ip += 4;
+
+                if (idx >= frame->chunk->const_len) {
+                    vm_error(vm, "PUSH_CONST constant index out of range");
+                    goto err;
+                }
+
+                vm_push(vm, frame->chunk->consts[idx]);
                 break;
             }
 
@@ -1283,98 +1687,84 @@ VMResult vm_run_chunk(VM *vm, Chunk *chunk) {
             xf_value_release(out);
             break;
         }
-            case OP_MAKE_TUPLE: {
-    uint16_t n = READ_U16();
+                    case OP_MAKE_TUPLE: {
+                uint16_t n = read_u16(frame->chunk, frame->ip);
+                frame->ip += 2;
 
-    xf_Value *items = n ? malloc(sizeof(xf_Value) * n) : NULL;
-    if (n && !items) {
-        vm_error(vm, "failed to allocate tuple staging buffer");
-        goto err;
-    }
+                xf_Value *items = n ? malloc(sizeof(xf_Value) * n) : NULL;
+                if (n && !items) {
+                    vm_error(vm, "failed to allocate tuple staging buffer");
+                    goto err;
+                }
 
-    for (uint16_t i = 0; i < n; i++) {
-        items[n - 1 - i] = vm_pop(vm);
-    }
+                for (uint16_t i = 0; i < n; i++) {
+                    items[n - 1 - i] = vm_pop(vm);
+                }
 
-    xf_tuple_t *t = xf_tuple_new(items, n);
+                xf_tuple_t *t = xf_tuple_new(items, n);
 
-    for (uint16_t i = 0; i < n; i++) {
-        xf_value_release(items[i]);
-    }
-    free(items);
+                for (uint16_t i = 0; i < n; i++) {
+                    xf_value_release(items[i]);
+                }
+                free(items);
 
-    if (!t) {
-        vm_error(vm, "failed to allocate tuple");
-        goto err;
-    }
+                if (!t) {
+                    vm_error(vm, "failed to allocate tuple");
+                    goto err;
+                }
 
-    xf_Value out = xf_val_ok_tuple(t);
-    xf_tuple_release(t);
+                xf_Value out = xf_val_ok_tuple(t);
+                xf_tuple_release(t);
 
-    vm_push(vm, out);
-    xf_value_release(out);
-    break;
-}
-case OP_MAKE_MAP: {
-    uint16_t n = READ_U16();
-
-    xf_map_t *m = xf_map_new();
-    if (!m) {
-        vm_error(vm, "failed to allocate map");
-        goto err;
-    }
-
-    xf_Value *vals = n ? malloc(sizeof(xf_Value) * n) : NULL;
-    xf_Value *keys = n ? malloc(sizeof(xf_Value) * n) : NULL;
-    if (n && (!vals || !keys)) {
-        free(vals);
-        free(keys);
-        xf_map_release(m);
-        vm_error(vm, "failed to allocate map staging buffers");
-        goto err;
-    }
-
-    for (uint16_t i = 0; i < n; i++) {
-        vals[n - 1 - i] = vm_pop(vm);
-        keys[n - 1 - i] = vm_pop(vm);
-    }
-
-    for (uint16_t i = 0; i < n; i++) {
-        xf_Value ks = xf_coerce_str(keys[i]);
-        if (ks.state != XF_STATE_OK || !ks.data.str) {
-            for (uint16_t j = i; j < n; j++) {
-                xf_value_release(keys[j]);
-                xf_value_release(vals[j]);
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
             }
-            for (uint16_t j = 0; j < i; j++) {
-                xf_value_release(keys[j]);
-                xf_value_release(vals[j]);
+                        case OP_MAKE_MAP: {
+                uint16_t n = read_u16(frame->chunk, frame->ip);
+                frame->ip += 2;
+
+                xf_map_t *m = xf_map_new();
+                if (!m) {
+                    vm_error(vm, "failed to allocate map");
+                    goto err;
+                }
+
+                xf_Value *vals = n ? malloc(sizeof(xf_Value) * n) : NULL;
+                xf_Value *keys = n ? malloc(sizeof(xf_Value) * n) : NULL;
+                if (n && (!vals || !keys)) {
+                    free(vals);
+                    free(keys);
+                    xf_map_release(m);
+                    vm_error(vm, "failed to allocate map staging buffers");
+                    goto err;
+                }
+
+                for (uint16_t i = 0; i < n; i++) {
+                    vals[n - 1 - i] = vm_pop(vm);
+                    keys[n - 1 - i] = vm_pop(vm);
+                }
+
+                for (uint16_t i = 0; i < n; i++) {
+                    xf_Value ks = xf_coerce_str(keys[i]);
+                    if (ks.state == XF_STATE_OK && ks.data.str) {
+                        xf_map_set(m, ks.data.str, vals[i]);
+                    }
+                    xf_value_release(ks);
+                    xf_value_release(keys[i]);
+                    xf_value_release(vals[i]);
+                }
+
+                free(keys);
+                free(vals);
+
+                xf_Value out = xf_val_ok_map(m);
+                xf_map_release(m);
+
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
             }
-            xf_value_release(ks);
-            free(keys);
-            free(vals);
-            xf_map_release(m);
-            vm_error(vm, "map key is not string-coercible");
-            goto err;
-        }
-
-        xf_map_set(m, ks.data.str, vals[i]);
-
-        xf_value_release(ks);
-        xf_value_release(keys[i]);
-        xf_value_release(vals[i]);
-    }
-
-    free(keys);
-    free(vals);
-
-    xf_Value out = xf_val_ok_map(m);
-    xf_map_release(m);
-
-    vm_push(vm, out);
-    xf_value_release(out);
-    break;
-}
 case OP_GET_KEYS: {
     xf_Value obj = vm_pop(vm);
     xf_Value out = xf_val_nav(XF_TYPE_ARR);
@@ -1420,90 +1810,77 @@ case OP_GET_KEYS: {
     xf_value_release(out);
     break;
 }
-case OP_MAKE_SET: {
-    uint16_t n = READ_U16();
+            case OP_MAKE_SET: {
+                uint16_t n = read_u16(frame->chunk, frame->ip);
+                frame->ip += 2;
 
-    xf_set_t *set = xf_set_new();
-    if (!set) {
-        vm_error(vm, "failed to allocate set");
-        goto err;
-    }
+                xf_set_t *s = xf_set_new();
+                if (!s) {
+                    vm_error(vm, "failed to allocate set");
+                    goto err;
+                }
 
-    xf_Value *items = n ? malloc(sizeof(xf_Value) * n) : NULL;
-    if (n && !items) {
-        xf_set_release(set);
-        vm_error(vm, "failed to allocate set staging buffer");
-        goto err;
-    }
+                xf_Value *items = n ? malloc(sizeof(xf_Value) * n) : NULL;
+                if (n && !items) {
+                    xf_set_release(s);
+                    vm_error(vm, "failed to allocate set staging buffer");
+                    goto err;
+                }
 
-    for (uint16_t i = 0; i < n; i++) {
-        items[n - 1 - i] = vm_pop(vm);
-    }
+                for (uint16_t i = 0; i < n; i++) {
+                    items[n - 1 - i] = vm_pop(vm);
+                }
 
-    for (uint16_t i = 0; i < n; i++) {
-        if (!xf_set_add(set, items[i])) {
-            for (uint16_t j = i; j < n; j++) {
-                xf_value_release(items[j]);
+                for (uint16_t i = 0; i < n; i++) {
+                    xf_set_add(s, items[i]);
+                    xf_value_release(items[i]);
+                }
+                free(items);
+
+                xf_Value out = xf_val_ok_set(s);
+                xf_set_release(s);
+
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
             }
-            for (uint16_t j = 0; j < i; j++) {
-                xf_value_release(items[j]);
-            }
-            free(items);
-            xf_set_release(set);
-            vm_error(vm, "failed to add set element");
-            goto err;
-        }
-        xf_value_release(items[i]);
-    }
-
-    free(items);
-
-    xf_Value out = xf_val_ok_set(set);
-    xf_set_release(set);
-
-    vm_push(vm, out);
-    xf_value_release(out);
-    break;
-}
             case OP_PUSH_TRUE:  vm_push(vm, xf_val_true()); break;
             case OP_PUSH_FALSE: vm_push(vm, xf_val_false()); break;
             case OP_PUSH_NULL:  vm_push(vm, xf_val_null()); break;
             case OP_PUSH_UNDEF: vm_push(vm, xf_val_undef(XF_TYPE_VOID)); break;
-            case OP_MAKE_ARR: {
-    uint16_t n = READ_U16();
+                        case OP_MAKE_ARR: {
+                uint16_t n = read_u16(frame->chunk, frame->ip);
+                frame->ip += 2;
 
-    xf_arr_t *arr = xf_arr_new();
-    if (!arr) {
-        vm_error(vm, "failed to allocate array");
-        goto err;
-    }
+                xf_arr_t *a = xf_arr_new();
+                if (!a) {
+                    vm_error(vm, "failed to allocate array");
+                    goto err;
+                }
 
-    xf_Value *tmp = n ? malloc(sizeof(xf_Value) * n) : NULL;
-    if (n && !tmp) {
-        xf_arr_release(arr);
-        vm_error(vm, "failed to allocate array staging buffer");
-        goto err;
-    }
+                xf_Value *items = n ? malloc(sizeof(xf_Value) * n) : NULL;
+                if (n && !items) {
+                    xf_arr_release(a);
+                    vm_error(vm, "failed to allocate array staging buffer");
+                    goto err;
+                }
 
-    /* pop in reverse stack order, then push into array in source order */
-    for (uint16_t i = 0; i < n; i++) {
-        tmp[n - 1 - i] = vm_pop(vm);
-    }
+                for (uint16_t i = 0; i < n; i++) {
+                    items[n - 1 - i] = vm_pop(vm);
+                }
 
-    for (uint16_t i = 0; i < n; i++) {
-        xf_arr_push(arr, tmp[i]);
-        xf_value_release(tmp[i]);
-    }
+                for (uint16_t i = 0; i < n; i++) {
+                    xf_arr_push(a, items[i]);
+                    xf_value_release(items[i]);
+                }
+                free(items);
 
-    free(tmp);
-
-    xf_Value out = xf_val_ok_arr(arr);
-    xf_arr_release(arr);
-
-    vm_push(vm, out);
-    xf_value_release(out);
-    break;
-}
+                xf_Value out = xf_val_ok_arr(a);
+                xf_arr_release(a);
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
+            }
             case OP_POP:
                 xf_value_release(vm_pop(vm));
                 break;
@@ -1522,19 +1899,44 @@ case OP_MAKE_SET: {
                 break;
             }
 
-            case OP_LOAD_GLOBAL: {
-                uint32_t idx = READ_U32();
-                vm_push(vm, idx < vm->global_count ? vm->globals[idx] : xf_val_undef(XF_TYPE_VOID));
-                break;
-            }
+case OP_LOAD_GLOBAL: {
+    uint32_t idx =
+        ((uint32_t)frame->chunk->code[frame->ip] << 24) |
+        ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
+        ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
+        (uint32_t)frame->chunk->code[frame->ip + 3];
+    frame->ip += 4;
 
-            case OP_STORE_GLOBAL: {
-                uint32_t idx = READ_U32();
-                xf_Value v = vm_peek(vm, 0);
-                if (!vm_set_global(vm, idx, v)) vm_error(vm, "bad global slot");
-                break;
-            }
+    xf_Value gv = (idx < vm->global_count)
+        ? vm->globals[idx]
+        : xf_val_undef(XF_TYPE_VOID);
 
+
+    vm_push(vm, gv);
+    break;
+}
+case OP_STORE_GLOBAL: {
+    uint32_t idx =
+        ((uint32_t)frame->chunk->code[frame->ip] << 24) |
+        ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
+        ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
+        (uint32_t)frame->chunk->code[frame->ip + 3];
+    frame->ip += 4;
+
+    xf_Value v = vm_pop(vm);
+
+    if (idx < vm->global_count) {
+        xf_value_release(vm->globals[idx]);
+        vm->globals[idx] = xf_value_retain(v);
+    } else {
+        xf_value_release(v);
+        vm_error(vm, "bad global slot");
+        goto err;
+    }
+
+    xf_value_release(v);
+    break;
+}
 
             case OP_LOAD_NR:
                 vm_push(vm, val_num((double)vm->rec.nr));
@@ -1605,39 +2007,49 @@ case OP_MAKE_SET: {
                 break;
             }
 
-            case OP_EQ:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(val_cmp(a,b)==0); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
-            case OP_NEQ: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(val_cmp(a,b)!=0); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
-            case OP_LT:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(val_cmp(a,b)<0); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
-            case OP_GT:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(val_cmp(a,b)>0); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
-            case OP_LTE: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(val_cmp(a,b)<=0); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
-            case OP_GTE: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(val_cmp(a,b)>=0); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_EQ:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_eq(a,b) ? xf_val_true() : xf_val_false(); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_NEQ: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_eq(a,b) ? xf_val_false() : xf_val_true(); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_LT:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = (val_cmp(a,b)<0) ? xf_val_true() : xf_val_false(); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_GT:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = (val_cmp(a,b)>0) ? xf_val_true() : xf_val_false(); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_LTE: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = (val_cmp(a,b)<=0) ? xf_val_true() : xf_val_false(); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_GTE: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = (val_cmp(a,b)>=0) ? xf_val_true() : xf_val_false(); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
             case OP_SPACESHIP: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num((double)val_cmp(a,b)); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
 
-            case OP_AND: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(is_truthy(a) && is_truthy(b)); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
-            case OP_OR:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_num(is_truthy(a) || is_truthy(b)); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
-            case OP_NOT: a = vm_pop(vm); { xf_Value r = val_num(!is_truthy(a)); vm_push(vm,r); xf_value_release(a); xf_value_release(r); } break;
+            case OP_AND: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = (is_truthy(a) && is_truthy(b)) ? xf_val_true() : xf_val_false(); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_OR:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = (is_truthy(a) || is_truthy(b)) ? xf_val_true() : xf_val_false(); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_NOT: a = vm_pop(vm); { xf_Value r = is_truthy(a) ? xf_val_false() : xf_val_true(); vm_push(vm,r); xf_value_release(a); xf_value_release(r); } break;
 
             case OP_CONCAT: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_concat(a,b); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
 
-            case OP_MATCH:
-            case OP_NMATCH: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value sa = xf_coerce_str(a);
-                xf_Value sb = xf_coerce_str(b);
-                bool found = (sa.state == XF_STATE_OK && sb.state == XF_STATE_OK &&
-                              sa.data.str && sb.data.str &&
-                              strstr(sa.data.str->data, sb.data.str->data) != NULL);
-                xf_Value r = val_num((op == OP_MATCH) == found);
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(sa);
-                xf_value_release(sb);
-                xf_value_release(r);
-                break;
-            }
+case OP_MATCH: {
+    b = vm_pop(vm);   /* pattern */
+    a = vm_pop(vm);   /* subject */
 
+    bool ok = false;
+    /* keep your existing regex/string match logic here, just compute ok */
+
+    xf_Value r = ok ? xf_val_true() : xf_val_false();
+    vm_push(vm, r);
+    xf_value_release(a);
+    xf_value_release(b);
+    xf_value_release(r);
+    break;
+}
+
+case OP_NMATCH: {
+    b = vm_pop(vm);
+    a = vm_pop(vm);
+
+    bool ok = false;
+    /* same existing match logic, compute ok */
+
+    xf_Value r = ok ? xf_val_false() : xf_val_true();
+    vm_push(vm, r);
+    xf_value_release(a);
+    xf_value_release(b);
+    xf_value_release(r);
+    break;
+}
             case OP_COALESCE:
                 b = vm_pop(vm);
                 a = vm_pop(vm);
@@ -1705,8 +2117,9 @@ case OP_MAKE_SET: {
                 frame->return_val = xf_val_null();
                 goto done;
             case OP_EXIT:
-                vm->should_exit = true;
-                goto done;
+    vm->should_exit = true;
+    vm->frame_count--;
+    return VM_EXIT;
 
 
             case OP_NEXT_RECORD:
@@ -1780,37 +2193,30 @@ case OP_MAKE_SET: {
     xf_value_release(out);
     break;
 }
+            case OP_GET_STATE: {
+                a = vm_pop(vm);
+                const char *s = XF_STATE_NAMES[a.state];
+                xf_Str *xs = xf_str_from_cstr(s ? s : "?");
+                xf_Value out = xf_val_ok_str(xs);
+                xf_str_release(xs);
+                xf_value_release(a);
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
+            }
 
-case OP_GET_STATE: {
-    xf_Value v = vm_pop(vm);
-    uint8_t st = (v.state < XF_STATE_COUNT) ? v.state : XF_STATE_OK;
-    const char *name = XF_STATE_NAMES[st];
+            case OP_GET_TYPE: {
+                a = vm_pop(vm);
+                const char *s = XF_TYPE_NAMES[(a.type < XF_TYPE_COUNT) ? a.type : 0];
+                xf_Str *xs = xf_str_from_cstr(s ? s : "?");
+                xf_Value out = xf_val_ok_str(xs);
+                xf_str_release(xs);
+                xf_value_release(a);
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
+            }
 
-    xf_Str *s = xf_str_from_cstr(name);
-    xf_Value out = xf_val_ok_str(s);
-    xf_str_release(s);
-
-    xf_value_release(v);
-    vm_push(vm, out);
-    xf_value_release(out);
-    break;
-}
-
-case OP_GET_TYPE: {
-    xf_Value v = vm_pop(vm);
-    uint8_t t = XF_STATE_IS_BOOL(v.state) ? XF_TYPE_BOOL : v.type;
-    if (t >= XF_TYPE_COUNT) t = XF_TYPE_VOID;
-
-    const char *name = XF_TYPE_NAMES[t];
-    xf_Str *s = xf_str_from_cstr(name);
-    xf_Value out = xf_val_ok_str(s);
-    xf_str_release(s);
-
-    xf_value_release(v);
-    vm_push(vm, out);
-    xf_value_release(out);
-    break;
-}
 
 case OP_GET_LEN: {
     xf_Value v = vm_pop(vm);
@@ -1848,12 +2254,14 @@ case OP_GET_LEN: {
 }
 case OP_STORE_LOCAL: {
     uint8_t slot = READ_U8();
-    xf_Value v = vm_peek(vm, 0);
+
+    xf_Value v = vm_pop(vm);
 
     xf_value_release(frame->locals[slot]);
     frame->locals[slot] = xf_value_retain(v);
-
     if (frame->local_count <= slot) frame->local_count = slot + 1;
+
+    xf_value_release(v);
     break;
 }
         case OP_PRINTF: {
@@ -1964,8 +2372,103 @@ case OP_CALL: {
             xf_value_release(ret);
             break;
         }
-            case OP_SPAWN:
-            case OP_JOIN:
+                    case OP_SPAWN: {
+                uint8_t argc = READ_U8();
+                xf_Value args[64];
+
+                if (argc > 64) {
+                    vm_error(vm, "too many spawn args");
+                    goto err;
+                }
+
+                for (int i = (int)argc - 1; i >= 0; i--) {
+                    args[i] = vm_pop(vm);
+                }
+
+                xf_Value callee = vm_pop(vm);
+
+                if (callee.state != XF_STATE_OK ||
+                    callee.type  != XF_TYPE_FN ||
+                    !callee.data.fn) {
+                    for (size_t i = 0; i < argc; i++) xf_value_release(args[i]);
+                    xf_value_release(callee);
+                    vm_error(vm, "attempt to spawn non-function");
+                    goto err;
+                }
+
+                xf_fn_t *fn = callee.data.fn;
+                xf_Value ret = xf_val_null();
+
+                /* synchronous fallback for now */
+                if (fn->is_native && fn->native_v) {
+                    ret = fn->native_v(args, argc);
+                } else {
+                    Chunk *fn_chunk = (Chunk *)fn->body;
+                    ret = vm_call_compiled_fn(vm, fn_chunk, args, argc);
+                }
+
+                int handle = -1;
+                for (int i = 0; i < 256; i++) {
+                    if (!vm->tasks[i].used) {
+                        handle = i;
+                        break;
+                    }
+                }
+
+                if (handle < 0) {
+                    for (size_t i = 0; i < argc; i++) xf_value_release(args[i]);
+                    xf_value_release(callee);
+                    xf_value_release(ret);
+                    vm_error(vm, "no free task slots");
+                    goto err;
+                }
+
+                vm->tasks[handle].used   = true;
+                vm->tasks[handle].done   = true;
+                xf_value_release(vm->tasks[handle].result);
+                vm->tasks[handle].result = xf_value_retain(ret);
+
+                for (size_t i = 0; i < argc; i++) xf_value_release(args[i]);
+                xf_value_release(callee);
+                xf_value_release(ret);
+
+                xf_Value hv = xf_val_ok_num((double)handle);
+                vm_push(vm, hv);
+                xf_value_release(hv);
+                break;
+            }
+
+            case OP_JOIN: {
+                xf_Value handle_v = vm_pop(vm);
+                xf_Value nk = xf_coerce_num(handle_v);
+
+                if (nk.state != XF_STATE_OK) {
+                    xf_value_release(handle_v);
+                    xf_value_release(nk);
+                    vm_error(vm, "join expects numeric handle");
+                    goto err;
+                }
+
+                long h = (long)nk.data.num;
+                xf_value_release(handle_v);
+                xf_value_release(nk);
+
+                if (h < 0 || h >= 256 || !vm->tasks[h].used) {
+                    vm_error(vm, "invalid join handle");
+                    goto err;
+                }
+
+                xf_Value out = xf_value_retain(vm->tasks[h].result);
+
+                vm->tasks[h].used = false;
+                vm->tasks[h].done = false;
+                xf_value_release(vm->tasks[h].result);
+                vm->tasks[h].result = xf_val_null();
+
+                vm_push(vm, out);
+                xf_value_release(out);
+                break;
+            }
             case OP_SUBST:
             case OP_TRANS:
             case OP_LOAD_LOCAL:

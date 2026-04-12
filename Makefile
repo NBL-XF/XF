@@ -109,6 +109,6 @@ uninstall:
 	rm -rf $(DESTDIR)$(PREFIX)/include/xf
 
 clean:
-	rm -rf obj/* bin/* lib/*
+	rm -rf obj/* bin/*
 
 .PHONY: all run install uninstall clean

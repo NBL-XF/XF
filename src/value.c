@@ -48,9 +48,12 @@ const char *const XF_TYPE_NAMES[XF_TYPE_COUNT] = {
     "module",
     "tuple",
     "bool",
-    "complex"
+    "complex",
+    "OK",
+    "NAV",
+    "NULL",
+    "UNDET"
 };
-
 /* ============================================================
  * Internal helpers
  * ============================================================ */
@@ -1274,7 +1277,167 @@ xf_value_t xf_coerce_num(xf_value_t v) {
 
     return xf_val_nav(XF_TYPE_NUM);
 }
+static void append_bytes(char **buf, size_t *len, size_t *cap, const char *s, size_t n) {
+    if (*len + n + 1 > *cap) {
+        while (*len + n + 1 > *cap) *cap *= 2;
+        *buf = realloc(*buf, *cap);
+    }
+    memcpy(*buf + *len, s, n);
+    *len += n;
+    (*buf)[*len] = '\0';
+}
 
+static void append_cstr(char **buf, size_t *len, size_t *cap, const char *s) {
+    append_bytes(buf, len, cap, s, strlen(s));
+}
+
+static xf_value_t xf_stringify_value(xf_value_t v);
+
+static xf_value_t stringify_arr(xf_arr_t *a) {
+    size_t cap = 256, len = 0;
+    char *buf = malloc(cap);
+    buf[0] = '\0';
+
+    append_cstr(&buf, &len, &cap, "[");
+
+    if (a) {
+        for (size_t i = 0; i < a->len; i++) {
+            if (i) append_cstr(&buf, &len, &cap, ", ");
+            xf_value_t sv = xf_stringify_value(a->items[i]);
+            const char *s = (sv.state == XF_STATE_OK && sv.type == XF_TYPE_STR && sv.data.str)
+                ? sv.data.str->data : "NAV";
+            append_cstr(&buf, &len, &cap, s);
+            xf_value_release(sv);
+        }
+    }
+
+    append_cstr(&buf, &len, &cap, "]");
+    xf_str_t *xs = xf_str_new(buf, len);
+    free(buf);
+    xf_value_t out = xf_val_ok_str(xs);
+    xf_str_release(xs);
+    return out;
+}
+
+static xf_value_t stringify_tuple(xf_tuple_t *t) {
+    size_t cap = 256, len = 0;
+    char *buf = malloc(cap);
+    buf[0] = '\0';
+
+    append_cstr(&buf, &len, &cap, "(");
+
+    if (t) {
+        for (size_t i = 0; i < t->len; i++) {
+            if (i) append_cstr(&buf, &len, &cap, ", ");
+            xf_value_t sv = xf_stringify_value(t->items[i]);
+            const char *s = (sv.state == XF_STATE_OK && sv.type == XF_TYPE_STR && sv.data.str)
+                ? sv.data.str->data : "NAV";
+            append_cstr(&buf, &len, &cap, s);
+            xf_value_release(sv);
+        }
+        if (t->len == 1) append_cstr(&buf, &len, &cap, ",");
+    }
+
+    append_cstr(&buf, &len, &cap, ")");
+    xf_str_t *xs = xf_str_new(buf, len);
+    free(buf);
+    xf_value_t out = xf_val_ok_str(xs);
+    xf_str_release(xs);
+    return out;
+}
+
+static xf_value_t stringify_map(xf_map_t *m) {
+    size_t cap = 256, len = 0;
+    char *buf = malloc(cap);
+    buf[0] = '\0';
+
+    append_cstr(&buf, &len, &cap, "{");
+
+    if (m) {
+        bool first = true;
+        for (size_t i = 0; i < m->order_len; i++) {
+            xf_str_t *k = m->order[i];
+            if (!k) continue;
+
+            xf_value_t mv = xf_map_get(m, k);
+
+            if (!first) append_cstr(&buf, &len, &cap, ", ");
+            first = false;
+
+            append_cstr(&buf, &len, &cap, "\"");
+            append_cstr(&buf, &len, &cap, k->data);
+            append_cstr(&buf, &len, &cap, "\": ");
+
+            xf_value_t sv = xf_stringify_value(mv);
+            const char *s = (sv.state == XF_STATE_OK && sv.type == XF_TYPE_STR && sv.data.str)
+                ? sv.data.str->data : "NAV";
+            append_cstr(&buf, &len, &cap, s);
+
+            xf_value_release(sv);
+            xf_value_release(mv);
+        }
+    }
+
+    append_cstr(&buf, &len, &cap, "}");
+    xf_str_t *xs = xf_str_new(buf, len);
+    free(buf);
+    xf_value_t out = xf_val_ok_str(xs);
+    xf_str_release(xs);
+    return out;
+}
+
+static xf_value_t stringify_set(xf_set_t *s) {
+    size_t cap = 256, len = 0;
+    char *buf = malloc(cap);
+    buf[0] = '\0';
+
+    append_cstr(&buf, &len, &cap, "{");
+
+    if (s) {
+        xf_set_impl_t *impl = (xf_set_impl_t *)s->impl;
+        if (impl && impl->backing) {
+            xf_map_t *m = impl->backing;
+            bool first = true;
+
+            for (size_t i = 0; i < m->order_len; i++) {
+                xf_str_t *k = m->order[i];
+                if (!k) continue;
+
+                xf_value_t sv0 = xf_map_get(m, k);
+
+                if (!first) append_cstr(&buf, &len, &cap, ", ");
+                first = false;
+
+                xf_value_t sv = xf_stringify_value(sv0);
+                const char *ss = (sv.state == XF_STATE_OK && sv.type == XF_TYPE_STR && sv.data.str)
+                    ? sv.data.str->data : "NAV";
+                append_cstr(&buf, &len, &cap, ss);
+
+                xf_value_release(sv);
+                xf_value_release(sv0);
+            }
+        }
+    }
+
+    append_cstr(&buf, &len, &cap, "}");
+    xf_str_t *xs = xf_str_new(buf, len);
+    free(buf);
+    xf_value_t out = xf_val_ok_str(xs);
+    xf_str_release(xs);
+    return out;
+}
+
+static xf_value_t xf_stringify_value(xf_value_t v) {
+    if (v.state != XF_STATE_OK) return xf_coerce_str(v);
+
+    switch (v.type) {
+        case XF_TYPE_ARR:   return stringify_arr(v.data.arr);
+        case XF_TYPE_TUPLE: return stringify_tuple(v.data.tuple);
+        case XF_TYPE_MAP:   return stringify_map(v.data.map);
+        case XF_TYPE_SET:   return stringify_set(v.data.set);
+        default:            return xf_coerce_str(v);
+    }
+}
 xf_value_t xf_coerce_str(xf_value_t v) {
     if (v.state == XF_STATE_TRUE) {
         xf_str_t *s = xf_str_from_cstr("true");
@@ -1322,11 +1485,18 @@ xf_value_t xf_coerce_str(xf_value_t v) {
         xf_str_release(s);
         return out;
     }
-
-    xf_str_t *s = xf_str_from_cstr(XF_TYPE_NAMES[v.type < XF_TYPE_COUNT ? v.type : 0]);
-    xf_value_t out = xf_val_ok_str(s);
-    xf_str_release(s);
-    return out;
+    switch (v.type) {
+        case XF_TYPE_ARR:   return stringify_arr(v.data.arr);
+        case XF_TYPE_SET:   return stringify_set(v.data.set);
+        case XF_TYPE_TUPLE: return stringify_tuple(v.data.tuple);
+        case XF_TYPE_MAP:   return stringify_map(v.data.map);
+        default: {
+            xf_str_t *s = xf_str_from_cstr(XF_TYPE_NAMES[v.type < XF_TYPE_COUNT ? v.type : 0]);
+            xf_value_t out = xf_val_ok_str(s);
+            xf_str_release(s);
+            return out;
+        }
+    }
 }
 
 bool xf_can_coerce(xf_value_t v, uint8_t target_type) {

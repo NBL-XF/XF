@@ -61,6 +61,10 @@ typedef enum {
     XF_TYPE_TUPLE,
     XF_TYPE_BOOL,
     XF_TYPE_COMPLEX,
+    XF_TYPE_OK,
+  XF_TYPE_NAV,
+  XF_TYPE_NULL,
+  XF_TYPE_UNDET,
     XF_TYPE_COUNT
 }
 xf_type_t;
