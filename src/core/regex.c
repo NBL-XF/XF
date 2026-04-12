@@ -132,21 +132,30 @@ xf_str_release(mval_s);
 static xf_Value cr_match(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value sv = xf_coerce_str(args[0]);
-    if (sv.state != XF_STATE_OK)xf_value_release(sv); return xf_val_nav(XF_TYPE_MAP);
+    if (sv.state != XF_STATE_OK || !sv.data.str) {
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_MAP);
+    }
     const char *pat; int cflags;
-    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) return xf_val_nav(XF_TYPE_MAP);
+    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) {
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_MAP);
+    }
 
     regex_t re; char errmsg[256];
-    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
+    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg))) {
+        xf_value_release(sv);
         return xf_val_nav(XF_TYPE_MAP);
+    }
 
     size_t ngroups = re.re_nsub + 1;
     if (ngroups > CR_MAX_GROUPS) ngroups = CR_MAX_GROUPS;
     regmatch_t pm[CR_MAX_GROUPS];
+    /* retain subject pointer before any release */
     const char *subject = sv.data.str->data;
-    xf_value_release(sv);
     int rc = regexec(&re, subject, ngroups, pm, 0);
     regfree(&re);
+    xf_value_release(sv);
     if (rc != 0) return xf_val_nav(XF_TYPE_MAP);
     return cr_build_match_map(subject, pm, ngroups);
 }
@@ -156,20 +165,29 @@ static xf_Value cr_match(xf_Value *args, size_t argc) {
 static xf_Value cr_search(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value sv = xf_coerce_str(args[0]);
-    if (sv.state != XF_STATE_OK) xf_value_release(sv);  return xf_val_nav(XF_TYPE_ARR);
+    if (sv.state != XF_STATE_OK || !sv.data.str) {
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
     const char *pat; int cflags;
-    xf_value_release(sv);
-    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) return xf_val_nav(XF_TYPE_ARR);
+    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) {
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
 
     regex_t re; char errmsg[256];
-    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
+    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg))) {
+        xf_value_release(sv);
         return xf_val_nav(XF_TYPE_ARR);
+    }
 
     size_t ngroups = re.re_nsub + 1;
     if (ngroups > CR_MAX_GROUPS) ngroups = CR_MAX_GROUPS;
     regmatch_t pm[CR_MAX_GROUPS];
     xf_arr_t   *results     = xf_arr_new();
-    const char *cursor      = sv.data.str->data;
+    /* save subject pointer — sv must stay alive for the whole loop */
+    const char *subject     = sv.data.str->data;
+    const char *cursor      = subject;
     size_t      base_offset = 0;
     while (*cursor) {
         int rc = regexec(&re, cursor, ngroups, pm,
@@ -183,14 +201,18 @@ static xf_Value cr_search(xf_Value *args, size_t argc) {
                 abs_pm[g].rm_eo += (regoff_t)base_offset;
             }
         }
-        xf_Value mv = cr_build_match_map(sv.data.str->data, abs_pm, ngroups);
-xf_value_release(sv);        xf_arr_push(results, mv);
+        xf_Value mv = cr_build_match_map(subject, abs_pm, ngroups);
+        xf_arr_push(results, mv);
+        xf_value_release(mv);
         size_t adv = (pm[0].rm_eo > pm[0].rm_so) ? (size_t)pm[0].rm_eo : 1;
-        base_offset += adv; cursor += adv;
-            xf_value_release(mv);
+        base_offset += adv;
+        cursor      += adv;
     }
     regfree(&re);
-    xf_Value rv = xf_val_ok_arr(results); xf_arr_release(results); return rv;
+    xf_value_release(sv);   /* release exactly once, after the loop */
+    xf_Value rv = xf_val_ok_arr(results);
+    xf_arr_release(results);
+    return rv;
 }
 
 /* ── cr_replace_impl ──────────────────────────────────────────── */
@@ -199,8 +221,11 @@ static xf_Value cr_replace_impl(xf_Value *args, size_t argc, bool global) {
     NEED(3);
     xf_Value sv   = xf_coerce_str(args[0]);
     xf_Value repv = xf_coerce_str(args[2]);
-    if (sv.state != XF_STATE_OK || repv.state != XF_STATE_OK)
-       xf_value_release(sv); xf_value_release(repv); return xf_val_nav(XF_TYPE_STR);
+    if (sv.state != XF_STATE_OK || repv.state != XF_STATE_OK) {
+        xf_value_release(sv);
+        xf_value_release(repv);
+        return xf_val_nav(XF_TYPE_STR);
+    }
     const char *pat; int cflags;
     if (!cr_arg_pat(args, argc, 1, 3, &pat, &cflags)) return xf_val_nav(XF_TYPE_STR);
 
@@ -256,13 +281,21 @@ static xf_Value cr_replace_all(xf_Value *args, size_t argc) {
 static xf_Value cr_groups(xf_Value *args, size_t argc) {
     NEED(2);
     xf_Value sv = xf_coerce_str(args[0]);
-    if (sv.state != XF_STATE_OK) xf_value_release(sv); return xf_val_nav(XF_TYPE_ARR);
+    if (sv.state != XF_STATE_OK || !sv.data.str) {
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
     const char *pat; int cflags;
-    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) xf_value_release(sv); return xf_val_nav(XF_TYPE_ARR);
+    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) {
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
 
     regex_t re; char errmsg[256];
-    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
+    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg))) {
+        xf_value_release(sv);
         return xf_val_nav(XF_TYPE_ARR);
+    }
 
     size_t ngroups = re.re_nsub + 1;
     if (ngroups > CR_MAX_GROUPS) ngroups = CR_MAX_GROUPS;
@@ -270,7 +303,10 @@ static xf_Value cr_groups(xf_Value *args, size_t argc) {
     const char *subject = sv.data.str->data;
     int rc = regexec(&re, subject, ngroups, pm, 0);
     regfree(&re);
-    if (rc != 0) return xf_val_nav(XF_TYPE_ARR);
+    if (rc != 0) {
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
 
     xf_arr_t *arr = xf_arr_new();
     for (size_t g = 1; g < ngroups; g++) {
@@ -283,6 +319,7 @@ static xf_Value cr_groups(xf_Value *args, size_t argc) {
             xf_arr_push(arr, xf_val_ok_str(empty)); xf_str_release(empty);
         }
     }
+    xf_value_release(sv);
     xf_Value rv = xf_val_ok_arr(arr); xf_arr_release(arr); return rv;
 }
 
@@ -294,13 +331,19 @@ static xf_Value cr_test(xf_Value *args, size_t argc) {
     xf_Value sv = xf_coerce_str(args[0]);
     if (sv.state != XF_STATE_OK) { xf_value_release(sv); return xf_val_ok_num(0); }
     const char *pat; int cflags;
-    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) return xf_val_ok_num(0);
-    regex_t re; char errmsg[256];
-    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
+    if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) {
+        xf_value_release(sv);
         return xf_val_ok_num(0);
+    }
+    regex_t re; char errmsg[256];
+    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg))) {
+        xf_value_release(sv);
+        return xf_val_ok_num(0);
+    }
     int rc = regexec(&re, sv.data.str->data, 0, NULL, 0);
     regfree(&re);
-    return xf_val_ok_num(rc == 0 ? 0.0 : 1.0);
+    xf_value_release(sv);
+    return xf_val_ok_num(rc == 0 ? 1.0 : 0.0);
 }
 
 
@@ -309,8 +352,10 @@ static xf_Value cr_split(xf_Value *args, size_t argc) {
     NEED(2);
 
     xf_Value sv = xf_coerce_str(args[0]);
-    if (sv.state != XF_STATE_OK || !sv.data.str)
+    if (sv.state != XF_STATE_OK || !sv.data.str) {
+        xf_value_release(sv);
         return xf_val_nav(XF_TYPE_ARR);
+    }
 
     const char *s   = sv.data.str->data;
     size_t      len = sv.data.str->len;
@@ -365,6 +410,7 @@ static xf_Value cr_split(xf_Value *args, size_t argc) {
     }
 
     regfree(&re);
+    xf_value_release(sv);
     xf_Value rv = xf_val_ok_arr(arr);
     xf_arr_release(arr);
     return rv;

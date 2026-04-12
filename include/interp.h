@@ -26,11 +26,12 @@ typedef struct Interp {
 uint32_t interp_bind_global_name(Interp *it, xf_Str *name);
 uint32_t interp_bind_global_cstr(Interp *it, const char *name);
 void     interp_reset_global_bindings(void);
-
+bool interp_compile_program_repl(Interp *it, Program *prog);
 /* compiler entry */
 bool     interp_compile_program(Interp *it, Program *prog);
 void     interp_init(Interp *it, SymTable *syms, VM *vm);
 void     interp_free(Interp *it);
+bool interp_compile_expr_repl(Interp *it, Chunk *c, Expr *e);
 xf_Value interp_eval_expr(Interp *it, Expr *e);
 xf_Value interp_eval_stmt(Interp *it, Stmt *s);
 bool     interp_run_program(Interp *it, Program *prog);

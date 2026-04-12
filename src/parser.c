@@ -11,6 +11,11 @@
 TopLevel *parse_fn_decl_top(Parser *p);
 TopLevel *parse_rule(Parser *p);
 TopLevel *parse_top_level(Parser *p);
+Expr *parse_primary_fn_expr(Parser *p, Token *tok);
+static Expr *make_call1_named_expr(Expr *callee, Expr *a0, Loc loc);
+static Expr *parse_flow_postfix(Parser *p);
+static Expr *parse_sugar(Parser *p);
+static Expr *parse_pipe(Parser *p);
 void parser_init(Parser *p, Lexer *lex, SymTable *syms) {
     p->lex        = lex;
     p->pos        = 0;
@@ -146,7 +151,8 @@ void parser_sync(Parser *p) {
 /* ============================================================
  * Primary expressions
  * ============================================================ */
-static bool token_is_type_kw(TokenKind k) {
+ 
+ static bool token_is_type_kw(TokenKind k) {
     switch (k) {
         case TK_KW_NUM:
         case TK_KW_STR:
@@ -157,10 +163,215 @@ static bool token_is_type_kw(TokenKind k) {
         case TK_KW_FN:
         case TK_KW_VOID:
         case TK_KW_BOOL:
+        case TK_KW_OK:
+        case TK_KW_NAV:
+        case TK_KW_NULL:
+        case TK_KW_UNDET:
             return true;
         default:
             return false;
     }
+}
+Expr *parse_primary_fn_expr(Parser *p, Token *tok) {
+    if (!parser_consume(p, TK_LPAREN, "expected '(' after 'fn'")) {
+        return NULL;
+    }
+
+    size_t param_count = 0;
+    Param *params = parse_paramlist(p, &param_count);
+
+    if (!parser_consume(p, TK_RPAREN, "expected ')' after parameter list")) {
+        if (params) {
+            for (size_t i = 0; i < param_count; i++) {
+                xf_str_release(params[i].name);
+                ast_expr_free(params[i].default_val);
+            }
+            free(params);
+        }
+        return NULL;
+    }
+
+    if (!parser_consume(p, TK_LBRACE, "expected '{' before anonymous function body")) {
+        if (params) {
+            for (size_t i = 0; i < param_count; i++) {
+                xf_str_release(params[i].name);
+                ast_expr_free(params[i].default_val);
+            }
+            free(params);
+        }
+        return NULL;
+    }
+
+    if (p->syms) {
+        sym_push(p->syms, SCOPE_FN);
+        Scope *fn_sc = sym_fn_scope(p->syms);
+        if (fn_sc) fn_sc->fn_ret_type = XF_TYPE_VOID;
+
+        for (size_t i = 0; i < param_count; i++) {
+            sym_declare(p->syms, params[i].name, SYM_PARAM, params[i].type, params[i].loc);
+        }
+    }
+
+    Stmt *body = parse_block(p);
+
+    if (p->syms) {
+        sym_pop(p->syms);
+    }
+
+    if (!body) {
+        if (params) {
+            for (size_t i = 0; i < param_count; i++) {
+                xf_str_release(params[i].name);
+                ast_expr_free(params[i].default_val);
+            }
+            free(params);
+        }
+        return NULL;
+    }
+return ast_fn(XF_TYPE_VOID, params, param_count, body, tok->loc);
+}
+static Expr *make_ident_expr(const char *name, Loc loc) {
+    xf_Str *xs = xf_str_from_cstr(name);
+    if (!xs) return NULL;
+
+    Expr *e = ast_ident(xs, loc);
+    xf_str_release(xs);
+    return e;
+}
+
+static Expr *make_call1_named(const char *name, Expr *a0, Loc loc) {
+    if (!a0) return NULL;
+
+    Expr *callee = make_ident_expr(name, loc);
+    if (!callee) {
+        ast_expr_free(a0);
+        return NULL;
+    }
+
+    Expr **args = calloc(1, sizeof(Expr *));
+    if (!args) {
+        ast_expr_free(callee);
+        ast_expr_free(a0);
+        return NULL;
+    }
+
+    args[0] = a0;
+    return ast_call(callee, args, 1, loc);
+}
+
+static Expr *make_call2_named(const char *name, Expr *a0, Expr *a1, Loc loc) {
+    if (!a0 || !a1) {
+        ast_expr_free(a0);
+        ast_expr_free(a1);
+        return NULL;
+    }
+
+    Expr *callee = make_ident_expr(name, loc);
+    if (!callee) {
+        ast_expr_free(a0);
+        ast_expr_free(a1);
+        return NULL;
+    }
+
+    Expr **args = calloc(2, sizeof(Expr *));
+    if (!args) {
+        ast_expr_free(callee);
+        ast_expr_free(a0);
+        ast_expr_free(a1);
+        return NULL;
+    }
+
+    args[0] = a0;
+    args[1] = a1;
+    return ast_call(callee, args, 2, loc);
+}
+
+static Expr *pipe_into_first_arg(Expr *lhs, Expr *rhs, Loc loc) {
+    if (!lhs || !rhs) {
+        ast_expr_free(lhs);
+        ast_expr_free(rhs);
+        return NULL;
+    }
+
+    if (rhs->kind == EXPR_CALL) {
+        Expr *callee = rhs->as.call.callee;
+        Expr **old_args = rhs->as.call.args;
+        size_t old_argc = rhs->as.call.argc;
+
+        Expr **args = calloc(old_argc + 1, sizeof(Expr *));
+        if (!args) {
+            ast_expr_free(lhs);
+            ast_expr_free(rhs);
+            return NULL;
+        }
+
+        args[0] = lhs;
+        for (size_t i = 0; i < old_argc; i++) {
+            args[i + 1] = old_args[i];
+        }
+
+        rhs->as.call.callee = NULL;
+        rhs->as.call.args = NULL;
+        rhs->as.call.argc = 0;
+        ast_expr_free(rhs);
+
+        return ast_call(callee, args, old_argc + 1, loc);
+    }
+
+    return make_call1_named_expr(rhs, lhs, loc);
+}
+
+static Expr *make_call1_named_expr(Expr *callee, Expr *a0, Loc loc) {
+    if (!callee || !a0) {
+        ast_expr_free(callee);
+        ast_expr_free(a0);
+        return NULL;
+    }
+
+    Expr **args = calloc(1, sizeof(Expr *));
+    if (!args) {
+        ast_expr_free(callee);
+        ast_expr_free(a0);
+        return NULL;
+    }
+
+    args[0] = a0;
+    return ast_call(callee, args, 1, loc);
+}
+
+static Expr *pipe_into_last_arg(Expr *lhs, Expr *rhs, Loc loc) {
+    if (!lhs || !rhs) {
+        ast_expr_free(lhs);
+        ast_expr_free(rhs);
+        return NULL;
+    }
+
+    if (lhs->kind == EXPR_CALL) {
+        Expr *callee = lhs->as.call.callee;
+        Expr **old_args = lhs->as.call.args;
+        size_t old_argc = lhs->as.call.argc;
+
+        Expr **args = calloc(old_argc + 1, sizeof(Expr *));
+        if (!args) {
+            ast_expr_free(lhs);
+            ast_expr_free(rhs);
+            return NULL;
+        }
+
+        for (size_t i = 0; i < old_argc; i++) {
+            args[i] = old_args[i];
+        }
+        args[old_argc] = rhs;
+
+        lhs->as.call.callee = NULL;
+        lhs->as.call.args = NULL;
+        lhs->as.call.argc = 0;
+        ast_expr_free(lhs);
+
+        return ast_call(callee, args, old_argc + 1, loc);
+    }
+
+    return make_call1_named_expr(lhs, rhs, loc);
 }
 Expr *parse_primary(Parser *p) {
     Token *tok = parser_current(p);
@@ -180,9 +391,10 @@ Expr *parse_primary(Parser *p) {
             return parse_primary_regex(p, tok);
 
         case TK_IDENT:
-            parser_advance(p);
-            return parse_primary_ident(p, tok);
-
+        case TK_KW_PRINT:
+        case TK_KW_PRINTF:
+    parser_advance(p);
+    return parse_primary_ident(p, tok);
         case TK_FIELD:
             parser_advance(p);
             return parse_primary_field(p, tok);
@@ -199,11 +411,12 @@ Expr *parse_primary(Parser *p) {
         case TK_VAR_OFS:
         case TK_VAR_ORS:
         case TK_VAR_OFMT:
+        case TK_KW_VOID:
+        case TK_KW_VOID_S:
         case TK_KW_OK:
         case TK_KW_ERR:
         case TK_KW_NAV:
         case TK_KW_NULL:
-        case TK_KW_VOID_S:
         case TK_KW_UNDEF:
         case TK_KW_UNDET:
         case TK_KW_TRUE:
@@ -214,6 +427,15 @@ Expr *parse_primary(Parser *p) {
         case TK_LPAREN:
             parser_advance(p);
             return parse_primary_group(p);
+                case TK_KW_SET:
+            parser_advance(p);
+            if (!parser_consume(p, TK_LBRACE, "expected '{' after 'set'")) {
+                return NULL;
+            }
+            return parse_primary_brace(p);
+        case TK_KW_FN:
+            parser_advance(p);
+            return parse_primary_fn_expr(p, tok);
         case TK_LBRACE:
             parser_advance(p);
             return parse_primary_brace(p);
@@ -368,16 +590,30 @@ Expr *parse_primary_array(Parser *p) {
             items = tmp;
             cap = new_cap;
         }
+                Expr *item = NULL;
 
-        Expr *item = parse_expr(p);
-        if (!item) {
-            for (size_t i = 0; i < count; i++) ast_expr_free(items[i]);
-            free(items);
-            parser_consume(p, TK_RBRACKET, "expected ']' after array literal");
-            return NULL;
+        if (parser_match(p, TK_DOTDOTDOT)) {
+            Token *op = parser_previous(p);
+            Expr *inner = parse_expr(p);
+            if (!inner) {
+                for (size_t i = 0; i < count; i++) ast_expr_free(items[i]);
+                free(items);
+                parser_consume(p, TK_RBRACKET, "expected ']' after array literal");
+                return NULL;
+            }
+            item = ast_spread(inner, op->loc);
+        } else {
+            item = parse_expr(p);
+            if (!item) {
+                for (size_t i = 0; i < count; i++) ast_expr_free(items[i]);
+                free(items);
+                parser_consume(p, TK_RBRACKET, "expected ']' after array literal");
+                return NULL;
+            }
         }
 
         items[count++] = item;
+
 
         if (!parser_match(p, TK_COMMA)) break;
         if (parser_check(p, TK_RBRACKET)) break; /* trailing comma */
@@ -403,7 +639,9 @@ Expr *parse_primary_keyword(Parser *p, Token *tok) {
 
         case TK_KW_OK:
             return ast_state_lit(XF_STATE_OK, tok->loc);
-
+        case TK_KW_VOID:
+        case TK_KW_VOID_S:
+            return ast_state_lit(XF_STATE_VOID, tok->loc);
         case TK_KW_ERR:
             return ast_state_lit(XF_STATE_ERR, tok->loc);
 
@@ -412,9 +650,6 @@ Expr *parse_primary_keyword(Parser *p, Token *tok) {
 
         case TK_KW_NULL:
             return ast_state_lit(XF_STATE_NULL, tok->loc);
-
-        case TK_KW_VOID_S:
-            return ast_state_lit(XF_STATE_VOID, tok->loc);
 
         case TK_KW_UNDEF:
             return ast_state_lit(XF_STATE_UNDEF, tok->loc);
@@ -481,7 +716,7 @@ Expr *parse_unary(Parser *p) {
         }
 
         default:
-            return parse_postfix(p);
+            return parse_flow_postfix(p);
     }
 }
 Expr **parse_arglist(Parser *p, size_t *out_count) {
@@ -523,6 +758,30 @@ Expr **parse_arglist(Parser *p, size_t *out_count) {
 
     *out_count = count;
     return args;
+}
+Expr *parse_flow_postfix(Parser *p) {
+    Expr *expr = parse_postfix(p);
+    if (!expr) return NULL;
+
+    for (;;) {
+        if (parser_match(p, TK_POP_ARROW)) {
+            Token *op = parser_previous(p);
+            expr = make_call1_named("pop", expr, op->loc);
+            if (!expr) return NULL;
+            continue;
+        }
+
+        if (parser_match(p, TK_SHIFT_ARROW)) {
+            Token *op = parser_previous(p);
+            expr = make_call1_named("shift", expr, op->loc);
+            if (!expr) return NULL;
+            continue;
+        }
+
+        break;
+    }
+
+    return expr;
 }
 Expr *parse_postfix(Parser *p) {
     Expr *expr = parse_primary(p);
@@ -602,6 +861,7 @@ Expr *parse_postfix(Parser *p) {
                 case TK_KW_FN:
                 case TK_KW_VOID:
                 case TK_KW_BOOL:
+                case TK_KW_JOIN:
                     parser_advance(p);
                     break;
 
@@ -757,22 +1017,45 @@ Expr *parse_compare(Parser *p) {
 
     for (;;) {
         BinOp op;
+        Token *op_tok = NULL;
 
         if (parser_match(p, TK_LT)) {
             op = BINOP_LT;
+            op_tok = parser_previous(p);
         } else if (parser_match(p, TK_GT)) {
             op = BINOP_GT;
-        } else if (parser_match(p, TK_LT_EQ)) {
-            op = BINOP_LTE;
+            op_tok = parser_previous(p);
         } else if (parser_match(p, TK_GT_EQ)) {
             op = BINOP_GTE;
-        } else if (parser_match(p, TK_SPACESHIP)) {   /* <=> */
+            op_tok = parser_previous(p);
+        } else if (parser_match(p, TK_SPACESHIP)) {
             op = BINOP_SPACESHIP;
+            op_tok = parser_previous(p);
+        } else if (parser_match(p, TK_LT_EQ) || parser_match(p, TK_POP_ARROW)) {
+            Token *maybe = parser_previous(p);
+
+            TokenKind k = parser_current(p)->kind;
+            bool starts_rhs =
+                k != TK_EOF &&
+                k != TK_NEWLINE &&
+                k != TK_SEMICOLON &&
+                k != TK_RBRACE &&
+                k != TK_RPAREN &&
+                k != TK_RBRACKET &&
+                k != TK_COMMA &&
+                k != TK_COLON;
+
+            if (!starts_rhs) {
+                p->pos--;
+                break;
+            }
+
+            op = BINOP_LTE;
+            op_tok = maybe;
         } else {
             break;
         }
 
-        Token *op_tok = parser_previous(p);
         Expr *right = parse_concat(p);
         if (!right) {
             ast_expr_free(expr);
@@ -891,19 +1174,100 @@ Expr *parse_ternary(Parser *p) {
 
     return ast_ternary(cond, then_branch, else_branch, cond->loc);
 }
-Expr *parse_pipe(Parser *p) {
+Expr *parse_sugar(Parser *p) {
     Expr *expr = parse_ternary(p);
     if (!expr) return NULL;
 
-    while (parser_match(p, TK_PIPE_GT)) {   /* |> */
-        Token *op_tok = parser_previous(p);
-        Expr *right = parse_ternary(p);
-        if (!right) {
-            ast_expr_free(expr);
-            return NULL;
+    for (;;) {
+        if (parser_match(p, TK_PUSH_ARROW)) {
+            Token *op = parser_previous(p);
+            Expr *right = parse_ternary(p);
+            if (!right) {
+                ast_expr_free(expr);
+                return NULL;
+            }
+
+            expr = make_call2_named("push", right, expr, op->loc);
+            if (!expr) return NULL;
+            continue;
         }
 
-        expr = ast_pipe_fn(expr, right, op_tok->loc);
+        if (parser_match(p, TK_UNSHIFT_ARROW)) {
+            Token *op = parser_previous(p);
+            Expr *right = parse_ternary(p);
+            if (!right) {
+                ast_expr_free(expr);
+                return NULL;
+            }
+
+            expr = make_call2_named("unshift", right, expr, op->loc);
+            if (!expr) return NULL;
+            continue;
+        }
+
+        if (parser_match(p, TK_FILTER_BR)) {
+            Token *op = parser_previous(p);
+            Expr *right = parse_ternary(p);
+            if (!right) {
+                ast_expr_free(expr);
+                return NULL;
+            }
+
+            expr = make_call2_named("filter", expr, right, op->loc);
+            if (!expr) return NULL;
+            continue;
+        }
+
+        if (parser_match(p, TK_TRANSFORM_BR)) {
+            Token *op = parser_previous(p);
+            Expr *right = parse_ternary(p);
+            if (!right) {
+                ast_expr_free(expr);
+                return NULL;
+            }
+
+            expr = make_call2_named("transform", expr, right, op->loc);
+            if (!expr) return NULL;
+            continue;
+        }
+
+        break;
+    }
+
+    return expr;
+}
+Expr *parse_pipe(Parser *p) {
+    Expr *expr = parse_sugar(p);
+    if (!expr) return NULL;
+
+    for (;;) {
+        if (parser_match(p, TK_PIPE_GT)) {
+            Token *op_tok = parser_previous(p);
+            Expr *right = parse_sugar(p);
+            if (!right) {
+                ast_expr_free(expr);
+                return NULL;
+            }
+
+            expr = pipe_into_first_arg(expr, right, op_tok->loc);
+            if (!expr) return NULL;
+            continue;
+        }
+
+        if (parser_match(p, TK_PIPE_LT)) {
+            Token *op_tok = parser_previous(p);
+            Expr *right = parse_sugar(p);
+            if (!right) {
+                ast_expr_free(expr);
+                return NULL;
+            }
+
+            expr = pipe_into_last_arg(expr, right, op_tok->loc);
+            if (!expr) return NULL;
+            continue;
+        }
+
+        break;
     }
 
     return expr;
@@ -1542,6 +1906,21 @@ Stmt *parse_stmt(Parser *p) {
         if (parser_match(p, TK_KW_OUTFMT)) {
         return parse_outfmt(p);
     }
+    if (parser_check(p, TK_KW_PRINT)) {
+    TokenKind next = parser_peek(p, 1)->kind;
+    if (next != TK_PIPE_LT && next != TK_LPAREN) {
+        parser_advance(p);
+        return parse_print(p);
+    }
+}
+
+if (parser_check(p, TK_KW_PRINTF)) {
+    TokenKind next = parser_peek(p, 1)->kind;
+    if (next != TK_PIPE_LT && next != TK_LPAREN) {
+        parser_advance(p);
+        return parse_printf(p);
+    }
+}
 
     if (parser_match(p, TK_KW_FOR)) {
         return parse_for(p);
@@ -1568,14 +1947,21 @@ Stmt *parse_stmt(Parser *p) {
     if (parser_match(p, TK_KW_RETURN)) {
         return parse_return(p);
     }
-
-    if (parser_match(p, TK_KW_PRINT)) {
+    if (parser_check(p, TK_KW_PRINT)) {
+    TokenKind next = parser_peek(p, 1)->kind;
+    if (next != TK_PIPE_LT && next != TK_LPAREN) {
+        parser_advance(p);
         return parse_print(p);
     }
+}
 
-    if (parser_match(p, TK_KW_PRINTF)) {
+if (parser_check(p, TK_KW_PRINTF)) {
+    TokenKind next = parser_peek(p, 1)->kind;
+    if (next != TK_PIPE_LT && next != TK_LPAREN) {
+        parser_advance(p);
         return parse_printf(p);
     }
+}
 
     if (parser_match(p, TK_KW_IMPORT)) {
         return parse_import(p);
@@ -1638,6 +2024,10 @@ uint8_t parse_type(Parser *p) {
         case TK_KW_FN:    parser_advance(p); return XF_TYPE_FN;
         case TK_KW_VOID:  parser_advance(p); return XF_TYPE_VOID;
         case TK_KW_BOOL:  parser_advance(p); return XF_TYPE_BOOL;
+        case TK_KW_OK:    parser_advance(p); return XF_TYPE_OK;
+        case TK_KW_NAV:   parser_advance(p); return XF_TYPE_NAV;
+        case TK_KW_NULL:  parser_advance(p); return XF_TYPE_NULL;
+        case TK_KW_UNDET: parser_advance(p); return XF_TYPE_UNDET;
         default:
             parser_error(p, tok, "expected type");
             return XF_TYPE_VOID;

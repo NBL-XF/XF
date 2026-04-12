@@ -1047,37 +1047,51 @@ static Token * next(Lexer * l) {
     t = make_tok(l, TK_BANG, start, loc);
     l -> after_value = false;
     break;
-
   case '<':
     if (match(l, '=')) {
       if (match(l, '=')) {
         t = make_tok(l, TK_UNSHIFT_ARROW, start, loc);
-        l -> after_value = false;
+        l->after_value = false;
         break;
       }
       if (match(l, '>')) {
         t = make_tok(l, TK_SPACESHIP, start, loc);
-        l -> after_value = false;
+        l->after_value = false;
         break;
       }
-      t = make_tok(l, TK_LT_EQ, start, loc);
-      l -> after_value = false;
+
+      t = make_tok(l, TK_POP_ARROW, start, loc);
+      l->after_value = false;
       break;
     }
+
+    if (match(l, '|')) {
+      t = make_tok(l, TK_PIPE_LT, start, loc);
+      l->after_value = false;
+      break;
+    }
+
+    if (match(l, '3')) {
+      t = make_tok(l, TK_SPLIT_LT3, start, loc);
+      l->after_value = false;
+      break;
+    }
+
     if (match(l, '<')) {
       t = make_tok(l, TK_LT_LT, start, loc);
-      l -> after_value = false;
+      l->after_value = false;
       break;
     }
+
     if (match(l, '>')) {
       t = make_tok(l, TK_DIAMOND, start, loc);
-      l -> after_value = false;
+      l->after_value = false;
       break;
     }
-    t = make_tok(l, TK_LT, start, loc);
-    l -> after_value = false;
-    break;
 
+    t = make_tok(l, TK_LT, start, loc);
+    l->after_value = false;
+    break;
   case '>':
     if (match(l, '=')) {
       t = make_tok(l, TK_GT_EQ, start, loc);
@@ -1258,14 +1272,30 @@ static Token * next(Lexer * l) {
       advance(l);
       advance(l);
       t = make_tok(l, TK_FLATTEN_ASSIGN, start, loc);
-      l -> after_value = false;
+      l->after_value = false;
       break;
     }
-    l -> bracket_depth++;
-    t = make_tok(l, TK_LBRACKET, start, loc);
-    l -> after_value = false;
-    break;
 
+    if (peek(l) == '*' && peek2(l) == ']') {
+      advance(l);
+      advance(l);
+      t = make_tok(l, TK_FILTER_BR, start, loc);
+      l->after_value = false;
+      break;
+    }
+
+    if (peek(l) == '/' && peek2(l) == ']') {
+      advance(l);
+      advance(l);
+      t = make_tok(l, TK_TRANSFORM_BR, start, loc);
+      l->after_value = false;
+      break;
+    }
+
+    l->bracket_depth++;
+    t = make_tok(l, TK_LBRACKET, start, loc);
+    l->after_value = false;
+    break;
   case ']':
     if (l -> bracket_depth > 0) l -> bracket_depth--;
     t = make_tok(l, TK_RBRACKET, start, loc);
@@ -1554,6 +1584,16 @@ const char * xf_token_kind_name(TokenKind kind) {
     return ".";
   case TK_DOTDOTDOT:
     return "...";
+    case TK_POP_ARROW:
+    return "<=";
+  case TK_SPLIT_LT3:
+    return "<3";
+  case TK_TRANSFORM_BR:
+    return "[/]";
+  case TK_FILTER_BR:
+    return "[*]";
+  case TK_PIPE_LT:
+    return "<|";
   case TK_REPL_CMD:
     return "REPL_CMD";
   case TK_NEWLINE:

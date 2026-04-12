@@ -9,6 +9,7 @@
 #include "../include/vm.h"
 #include "../include/value.h"
 #include "../include/interp.h"
+#include "../include/repl.h"
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -54,6 +55,43 @@ static char *read_file(const char *path) {
 static void usage(const char *argv0) {
     fprintf(stderr, "usage: %s <file.xf>\n", argv0 ? argv0 : "xf");
 }
+
+static void bind_runtime_specials(Interp *it) {
+    if (!it || !it->vm) return;
+
+    struct {
+        const char *name;
+        xf_Value value;
+    } specs[5];
+
+    specs[0].name = "file";
+    specs[0].value = xf_val_ok_str(xf_str_from_cstr(""));
+
+    specs[1].name = "match";
+    specs[1].value = xf_val_null();
+
+    xf_arr_t *caps = xf_arr_new();
+    specs[2].name = "captures";
+    specs[2].value = caps ? xf_val_ok_arr(caps) : xf_val_null();
+    if (caps) xf_arr_release(caps);
+
+    specs[3].name = "err";
+    specs[3].value = xf_val_null();
+
+    xf_Str *ofmt_s = xf_str_from_cstr("%.6g");
+    specs[4].name = "OFMT";
+    specs[4].value = ofmt_s ? xf_val_ok_str(ofmt_s) : xf_val_null();
+    xf_str_release(ofmt_s);
+
+    for (size_t i = 0; i < 5; i++) {
+        uint32_t slot = interp_bind_global_cstr(it, specs[i].name);
+        if (slot != UINT32_MAX) {
+            vm_set_global(it->vm, slot, specs[i].value);
+        }
+        xf_value_release(specs[i].value);
+    }
+}
+
 static void inject_args(Interp *it, int argc, char **argv) {
     xf_arr_t *arr = xf_arr_new();
     if (!arr) return;
@@ -99,13 +137,19 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
     it.vm   = &vm;
     it.syms = &syms;
 core_set_fn_caller(&vm, &syms, interp_exec_xf_fn_bridge);
+    bind_runtime_specials(&it);
     if (!interp_compile_program(&it, prog)) {
-        fprintf(stderr, "compile failed\n");
+        fprintf(stderr, "xf: compile failed\n");
+        if (it.vm && it.vm->had_error) {
+            fprintf(stderr, "xf: vm error: %s\n", it.vm->err_msg);
+        }
+        if (it.syms && it.syms->had_error) {
+            fprintf(stderr, "xf: sym error: %s\n", it.syms->err_msg);
+        }
         sym_free(&syms);
         vm_free(&vm);
         return 1;
     }
-
     inject_args(&it, argc, argv);
 
     if (vm_run_begin(&vm) != VM_OK) {
@@ -147,8 +191,7 @@ int main(int argc, char **argv) {
     Program *prog = NULL;
 
     if (argc < 2) {
-        usage(argv[0]);
-        return 1;
+        return xf_run_repl();
     }
 
     path = argv[1];

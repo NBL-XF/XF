@@ -419,15 +419,17 @@ xf_map_set(out, key, val);         xf_value_release(val);   }
 }
 static xf_Value cg_contains(xf_Value *args, size_t argc) {
     NEED(2);
-    xf_Value coll = args[0], needle = args[1];
-    if (coll.state != XF_STATE_OK) return xf_value_retain(coll);
+    xf_Value coll   = args[0];
+    xf_Value needle = args[1];
+
+    if (coll.state != XF_STATE_OK)   return xf_value_retain(coll);
     if (needle.state != XF_STATE_OK) return xf_value_retain(needle);
 
     if (coll.type == XF_TYPE_STR && coll.data.str) {
         xf_Value ns = xf_coerce_str(needle);
         if (ns.state != XF_STATE_OK || !ns.data.str) {
             if (ns.state == XF_STATE_OK) xf_value_release(ns);
-            return xf_val_ok_num(0.0);
+            return xf_val_false();
         }
 
         bool found = strstr(coll.data.str->data, ns.data.str->data) != NULL;
@@ -439,7 +441,7 @@ static xf_Value cg_contains(xf_Value *args, size_t argc) {
         xf_Value ns = xf_coerce_str(needle);
         if (ns.state != XF_STATE_OK || !ns.data.str) {
             if (ns.state == XF_STATE_OK) xf_value_release(ns);
-            return xf_val_ok_num(0.0);
+            return xf_val_false();
         }
 
         xf_arr_t *a = coll.data.arr;
@@ -449,27 +451,34 @@ static xf_Value cg_contains(xf_Value *args, size_t argc) {
                           es.data.str &&
                           strcmp(es.data.str->data, ns.data.str->data) == 0);
             xf_value_release(es);
+
             if (match) {
                 xf_value_release(ns);
-                return xf_val_ok_num(1.0);
+                return xf_val_true();
             }
         }
 
         xf_value_release(ns);
-        return xf_val_ok_num(0.0);
+        return xf_val_false();
     }
 
-    if ((coll.type == XF_TYPE_MAP || coll.type == XF_TYPE_SET) && coll.data.map) {
+    if (coll.type == XF_TYPE_MAP && coll.data.map) {
         xf_Value ks = xf_coerce_str(needle);
         if (ks.state != XF_STATE_OK || !ks.data.str) {
             if (ks.state == XF_STATE_OK) xf_value_release(ks);
-            return xf_val_ok_num(0.0);
+            return xf_val_false();
         }
 
         xf_Value got = xf_map_get(coll.data.map, ks.data.str);
         xf_value_release(ks);
-        bool found = (got.state==XF_STATE_OK);
+
+        bool found = (got.state == XF_STATE_OK);
         xf_value_release(got);
+        return found ? xf_val_true() : xf_val_false();
+    }
+
+    if (coll.type == XF_TYPE_SET && coll.data.set) {
+        bool found = xf_set_has(coll.data.set, needle);
         return found ? xf_val_true() : xf_val_false();
     }
 
@@ -501,7 +510,7 @@ xf_module_t *build_generics(void) {
     FN("join",     XF_TYPE_STR, cg_join);
     FN("split",    XF_TYPE_ARR, cg_split);
     FN("strip",    XF_TYPE_STR, cg_strip);
-    FN("contains", XF_TYPE_NUM, cg_contains);
+    FN("contains", XF_TYPE_BOOL, cg_contains);
     FN("size",   XF_TYPE_NUM, cg_length);
     return m;
 }

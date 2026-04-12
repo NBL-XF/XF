@@ -18,6 +18,7 @@
 #define XF_OUTFMT_JSON  3
 typedef enum {
     OP_PUSH_NUM,
+    OP_PUSH_CONST,
     OP_PUSH_STR,
     OP_PUSH_TRUE,
     OP_PUSH_FALSE,
@@ -168,7 +169,11 @@ typedef struct {
     FILE *fp;
     bool  is_pipe;
 } VMRedirect;
-
+typedef struct {
+    bool     used;
+    bool     done;
+    xf_Value result;
+} VMTask;
 typedef enum {
     VM_OK,
     VM_ERR,
@@ -178,7 +183,7 @@ typedef enum {
 typedef struct VM {
     xf_Value   stack[VM_STACK_MAX];
     size_t     stack_top;
-
+        VMTask    tasks[256];
     CallFrame  frames[VM_FRAMES_MAX];
     size_t     frame_count;
 
