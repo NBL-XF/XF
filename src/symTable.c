@@ -8,7 +8,29 @@
 /* ============================================================
  * Scope alloc / free
  * ============================================================ */
+#include "../include/core.h"
 
+/* fn-caller hooks provided by helpers.c */
+extern xf_fn_caller_t  core_get_fn_caller(void);
+extern void           *core_get_fn_caller_vm(void);
+extern void           *core_get_fn_caller_syms(void);
+
+static xf_value_t call_any_fn(xf_value_t fnv, xf_value_t *args, size_t argc, uint8_t want_type) {
+    if (fnv.state != XF_STATE_OK || fnv.type != XF_TYPE_FN || !fnv.data.fn) {
+        return xf_val_nav(want_type);
+    }
+
+    xf_fn_caller_t caller = core_get_fn_caller();
+    if (!caller) {
+        return xf_val_nav(want_type);
+    }
+
+    return caller(core_get_fn_caller_vm(),
+                  core_get_fn_caller_syms(),
+                  fnv.data.fn,
+                  args,
+                  argc);
+}
 static Scope *scope_new(ScopeKind kind, Scope *parent, uint8_t fn_ret_type) {
     Scope *sc = calloc(1, sizeof(Scope));
     if (!sc) return NULL;
@@ -362,7 +384,237 @@ uint8_t sym_fn_return_type(const SymTable *st) {
 /* ============================================================
  * Native builtins (minimal collection set)
  * ============================================================ */
+static xf_value_t builtin_regex(xf_value_t *args, size_t argc) {
+    if (!args || argc != 1) return xf_val_nav(XF_TYPE_REGEX);
 
+    xf_value_t sv = xf_coerce_str(args[0]);
+    if (sv.state != XF_STATE_OK || sv.type != XF_TYPE_STR || !sv.data.str) {
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_REGEX);
+    }
+
+    xf_regex_t *re = calloc(1, sizeof(xf_regex_t));
+    if (!re) {
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_REGEX);
+    }
+
+    atomic_store(&re->refcount, 1);
+    re->pattern = xf_str_retain(sv.data.str);
+    re->flags = 0;
+    re->compiled = NULL;
+
+    xf_value_t out = xf_val_ok_re(re);
+    xf_regex_release(re);
+    xf_value_release(sv);
+    return out;
+}
+static xf_value_t builtin_expand(xf_value_t *args, size_t argc) {
+    if (!args || argc != 1) return xf_val_nav(XF_TYPE_ARR);
+
+    xf_value_t v = args[0];
+    if (v.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_ARR);
+
+    if (v.type == XF_TYPE_ARR && v.data.arr) {
+        return xf_value_retain(v);
+    }
+
+    xf_arr_t *out = xf_arr_new();
+    if (!out) return xf_val_nav(XF_TYPE_ARR);
+
+    if (v.type == XF_TYPE_TUPLE && v.data.tuple) {
+        for (size_t i = 0; i < v.data.tuple->len; i++) {
+            xf_arr_push(out, v.data.tuple->items[i]);
+        }
+    } else if (v.type == XF_TYPE_SET && v.data.set) {
+        xf_arr_t *tmp = xf_set_to_arr(v.data.set);
+        if (!tmp) {
+            xf_arr_release(out);
+            return xf_val_nav(XF_TYPE_ARR);
+        }
+        for (size_t i = 0; i < tmp->len; i++) {
+            xf_arr_push(out, tmp->items[i]);
+        }
+        xf_arr_release(tmp);
+    } else {
+        xf_arr_push(out, v);
+    }
+
+    xf_value_t rv = xf_val_ok_arr(out);
+    xf_arr_release(out);
+    return rv;
+}
+
+static xf_value_t builtin_flatten(xf_value_t *args, size_t argc) {
+    if (!args || argc != 1) return xf_val_nav(XF_TYPE_ARR);
+
+    xf_value_t v = args[0];
+    if (v.state != XF_STATE_OK || v.type != XF_TYPE_ARR || !v.data.arr) {
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    xf_arr_t *out = xf_arr_new();
+    if (!out) return xf_val_nav(XF_TYPE_ARR);
+
+    for (size_t i = 0; i < v.data.arr->len; i++) {
+        xf_value_t item = v.data.arr->items[i];
+
+        if (item.state == XF_STATE_OK && item.type == XF_TYPE_ARR && item.data.arr) {
+            for (size_t j = 0; j < item.data.arr->len; j++) {
+                xf_arr_push(out, item.data.arr->items[j]);
+            }
+        } else {
+            xf_arr_push(out, item);
+        }
+    }
+
+    xf_value_t rv = xf_val_ok_arr(out);
+    xf_arr_release(out);
+    return rv;
+}
+static xf_value_t builtin_merge(xf_value_t *args, size_t argc) {
+    if (!args || argc != 2) return xf_val_nav(XF_TYPE_VOID);
+
+    xf_value_t a = args[0];
+    xf_value_t b = args[1];
+
+    if (a.state != XF_STATE_OK || b.state != XF_STATE_OK) {
+        return xf_val_nav(XF_TYPE_VOID);
+    }
+
+    if (a.type == XF_TYPE_ARR && a.data.arr &&
+        b.type == XF_TYPE_ARR && b.data.arr) {
+        xf_arr_t *out = xf_arr_new();
+        if (!out) return xf_val_nav(XF_TYPE_ARR);
+
+        for (size_t i = 0; i < a.data.arr->len; i++) {
+            xf_arr_push(out, a.data.arr->items[i]);
+        }
+        for (size_t i = 0; i < b.data.arr->len; i++) {
+            xf_arr_push(out, b.data.arr->items[i]);
+        }
+
+        xf_value_t rv = xf_val_ok_arr(out);
+        xf_arr_release(out);
+        return rv;
+    }
+
+    if (a.type == XF_TYPE_STR && a.data.str &&
+        b.type == XF_TYPE_STR && b.data.str) {
+        size_t n = a.data.str->len + b.data.str->len;
+        char *buf = malloc(n + 1);
+        if (!buf) return xf_val_nav(XF_TYPE_STR);
+
+        memcpy(buf, a.data.str->data, a.data.str->len);
+        memcpy(buf + a.data.str->len, b.data.str->data, b.data.str->len);
+        buf[n] = '\0';
+
+        xf_Str *s = xf_str_new(buf, n);
+        free(buf);
+        if (!s) return xf_val_nav(XF_TYPE_STR);
+
+        xf_value_t rv = xf_val_ok_str(s);
+        xf_str_release(s);
+        return rv;
+    }
+
+    if (a.type == XF_TYPE_MAP && a.data.map &&
+        b.type == XF_TYPE_MAP && b.data.map) {
+        xf_map_t *out = xf_map_new();
+        if (!out) return xf_val_nav(XF_TYPE_MAP);
+
+        for (size_t i = 0; i < a.data.map->order_len; i++) {
+            xf_Str *k = a.data.map->order[i];
+            if (!k) continue;
+            xf_value_t v = xf_map_get(a.data.map, k);
+            xf_map_set(out, k, v);
+            xf_value_release(v);
+        }
+
+        for (size_t i = 0; i < b.data.map->order_len; i++) {
+            xf_Str *k = b.data.map->order[i];
+            if (!k) continue;
+            xf_value_t v = xf_map_get(b.data.map, k);
+            xf_map_set(out, k, v);
+            xf_value_release(v);
+        }
+
+        xf_value_t rv = xf_val_ok_map(out);
+        xf_map_release(out);
+        return rv;
+    }
+
+    return xf_val_nav(XF_TYPE_VOID);
+}
+
+static xf_value_t builtin_split(xf_value_t *args, size_t argc) {
+    if (!args || argc != 2) return xf_val_nav(XF_TYPE_ARR);
+
+    xf_value_t subject = args[0];
+    xf_value_t delim   = args[1];
+
+    if (subject.state != XF_STATE_OK || delim.state != XF_STATE_OK) {
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    xf_value_t ss = xf_coerce_str(subject);
+    xf_value_t ds = xf_coerce_str(delim);
+
+    if (ss.state != XF_STATE_OK || ss.type != XF_TYPE_STR || !ss.data.str ||
+        ds.state != XF_STATE_OK || ds.type != XF_TYPE_STR || !ds.data.str) {
+        xf_value_release(ss);
+        xf_value_release(ds);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    const char *s = ss.data.str->data;
+    const char *d = ds.data.str->data;
+    size_t dlen = ds.data.str->len;
+
+    xf_arr_t *out = xf_arr_new();
+    if (!out) {
+        xf_value_release(ss);
+        xf_value_release(ds);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    if (dlen == 0) {
+        xf_value_t whole = xf_val_ok_str(ss.data.str);
+        xf_arr_push(out, whole);
+        xf_value_release(whole);
+    } else {
+        const char *cur = s;
+        const char *hit = NULL;
+
+        while ((hit = strstr(cur, d)) != NULL) {
+            size_t len = (size_t)(hit - cur);
+            xf_Str *part = xf_str_new(cur, len);
+            if (!part) break;
+
+            xf_value_t pv = xf_val_ok_str(part);
+            xf_arr_push(out, pv);
+            xf_value_release(pv);
+            xf_str_release(part);
+
+            cur = hit + dlen;
+        }
+
+        xf_Str *tail = xf_str_from_cstr(cur);
+        if (tail) {
+            xf_value_t tv = xf_val_ok_str(tail);
+            xf_arr_push(out, tv);
+            xf_value_release(tv);
+            xf_str_release(tail);
+        }
+    }
+
+    xf_value_release(ss);
+    xf_value_release(ds);
+
+    xf_value_t rv = xf_val_ok_arr(out);
+    xf_arr_release(out);
+    return rv;
+}
 static xf_value_t builtin_push(xf_value_t *args, size_t argc) {
     if (!args || argc != 2) return xf_val_nav(XF_TYPE_VOID);
 
@@ -608,7 +860,6 @@ static xf_value_t builtin_filter(xf_value_t *args, size_t argc) {
     if (coll.state != XF_STATE_OK || coll.type != XF_TYPE_ARR || !coll.data.arr) {
         return xf_val_nav(XF_TYPE_ARR);
     }
-
     if (pred.state != XF_STATE_OK || pred.type != XF_TYPE_FN || !pred.data.fn) {
         return xf_val_nav(XF_TYPE_ARR);
     }
@@ -620,15 +871,17 @@ static xf_value_t builtin_filter(xf_value_t *args, size_t argc) {
         xf_value_t argv[1];
         argv[0] = xf_value_retain(coll.data.arr->items[i]);
 
-        xf_value_t keep = pred.data.fn->native_v
-            ? pred.data.fn->native_v(argv, 1)
-            : xf_val_nav(XF_TYPE_BOOL);
-
+        xf_value_t keep = call_any_fn(pred, argv, 1, XF_TYPE_BOOL);
         xf_value_release(argv[0]);
 
-        bool truthy =
-            (keep.state == XF_STATE_TRUE) ||
-            (keep.state == XF_STATE_OK && keep.type == XF_TYPE_NUM && keep.data.num != 0);
+        bool truthy = false;
+        if (keep.state == XF_STATE_TRUE) {
+            truthy = true;
+        } else if (keep.state == XF_STATE_OK && keep.type == XF_TYPE_NUM) {
+            truthy = (keep.data.num != 0.0);
+        } else if (keep.state == XF_STATE_OK && keep.type == XF_TYPE_BOOL) {
+            truthy = true;
+        }
 
         if (truthy) {
             xf_arr_push(out, coll.data.arr->items[i]);
@@ -641,7 +894,6 @@ static xf_value_t builtin_filter(xf_value_t *args, size_t argc) {
     xf_arr_release(out);
     return rv;
 }
-
 static xf_value_t builtin_transform(xf_value_t *args, size_t argc) {
     if (!args || argc != 2) return xf_val_nav(XF_TYPE_ARR);
 
@@ -651,7 +903,6 @@ static xf_value_t builtin_transform(xf_value_t *args, size_t argc) {
     if (coll.state != XF_STATE_OK || coll.type != XF_TYPE_ARR || !coll.data.arr) {
         return xf_val_nav(XF_TYPE_ARR);
     }
-
     if (fn.state != XF_STATE_OK || fn.type != XF_TYPE_FN || !fn.data.fn) {
         return xf_val_nav(XF_TYPE_ARR);
     }
@@ -663,11 +914,9 @@ static xf_value_t builtin_transform(xf_value_t *args, size_t argc) {
         xf_value_t argv[1];
         argv[0] = xf_value_retain(coll.data.arr->items[i]);
 
-        xf_value_t mapped = fn.data.fn->native_v
-            ? fn.data.fn->native_v(argv, 1)
-            : xf_val_nav(XF_TYPE_VOID);
-
+        xf_value_t mapped = call_any_fn(fn, argv, 1, XF_TYPE_VOID);
         xf_value_release(argv[0]);
+
         xf_arr_push(out, mapped);
         xf_value_release(mapped);
     }
@@ -691,13 +940,15 @@ static xf_value_t builtin_print_fn(xf_value_t *args, size_t argc) {
     return xf_value_retain(args[argc - 1]);
 }
 static const char *const k_builtins[] = {
+
     "sin", "cos", "sqrt", "abs", "int",
     "len", "split", "sub", "gsub", "match", "substr", "index",
     "toupper", "tolower", "trim", "sprintf", "column",
     "getline", "close", "flush","filter","transform",
     "push", "pop", "shift", "unshift", "remove", "has", "keys", "values",
     "read", "lines", "write", "append",
-    "system", "time", "rand", "srand", "exit","print"
+    "system", "time", "rand", "srand", "exit","print",
+    "merge", "split","expand", "flatten",
 };
 
 #define BUILTIN_COUNT (sizeof(k_builtins) / sizeof(k_builtins[0]))
@@ -706,37 +957,54 @@ void sym_register_builtins(SymTable *st) {
     if (!st) return;
 
     /* real collection builtins */
-    xf_value_t filter_v    = xf_val_native_fn("filter",    XF_TYPE_ARR, builtin_filter);
+xf_value_t merge_v = xf_val_native_fn("merge", XF_TYPE_VOID, builtin_merge);
+xf_value_t split_v = xf_val_native_fn("split", XF_TYPE_ARR, builtin_split);
+        xf_value_t filter_v    = xf_val_native_fn("filter",    XF_TYPE_ARR, builtin_filter);
 xf_value_t transform_v = xf_val_native_fn("transform", XF_TYPE_ARR, builtin_transform);
     xf_value_t push_v    = xf_val_native_fn("push",    XF_TYPE_VOID, builtin_push);
     xf_value_t pop_v     = xf_val_native_fn("pop",     XF_TYPE_VOID, builtin_pop);
+    xf_value_t expand_v  = xf_val_native_fn("expand",  XF_TYPE_ARR, builtin_expand);
+xf_value_t flatten_v = xf_val_native_fn("flatten", XF_TYPE_ARR, builtin_flatten);
     xf_value_t len_v = xf_val_native_fn("len", XF_TYPE_NUM, builtin_len);
-sym_define_builtin(st, "len", XF_TYPE_FN, len_v);
-xf_value_release(len_v);
+
     xf_value_t shift_v   = xf_val_native_fn("shift",   XF_TYPE_VOID, builtin_shift);
     xf_value_t unshift_v = xf_val_native_fn("unshift", XF_TYPE_VOID, builtin_unshift);
     xf_value_t remove_v  = xf_val_native_fn("remove",  XF_TYPE_VOID, builtin_remove);
     xf_value_t has_v     = xf_val_native_fn("has",     XF_TYPE_BOOL, builtin_has);
+xf_value_t regex_v = xf_val_native_fn("regex", XF_TYPE_REGEX, builtin_regex);        
     xf_value_t keys_v    = xf_val_native_fn("keys",    XF_TYPE_ARR,  builtin_keys);
     xf_value_t values_v  = xf_val_native_fn("values",  XF_TYPE_ARR,  builtin_values);
     xf_value_t print_v   = xf_val_native_fn("print", XF_TYPE_VOID, builtin_print_fn);
+sym_define_builtin(st, "regex", XF_TYPE_FN, regex_v);
+sym_define_builtin(st, "len", XF_TYPE_FN, len_v);
+xf_value_release(len_v);
 sym_define_builtin(st, "filter",    XF_TYPE_FN, filter_v);
 sym_define_builtin(st, "transform", XF_TYPE_FN, transform_v);
     sym_define_builtin(st, "push",    XF_TYPE_FN, push_v);
     sym_define_builtin(st, "pop",     XF_TYPE_FN, pop_v);
     sym_define_builtin(st, "shift",   XF_TYPE_FN, shift_v);
+    sym_define_builtin(st, "regex", XF_TYPE_FN, regex_v);
     sym_define_builtin(st, "unshift", XF_TYPE_FN, unshift_v);
     sym_define_builtin(st, "remove",  XF_TYPE_FN, remove_v);
+    sym_define_builtin(st, "expand",  XF_TYPE_FN, expand_v);
+sym_define_builtin(st, "flatten", XF_TYPE_FN, flatten_v);
     sym_define_builtin(st, "has",     XF_TYPE_FN, has_v);
     sym_define_builtin(st, "keys",    XF_TYPE_FN, keys_v);
     sym_define_builtin(st, "values",  XF_TYPE_FN, values_v);
     sym_define_builtin(st, "print", XF_TYPE_FN, print_v);
+    sym_define_builtin(st, "merge", XF_TYPE_FN, merge_v);
+sym_define_builtin(st, "split", XF_TYPE_FN, split_v);
+xf_value_release(merge_v);
+xf_value_release(regex_v);
+xf_value_release(split_v);
     xf_value_release(push_v);
     xf_value_release(pop_v);
     xf_value_release(shift_v);
     xf_value_release(unshift_v);
     xf_value_release(filter_v);
 xf_value_release(transform_v);
+xf_value_release(expand_v);
+xf_value_release(flatten_v);
     xf_value_release(remove_v);
     xf_value_release(has_v);
     xf_value_release(keys_v);
@@ -751,12 +1019,17 @@ xf_value_release(transform_v);
         if (strcmp(name, "push")    == 0 ||
             strcmp(name, "pop")     == 0 ||
             strcmp(name, "len") == 0 ||
+            strcmp(name, "expand") == 0 ||
+            strcmp(name, "regex") == 0 ||
+strcmp(name, "flatten") == 0 ||
             strcmp(name, "shift")   == 0 ||
             strcmp(name, "unshift") == 0 ||
             strcmp(name, "remove")  == 0 ||
             strcmp(name, "has")     == 0 ||
             strcmp(name, "keys")    == 0 ||
             strcmp(name, "print") == 0 ||
+            strcmp(name, "merge") == 0 ||
+strcmp(name, "split") == 0 ||
             strcmp(name, "values")  == 0) {
             continue;
         }

@@ -10,6 +10,7 @@
 #include "../include/value.h"
 #include "../include/interp.h"
 #include "../include/repl.h"
+static int xf_run_program(Program *prog, int argc, char **argv);
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -51,11 +52,66 @@ static char *read_file(const char *path) {
     buf[size] = '\0';
     return buf;
 }
+static int xf_run_source(const char *source_name,
+                         const char *source,
+                         SrcMode mode,
+                         int argc,
+                         char **argv) {
+    int rc = 1;
 
-static void usage(const char *argv0) {
-    fprintf(stderr, "usage: %s <file.xf>\n", argv0 ? argv0 : "xf");
+    Lexer lex = {0};
+    SymTable syms = {0};
+    Program *prog = NULL;
+
+    if (!source) return 1;
+
+    xf_lex_init(&lex, source, strlen(source), mode, source_name ? source_name : "<inline>");
+    if (lex.had_error) {
+        fprintf(stderr, "xf: lexer init error: %s\n", lex.err_msg);
+        goto done;
+    }
+
+    xf_tokenize(&lex);
+
+    if (lex.had_error) {
+        fprintf(stderr, "[%s:%u:%u] lexer error: %s\n",
+                lex.source_name ? lex.source_name : "<unknown>",
+                lex.line,
+                lex.col,
+                lex.err_msg);
+        goto done;
+    }
+
+    sym_init(&syms);
+    if (syms.had_error) {
+        fprintf(stderr, "xf: symtable init error: %s\n", syms.err_msg);
+        goto done;
+    }
+
+    prog = xf_parse_program(&lex, &syms);
+    if (!prog) {
+        fprintf(stderr, "parser error\n");
+        goto done;
+    }
+
+    rc = xf_run_program(prog, argc, argv);
+
+done:
+    ast_program_free(prog);
+    sym_free(&syms);
+    xf_lex_free(&lex);
+    return rc;
 }
 
+static void usage(const char *argv0) {
+    const char *name = argv0 ? argv0 : "xf";
+    fprintf(stderr,
+            "usage:\n"
+            "  %s                 # repl\n"
+            "  %s -r <file.xf>    # run file\n"
+            "  %s -e \"code\"      # execute inline source\n",
+            name, name, name);
+}
 static void bind_runtime_specials(Interp *it) {
     if (!it || !it->vm) return;
 
@@ -152,13 +208,13 @@ core_set_fn_caller(&vm, &syms, interp_exec_xf_fn_bridge);
     }
     inject_args(&it, argc, argv);
 
-    if (vm_run_begin(&vm) != VM_OK) {
+    VMResult begin_rc = vm_run_begin(&vm);
+    if (begin_rc != VM_OK && !vm.should_exit) {
         fprintf(stderr, "BEGIN failed\n");
         sym_free(&syms);
         vm_free(&vm);
         return 1;
     }
-
     char buf[4096];
         while (!vm.should_exit && fgets(buf, sizeof(buf), stdin)) {
         size_t len = strlen(buf);
@@ -170,74 +226,39 @@ core_set_fn_caller(&vm, &syms, interp_exec_xf_fn_bridge);
         }
     }
 
-    if (vm_run_end(&vm) != VM_OK) {
-        fprintf(stderr, "END failed\n");
-        sym_free(&syms);
-        vm_free(&vm);
-        return 1;
+    if (!vm.should_exit) {
+        VMResult end_rc = vm_run_end(&vm);
+        if (end_rc != VM_OK && !vm.should_exit) {
+            fprintf(stderr, "END failed\n");
+            sym_free(&syms);
+            vm_free(&vm);
+            return 1;
+        }
     }
-
     sym_free(&syms);
     vm_free(&vm);
     return 0;
 }
 int main(int argc, char **argv) {
-    int rc = 1;
-    const char *path = NULL;
-    char *source = NULL;
-
-    Lexer lex = {0};
-    SymTable syms = {0};
-    Program *prog = NULL;
-
-    if (argc < 2) {
+    if (argc == 1) {
         return xf_run_repl();
     }
 
-    path = argv[1];
+    if (argc == 3 && strcmp(argv[1], "-r") == 0) {
+        char *source = read_file(argv[2]);
+        if (!source) {
+            return 1;
+        }
 
-    source = read_file(path);
-    if (!source) {
-        goto done;
+        int rc = xf_run_source(argv[2], source, XF_SRC_FILE, 1, &argv[2]);
+        free(source);
+        return rc;
     }
 
-    xf_lex_init_cstr(&lex, source, XF_SRC_FILE, path);
-    if (lex.had_error) {
-        fprintf(stderr, "xf: lexer init error: %s\n", lex.err_msg);
-        goto done;
+    if (argc == 3 && strcmp(argv[1], "-e") == 0) {
+        return xf_run_source("<inline>", argv[2], XF_SRC_INLINE, 1, &argv[2]);
     }
 
-    xf_tokenize(&lex);
-
-    if (lex.had_error) {
-        fprintf(stderr, "[%s:%u:%u] lexer error: %s\n",
-                lex.source_name ? lex.source_name : "<unknown>",
-                lex.line,
-                lex.col,
-                lex.err_msg);
-        goto done;
-    }
-
-    sym_init(&syms);
-    if (syms.had_error) {
-        fprintf(stderr, "xf: symtable init error: %s\n", syms.err_msg);
-        goto done;
-    }
-
-prog = xf_parse_program(&lex, &syms);
-if (!prog) {
-    fprintf(stderr, "parser error\n");
-    goto done;
-}
-
-//    ast_program_print(prog);
-
-    rc = xf_run_program(prog, argc - 1, argv + 1);
-
-done:
-    ast_program_free(prog);
-    sym_free(&syms);
-    xf_lex_free(&lex);
-    free(source);
-    return rc;
+    usage(argv[0]);
+    return 1;
 }

@@ -1048,20 +1048,35 @@ static bool compile_expr(Interp *it, Chunk *c, Expr *e) {
             chunk_write_u32(c, idx, e->loc.line);
             return true;
         }
-
         case EXPR_REGEX: {
-            /* For tonight, compile regex literals as plain string patterns.
-               This matches the current VM OP_MATCH / OP_NMATCH behavior,
-               which is string-based, not compiled-regex-based. */
-            xf_Value sv = xf_val_ok_str(e->as.regex.pattern);
-            uint32_t idx = chunk_add_const(c, sv);
-            xf_value_release(sv);
+    if (!e->as.regex.pattern || !e->as.regex.pattern->data) {
+        return false;
+    }
 
-            chunk_write(c, OP_PUSH_STR, e->loc.line);
-            chunk_write_u32(c, idx, e->loc.line);
-            return true;
-        }
+    xf_Str *pat = xf_str_from_cstr(e->as.regex.pattern->data);
+    if (!pat) return false;
 
+    xf_regex_t *re = calloc(1, sizeof(xf_regex_t));
+    if (!re) {
+        xf_str_release(pat);
+        return false;
+    }
+
+    atomic_store(&re->refcount, 1);
+    re->pattern  = pat;
+    re->flags    = e->as.regex.flags;
+    re->compiled = NULL;
+
+    xf_Value rv = xf_val_ok_re(re);
+    xf_regex_release(re);
+
+    uint32_t idx = chunk_add_const(c, rv);
+    xf_value_release(rv);
+
+    chunk_write(c, OP_PUSH_CONST, e->loc.line);
+    chunk_write_u32(c, idx, e->loc.line);
+    return true;
+}
         case EXPR_FN: {
             static uint32_t anon_counter = 0;
 
