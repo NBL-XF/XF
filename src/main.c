@@ -244,19 +244,21 @@ int main(int argc, char **argv) {
         return xf_run_repl();
     }
 
-    if (argc == 3 && strcmp(argv[1], "-r") == 0) {
+    if (argc >= 3 && strcmp(argv[1], "-r") == 0) {
         char *source = read_file(argv[2]);
         if (!source) {
             return 1;
         }
 
-        int rc = xf_run_source(argv[2], source, XF_SRC_FILE, 1, &argv[2]);
+        int rc = xf_run_source(argv[2], source, XF_SRC_FILE,
+                               argc - 3, argv + 3);
         free(source);
         return rc;
     }
 
-    if (argc == 3 && strcmp(argv[1], "-e") == 0) {
-        return xf_run_source("<inline>", argv[2], XF_SRC_INLINE, 1, &argv[2]);
+    if (argc >= 3 && strcmp(argv[1], "-e") == 0) {
+        return xf_run_source("<inline>", argv[2], XF_SRC_INLINE,
+                             argc - 3, argv + 3);
     }
 
     usage(argv[0]);
