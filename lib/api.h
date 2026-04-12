@@ -1,5 +1,5 @@
-#ifndef XF_H
-#define XF_H
+#ifndef XF_API_H
+#define XF_API_H
 
 #include <stdio.h>
 
@@ -52,4 +52,4 @@ const char *xf_version(void);
 }
 #endif
 
-#endif /* XF_H */
+#endif /* XF_API_H */
