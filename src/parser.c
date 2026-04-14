@@ -151,7 +151,7 @@ void parser_sync(Parser *p) {
 /* ============================================================
  * Primary expressions
  * ============================================================ */
-
+ 
  static bool token_is_type_kw(TokenKind k) {
     switch (k) {
         case TK_KW_NUM:
@@ -1947,53 +1947,7 @@ static Stmt *parse_shorthand_for(Parser *p, Expr *head) {
     return ast_for_short(iterable, iter_key, iter_val, body, op->loc);
 }
 static Expr *parse_stmt_head(Parser *p) {
-    Expr *expr = parse_concat(p);
-    if (!expr) return NULL;
-
-    for (;;) {
-        BinOp op;
-        Token *op_tok = NULL;
-
-        if (parser_match(p, TK_LT)) {
-            op = BINOP_LT;
-            op_tok = parser_previous(p);
-        } else if (parser_match(p, TK_GT)) {
-            op_tok = parser_previous(p);
-            /* If the accumulated left side is a subscript expression,
-             * '>' is the shorthand-for delimiter, not a comparison —
-             * put the token back and stop so parse_stmt can detect it. */
-            if (expr->kind == EXPR_SUBSCRIPT) {
-                p->pos--;
-                break;
-            }
-            op = BINOP_GT;
-        } else if (parser_match(p, TK_GT_EQ)) {
-            op = BINOP_GTE;
-            op_tok = parser_previous(p);
-        } else if (parser_match(p, TK_SPACESHIP)) {
-            op = BINOP_SPACESHIP;
-            op_tok = parser_previous(p);
-        } else if (parser_match(p, TK_LT_EQ) || parser_match(p, TK_POP_ARROW)) {
-            Token *maybe = parser_previous(p);
-            TokenKind k = parser_current(p)->kind;
-            bool starts_rhs =
-                k != TK_EOF      && k != TK_NEWLINE   &&
-                k != TK_SEMICOLON && k != TK_RBRACE   &&
-                k != TK_RPAREN   && k != TK_RBRACKET  &&
-                k != TK_COMMA    && k != TK_COLON;
-            if (!starts_rhs) { p->pos--; break; }
-            op = BINOP_LTE;
-            op_tok = maybe;
-        } else {
-            break;
-        }
-
-        Expr *right = parse_concat(p);
-        if (!right) { ast_expr_free(expr); return NULL; }
-        expr = ast_binary(op, expr, right, op_tok->loc);
-    }
-
-    return expr;
+    return parse_postfix(p);
 }
 Stmt *parse_rule_body(Parser *p) {
     if (parser_match(p, TK_LBRACE)) {
@@ -2245,28 +2199,8 @@ TopLevel *parse_rule(Parser *p) {
         return ast_top_rule(NULL, body, loc);
     }
 
-    Expr *pattern = parse_stmt_head(p);
+    Expr *pattern = parse_expr(p);
     if (!pattern) return NULL;
-
-    /* If the next token signals a shorthand loop, bail out so that
-     * parse_top_level falls back to parse_stmt where the shorthand
-     * dispatch lives.
-     *
-     *   expr <> body          -- shorthand while  (TK_DIAMOND)
-     *   coll[it] > body       -- shorthand for    (TK_GT + EXPR_SUBSCRIPT)
-     *
-     * Without these guards parse_rule would either swallow the diamond
-     * and strand it in the stream, or parse_compare inside parse_expr
-     * would eat the '>' as BINOP_GT before the subscript check fires.
-     */
-    if (parser_check(p, TK_DIAMOND)) {
-        ast_expr_free(pattern);
-        return NULL;
-    }
-    if (parser_check(p, TK_GT) && pattern->kind == EXPR_SUBSCRIPT) {
-        ast_expr_free(pattern);
-        return NULL;
-    }
 
     /* pattern { ... } */
     if (parser_match(p, TK_LBRACE)) {

@@ -1,10 +1,15 @@
+V2
 1. "a","b" should split with OFS
-2. printf in functions
-3. expr spread
-4. shorthand while not working
-5. pass num as args-> coerce
-6. auto gc
-7. manual gc
-8. SIMD
-9. Out of Order Instruction Execution && Six Sigma
-10. NUMA
+2. expr spread
+3. auto gc
+4. manual gc
+5. printf 
+6. tracetrap
+
+V3
+1. SIMD
+
+EE
+1. Java Introp/FFI
+2. Python Introp/FFI
+3. NUMA

@@ -1034,25 +1034,27 @@ void xf_map_release(xf_map_t *m) {
 void xf_map_set(xf_map_t *m, xf_str_t *key, xf_value_t val) {
     if (!m || !key) return;
 
-    if ((double)m->used / (double)m->cap > MAP_LOAD_FACTOR) {
-        if (!xf_map_resize(m, m->cap * 2)) return;
+    if ((double)(m->used + 1) / (double)m->cap > MAP_LOAD_FACTOR) {
+        if (!xf_map_resize(m, m->cap ? m->cap * 2 : MAP_INIT_CAP)) return;
     }
 
     size_t idx = xf_map_probe(m, key);
     xf_map_slot_t *slot = &m->slots[idx];
 
     if (slot->key) {
+        // overwrite existing key
         xf_value_release(slot->val);
         slot->val = xf_value_retain(val);
         return;
     }
 
+    // new entry: map must own both key and value
     slot->key = xf_str_retain(key);
     slot->val = xf_value_retain(val);
     m->used++;
+
     xf_map_order_append(m, slot->key);
 }
-
 xf_value_t xf_map_get(const xf_map_t *m, const xf_str_t *key) {
     if (!m || !key) return xf_val_nav(XF_TYPE_VOID);
 
@@ -1150,7 +1152,6 @@ xf_module_t *xf_module_retain(xf_module_t *m) {
     atomic_fetch_add(&m->refcount, 1);
     return m;
 }
-
 void xf_module_release(xf_module_t *m) {
     if (!m) return;
 
@@ -1169,7 +1170,6 @@ void xf_module_release(xf_module_t *m) {
     free(m->entries);
     free(m);
 }
-
 void xf_module_set(xf_module_t *m, const char *name, xf_value_t val) {
     if (!m || !name) return;
 
@@ -1245,7 +1245,6 @@ static bool xf_state_is_boolish(uint8_t state) {
            state == XF_STATE_FALSE ||
            state == XF_STATE_UNDET;
 }
-
 xf_value_t xf_coerce_num(xf_value_t v) {
     if (v.state == XF_STATE_TRUE)  return xf_val_ok_num(1.0);
     if (v.state == XF_STATE_FALSE) return xf_val_ok_num(0.0);
@@ -1264,7 +1263,7 @@ xf_value_t xf_coerce_num(xf_value_t v) {
         return out;
     }
 
-    if (v.state != XF_STATE_OK) return v;
+    if (v.state != XF_STATE_OK) return xf_value_retain(v);
     if (v.type == XF_TYPE_NUM)  return v;
 
     if (v.type == XF_TYPE_STR) {
@@ -1459,8 +1458,7 @@ xf_value_t xf_coerce_str(xf_value_t v) {
         xf_str_release(s);
         return out;
     }
-
-    if (v.state != XF_STATE_OK) return v;
+if (v.state != XF_STATE_OK) return xf_value_retain(v);
     if (v.type == XF_TYPE_STR) return xf_value_retain(v);
 
     char buf[128];

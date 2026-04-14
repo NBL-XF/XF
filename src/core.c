@@ -13,34 +13,93 @@ void core_register(SymTable *st) {
     xf_module_t *img_m      = build_img();
 
     xf_module_t *core_m = xf_module_new("core");
-    xf_module_set(core_m, "math",     xf_val_ok_module(math_m));
-    xf_module_set(core_m, "str",      xf_val_ok_module(str_m));
-    xf_module_set(core_m, "os",       xf_val_ok_module(os_m));
-    xf_module_set(core_m, "ds",       xf_val_ok_module(ds_m));
-    xf_module_set(core_m, "regex",    xf_val_ok_module(regex_m));
-    xf_module_set(core_m, "edit",     xf_val_ok_module(edit_m));
-    xf_module_set(core_m, "format",   xf_val_ok_module(format_m));
-    xf_module_set(core_m, "process",  xf_val_ok_module(process_m));
-    xf_module_set(core_m, "img",      xf_val_ok_module(img_m));
-    xf_module_set(core_m, "generics", xf_val_ok_module(generics_m));
-    xf_module_release(math_m);   xf_module_release(str_m);
-    xf_module_release(os_m);     xf_module_release(generics_m);
-    xf_module_release(ds_m);     xf_module_release(regex_m);
-    xf_module_release(edit_m);   xf_module_release(format_m);
-    xf_module_release(process_m);xf_module_release(img_m);
+    if (!core_m) {
+        xf_module_release(math_m);
+        xf_module_release(str_m);
+        xf_module_release(os_m);
+        xf_module_release(generics_m);
+        xf_module_release(ds_m);
+        xf_module_release(edit_m);
+        xf_module_release(format_m);
+        xf_module_release(regex_m);
+        xf_module_release(process_m);
+        xf_module_release(img_m);
+        return;
+    }
+
+    xf_Value tmp;
+
+    tmp = xf_val_ok_module(math_m);
+    xf_module_set(core_m, "math", tmp);
+    xf_value_release(tmp);
+
+    tmp = xf_val_ok_module(str_m);
+    xf_module_set(core_m, "str", tmp);
+    xf_value_release(tmp);
+
+    tmp = xf_val_ok_module(os_m);
+    xf_module_set(core_m, "os", tmp);
+    xf_value_release(tmp);
+
+    tmp = xf_val_ok_module(ds_m);
+    xf_module_set(core_m, "ds", tmp);
+    xf_value_release(tmp);
+
+    tmp = xf_val_ok_module(regex_m);
+    xf_module_set(core_m, "regex", tmp);
+    xf_value_release(tmp);
+
+    tmp = xf_val_ok_module(edit_m);
+    xf_module_set(core_m, "edit", tmp);
+    xf_value_release(tmp);
+
+    tmp = xf_val_ok_module(format_m);
+    xf_module_set(core_m, "format", tmp);
+    xf_value_release(tmp);
+
+    tmp = xf_val_ok_module(process_m);
+    xf_module_set(core_m, "process", tmp);
+    xf_value_release(tmp);
+
+    tmp = xf_val_ok_module(img_m);
+    xf_module_set(core_m, "img", tmp);
+    xf_value_release(tmp);
+
+    tmp = xf_val_ok_module(generics_m);
+    xf_module_set(core_m, "generics", tmp);
+    xf_value_release(tmp);
+
+    xf_module_release(math_m);
+    xf_module_release(str_m);
+    xf_module_release(os_m);
+    xf_module_release(generics_m);
+    xf_module_release(ds_m);
+    xf_module_release(regex_m);
+    xf_module_release(edit_m);
+    xf_module_release(format_m);
+    xf_module_release(process_m);
+    xf_module_release(img_m);
 
     xf_Value core_val = xf_val_ok_module(core_m);
     xf_module_release(core_m);
+
     xf_Str *name = xf_str_from_cstr("core");
-Symbol *sym  = sym_declare(st, name, SYM_BUILTIN, XF_TYPE_MODULE,
-                           (Loc){.source="<core>", .line=0, .col=0});
-if (sym) {
-    xf_value_release(sym->value);
-    sym->value      = core_val;
-    sym->is_const   = true;
-    sym->is_defined = true;
-} else {
-    xf_value_release(core_val);
-}
-xf_str_release(name);
+    Symbol *sym  = sym_declare(
+        st,
+        name,
+        SYM_BUILTIN,
+        XF_TYPE_MODULE,
+        (Loc){ .source = "<core>", .line = 0, .col = 0 }
+    );
+
+    if (sym) {
+        xf_value_release(sym->value);
+        sym->value      = core_val;
+        sym->is_const   = true;
+        sym->is_defined = true;
+    } else {
+        xf_value_release(core_val);
+    }
+
+    xf_str_release(name);
 }

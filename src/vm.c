@@ -332,28 +332,39 @@ case OP_PRINTF: {
                 xf_value_release(out);
                 break;
             }
-                        case OP_PUSH_CONST: {
-                uint32_t idx = read_u32(frame->chunk, frame->ip);
-                frame->ip += 4;
+            case OP_PUSH_CONST: {
+    uint32_t idx = read_u32(frame->chunk, frame->ip);
+    frame->ip += 4;
 
-                if (idx >= frame->chunk->const_len) {
-                    vm_error(vm, "PUSH_CONST constant index out of range");
-                    goto err;
-                }
+    if (idx >= frame->chunk->const_len) {
+        vm_error(vm, "PUSH_CONST constant index out of range");
+        goto err;
+    }
 
-                vm_push(vm, frame->chunk->consts[idx]);
-                break;
-            }
-            case OP_PUSH_STR: {
-                uint32_t idx =
-                    ((uint32_t)frame->chunk->code[frame->ip] << 24) |
-                    ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
-                    ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
-                    (uint32_t)frame->chunk->code[frame->ip + 3];
-                frame->ip += 4;
-                vm_push(vm, frame->chunk->consts[idx]);
-                break;
-            }
+    xf_Value v = xf_value_retain(frame->chunk->consts[idx]);
+    vm_push(vm, v);
+    xf_value_release(v);
+    break;
+}
+
+case OP_PUSH_STR: {
+    uint32_t idx =
+        ((uint32_t)frame->chunk->code[frame->ip] << 24) |
+        ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
+        ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
+        (uint32_t)frame->chunk->code[frame->ip + 3];
+    frame->ip += 4;
+
+    if (idx >= frame->chunk->const_len) {
+        vm_error(vm, "PUSH_STR constant index out of range");
+        goto err;
+    }
+
+    xf_Value v = xf_value_retain(frame->chunk->consts[idx]);
+    vm_push(vm, v);
+    xf_value_release(v);
+    break;
+}
 
             case OP_PUSH_TRUE:  vm_push(vm, xf_val_true()); break;
             case OP_PUSH_FALSE: vm_push(vm, xf_val_false()); break;
@@ -377,39 +388,40 @@ case OP_PRINTF: {
                 xf_value_release(sec);
                 break;
             }
-                    case OP_GET_MEMBER: {
-                    uint32_t idx = read_u32(frame->chunk, frame->ip);
-frame->ip += 4;
+            case OP_GET_MEMBER: {
+    uint32_t idx = read_u32(frame->chunk, frame->ip);
+    frame->ip += 4;
 
-            if (idx >= frame->chunk->const_len) {
-                vm_error(vm, "GET_MEMBER constant index out of range");
-                goto err;
-            }
+    if (idx >= frame->chunk->const_len) {
+        vm_error(vm, "GET_MEMBER constant index out of range");
+        goto err;
+    }
 
-            xf_Value obj = vm_pop(vm);
-            xf_Value keyv = frame->chunk->consts[idx];
+    xf_Value obj  = vm_pop(vm);
+    xf_Value keyv = xf_value_retain(frame->chunk->consts[idx]);
 
-            if (keyv.state != XF_STATE_OK || keyv.type != XF_TYPE_STR || !keyv.data.str) {
-                xf_value_release(obj);
-                vm_error(vm, "GET_MEMBER requires string field name");
-                goto err;
-            }
+    if (keyv.state != XF_STATE_OK || keyv.type != XF_TYPE_STR || !keyv.data.str) {
+        xf_value_release(obj);
+        xf_value_release(keyv);
+        vm_error(vm, "GET_MEMBER requires string field name");
+        goto err;
+    }
 
-            const char *field = keyv.data.str->data;
-            xf_Value out = xf_val_nav(XF_TYPE_VOID);
+    const char *field = keyv.data.str->data;
+    xf_Value out = xf_val_nav(XF_TYPE_VOID);
 
-            if (obj.state == XF_STATE_OK &&
-                obj.type == XF_TYPE_MODULE &&
-                obj.data.mod) {
-                out = xf_module_get(obj.data.mod, field);
-            }
+    if (obj.state == XF_STATE_OK &&
+        obj.type == XF_TYPE_MODULE &&
+        obj.data.mod) {
+        out = xf_module_get(obj.data.mod, field);
+    }
 
-            xf_value_release(obj);
-            vm_push(vm, out);
-            xf_value_release(out);
-            break;
-        }
-
+    xf_value_release(obj);
+    xf_value_release(keyv);
+    vm_push(vm, out);
+    xf_value_release(out);
+    break;
+}
             case OP_LOAD_LOCAL: {
                 uint8_t slot = frame->chunk->code[frame->ip++];
                 vm_push(vm, frame->locals[slot]);
@@ -513,21 +525,23 @@ case OP_STORE_GLOBAL: {
                 xf_value_release(r);
                 break;
             }
-
             case OP_NEG: {
-                a = vm_pop(vm);
-                xf_Value na = xf_coerce_num(a);
-                if (na.state == XF_STATE_OK) {
-                    xf_Value r = xf_val_ok_num(-na.data.num);
-                    vm_push(vm, r);
-                    xf_value_release(r);
-                } else {
-                    vm_push(vm, na);
-                }
-                xf_value_release(a);
-                xf_value_release(na);
-                break;
-            }
+    a = vm_pop(vm);
+    xf_Value n = xf_coerce_num(a);
+
+    if (n.state == XF_STATE_OK) {
+        xf_Value r = xf_val_ok_num(-n.data.num);
+        vm_push(vm, r);
+        xf_value_release(r);
+        xf_value_release(n);
+    } else {
+        vm_push(vm, n);
+        xf_value_release(n);
+    }
+
+    xf_value_release(a);
+    break;
+}
 
             case OP_EQ: {
                 b = vm_pop(vm);
@@ -1137,9 +1151,11 @@ xf_Value vm_pop(VM *vm) {
         vm_error(vm, "stack underflow");
         return xf_val_nav(XF_TYPE_VOID);
     }
-    return vm->stack[--vm->stack_top];
-}
 
+    xf_Value v = vm->stack[--vm->stack_top];
+    vm->stack[vm->stack_top] = xf_val_null();
+    return xf_value_retain(v);
+}
 xf_Value vm_peek(const VM *vm, int dist) {
     if ((size_t)dist >= vm->stack_top) return xf_val_nav(XF_TYPE_VOID);
     return vm->stack[vm->stack_top - 1 - dist];
@@ -1606,37 +1622,6 @@ VMResult vm_run_chunk(VM *vm, Chunk *chunk) {
                 xf_value_release(out);
                 break;
             }
-                case OP_GET_MEMBER: {
-            uint32_t idx = READ_U32();
-
-            if (idx >= frame->chunk->const_len) {
-                vm_error(vm, "GET_MEMBER constant index out of range");
-                goto err;
-            }
-
-            xf_Value obj = vm_pop(vm);
-            xf_Value keyv = frame->chunk->consts[idx];
-
-            if (keyv.state != XF_STATE_OK || keyv.type != XF_TYPE_STR || !keyv.data.str) {
-                xf_value_release(obj);
-                vm_error(vm, "GET_MEMBER requires string field name");
-                goto err;
-            }
-
-            const char *field = keyv.data.str->data;
-            xf_Value out = xf_val_nav(XF_TYPE_VOID);
-
-            if (obj.state == XF_STATE_OK &&
-                obj.type == XF_TYPE_MODULE &&
-                obj.data.mod) {
-                out = xf_module_get(obj.data.mod, field);
-            }
-
-            xf_value_release(obj);
-            vm_push(vm, out);
-            xf_value_release(out);
-            break;
-        }
             case OP_PUSH_NUM: {
                 uint64_t bits = 0;
                 for (int i = 0; i < 8; i++) bits = (bits << 8) | frame->chunk->code[frame->ip++];
@@ -1645,24 +1630,69 @@ VMResult vm_run_chunk(VM *vm, Chunk *chunk) {
                 vm_push(vm, val_num(v));
                 break;
             }
-                        case OP_PUSH_CONST: {
-                uint32_t idx = read_u32(frame->chunk, frame->ip);
-                frame->ip += 4;
+            case OP_PUSH_CONST: {
+    uint32_t idx = read_u32(frame->chunk, frame->ip);
+    frame->ip += 4;
 
-                if (idx >= frame->chunk->const_len) {
-                    vm_error(vm, "PUSH_CONST constant index out of range");
-                    goto err;
-                }
+    if (idx >= frame->chunk->const_len) {
+        vm_error(vm, "PUSH_CONST constant index out of range");
+        goto err;
+    }
 
-                vm_push(vm, frame->chunk->consts[idx]);
-                break;
-            }
+    xf_Value v = xf_value_retain(frame->chunk->consts[idx]);
+    vm_push(vm, v);
+    xf_value_release(v);
+    break;
+}
 
-            case OP_PUSH_STR: {
-                uint32_t idx = READ_U32();
-                vm_push(vm, frame->chunk->consts[idx]);
-                break;
-            }
+case OP_PUSH_STR: {
+    uint32_t idx = READ_U32();
+
+    if (idx >= frame->chunk->const_len) {
+        vm_error(vm, "PUSH_STR constant index out of range");
+        goto err;
+    }
+
+    xf_Value v = xf_value_retain(frame->chunk->consts[idx]);
+    vm_push(vm, v);
+    xf_value_release(v);
+    break;
+}
+
+case OP_GET_MEMBER: {
+    uint32_t idx = READ_U32();
+
+    if (idx >= frame->chunk->const_len) {
+        vm_error(vm, "GET_MEMBER constant index out of range");
+        goto err;
+    }
+
+    xf_Value obj  = vm_pop(vm);
+    xf_Value keyv = xf_value_retain(frame->chunk->consts[idx]);
+
+    if (keyv.state != XF_STATE_OK || keyv.type != XF_TYPE_STR || !keyv.data.str) {
+        xf_value_release(obj);
+        xf_value_release(keyv);
+        vm_error(vm, "GET_MEMBER requires string field name");
+        goto err;
+    }
+
+    const char *field = keyv.data.str->data;
+    xf_Value out = xf_val_nav(XF_TYPE_VOID);
+
+    if (obj.state == XF_STATE_OK &&
+        obj.type == XF_TYPE_MODULE &&
+        obj.data.mod) {
+        out = xf_module_get(obj.data.mod, field);
+    }
+
+    xf_value_release(obj);
+    xf_value_release(keyv);
+    vm_push(vm, out);
+    xf_value_release(out);
+    break;
+}
+
                     case OP_LOAD_FIELD: {
             uint8_t idx = READ_U8();
 

@@ -1017,16 +1017,20 @@ static bool compile_expr(Interp *it, Chunk *c, Expr *e) {
             chunk_write(c, OP_PUSH_NUM, e->loc.line);
             chunk_write_f64(c, e->as.num, e->loc.line);
             return true;
+         case EXPR_STR: {
+    if (!e->as.str.value) return false;
 
-        case EXPR_STR: {
-            xf_Value sv = xf_val_ok_str(e->as.str.value);
-            uint32_t idx = chunk_add_const(c, sv);
-            xf_value_release(sv);
+    uint32_t idx = chunk_add_str_const(
+        c,
+        e->as.str.value->data,
+        e->as.str.value->len
+    );
 
-            chunk_write(c, OP_PUSH_STR, e->loc.line);
-            chunk_write_u32(c, idx, e->loc.line);
-            return true;
-        }
+    chunk_write(c, OP_PUSH_STR, e->loc.line);
+    chunk_write_u32(c, idx, e->loc.line);
+    return true;
+}
+
         case EXPR_REGEX: {
     if (!e->as.regex.pattern || !e->as.regex.pattern->data) {
         return false;
