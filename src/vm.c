@@ -469,7 +469,6 @@ case OP_STORE_GLOBAL: {
         goto err;
     }
 
-    xf_value_release(v);
     break;
 }
             case OP_ADD: {

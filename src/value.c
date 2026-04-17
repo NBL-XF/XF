@@ -499,8 +499,6 @@ xf_fn_t *xf_fn_retain(xf_fn_t *f) {
     return f;
 }
 /* file: value.c */
-
-/* replace your current xf_fn_release with this */
 void xf_fn_release(xf_fn_t *f) {
     if (!f) return;
 
@@ -512,35 +510,22 @@ void xf_fn_release(xf_fn_t *f) {
 
     if (old != 1) return;
 
-    /*
-     * STABILITY PATCH:
-     * Do NOT release f->name or f->params[i].name here yet.
-     *
-     * Your current runtime is still double-releasing at least one string
-     * during teardown. That is what is causing:
-     *   [BUG] xf_str_release underflow ...
-     *   trace trap
-     *
-     * This patch favors finishing runs over perfect cleanup.
-     */
+    xf_str_release(f->name);   // ← restore this
 
     if (f->params) {
         for (size_t i = 0; i < f->param_count; i++) {
+            xf_str_release(f->params[i].name);   // ← and this
             if (f->params[i].has_default && f->params[i].default_val) {
                 xf_value_release(*f->params[i].default_val);
                 free(f->params[i].default_val);
-                f->params[i].default_val = NULL;
             }
         }
         free(f->params);
-        f->params = NULL;
     }
 
-    if (!f->is_native && f->body) {
-        Chunk *body = (Chunk *)f->body;
-        chunk_free(body);
-        free(body);
-        f->body = NULL;
+    if (f->body) {
+        chunk_free(f->body);
+        free(f->body);
     }
 
     free(f);
