@@ -118,7 +118,13 @@ static xf_fn_t *build_compiled_fn(xf_Str *name,
                                   size_t param_count,
                                   Chunk *body_chunk) {
     xf_fn_t *f = calloc(1, sizeof(xf_fn_t));
-    if (!f) return NULL;
+    if (!f) {
+        if (body_chunk) {
+            chunk_free(body_chunk);
+            free(body_chunk);
+        }
+        return NULL;
+    }
 
     atomic_store(&f->refcount, 1);
     f->name        = xf_str_retain(name);
@@ -131,6 +137,10 @@ static xf_fn_t *build_compiled_fn(xf_Str *name,
         f->params = calloc(param_count, sizeof(xf_param_t));
         if (!f->params) {
             xf_str_release(f->name);
+            if (body_chunk) {
+                chunk_free(body_chunk);
+                free(body_chunk);
+            }
             free(f);
             return NULL;
         }

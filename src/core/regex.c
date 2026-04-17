@@ -93,38 +93,85 @@ static bool cr_arg_pat(xf_Value *args, size_t argc,
 /* ── cr_build_match_map ────────────────────────────────────────── */
 
 static xf_Value cr_build_match_map(const char *subject, regmatch_t *pm,
-                                    size_t ngroups) {
+                                   size_t ngroups) {
     xf_map_t *m = xf_map_new();
+    if (!m) return xf_val_nav(XF_TYPE_MAP);
 
     xf_Str *mkey   = xf_str_from_cstr("match");
     xf_Str *mval_s = xf_str_new(subject + pm[0].rm_so,
-                                  (size_t)(pm[0].rm_eo - pm[0].rm_so));
-                                  xf_Value tmp_str = xf_val_ok_str(mval_s);
-xf_map_set(m, mkey, tmp_str);
-xf_value_release(tmp_str);
-xf_str_release(mkey);
-xf_str_release(mval_s);
+                                (size_t)(pm[0].rm_eo - pm[0].rm_so));
+    if (!mkey || !mval_s) {
+        xf_str_release(mkey);
+        xf_str_release(mval_s);
+        xf_map_release(m);
+        return xf_val_nav(XF_TYPE_MAP);
+    }
+
+    xf_Value tmp_match = xf_val_ok_str(mval_s);
+    xf_map_set(m, mkey, tmp_match);
+    xf_value_release(tmp_match);
+    xf_str_release(mkey);
+    xf_str_release(mval_s);
+
     xf_Str *ikey = xf_str_from_cstr("index");
+    if (!ikey) {
+        xf_map_release(m);
+        return xf_val_nav(XF_TYPE_MAP);
+    }
     xf_map_set(m, ikey, xf_val_ok_num((double)pm[0].rm_so));
     xf_str_release(ikey);
 
     xf_arr_t *grp_arr = xf_arr_new();
+    if (!grp_arr) {
+        xf_map_release(m);
+        return xf_val_nav(XF_TYPE_MAP);
+    }
+
     for (size_t g = 1; g < ngroups; g++) {
         if (pm[g].rm_so >= 0) {
             xf_Str *gs = xf_str_new(subject + pm[g].rm_so,
-                                     (size_t)(pm[g].rm_eo - pm[g].rm_so));
+                                    (size_t)(pm[g].rm_eo - pm[g].rm_so));
+            if (!gs) {
+                xf_arr_release(grp_arr);
+                xf_map_release(m);
+                return xf_val_nav(XF_TYPE_MAP);
+            }
 
-            xf_arr_push(grp_arr, xf_val_ok_str(gs)); xf_str_release(gs);
+            xf_Value gv = xf_val_ok_str(gs);
+            xf_arr_push(grp_arr, gv);
+            xf_value_release(gv);
+            xf_str_release(gs);
         } else {
             xf_Str *empty = xf_str_from_cstr("");
-            xf_arr_push(grp_arr, xf_val_ok_str(empty)); xf_str_release(empty);
+            if (!empty) {
+                xf_arr_release(grp_arr);
+                xf_map_release(m);
+                return xf_val_nav(XF_TYPE_MAP);
+            }
+
+            xf_Value gv = xf_val_ok_str(empty);
+            xf_arr_push(grp_arr, gv);
+            xf_value_release(gv);
+            xf_str_release(empty);
         }
     }
-    xf_Str *gkey = xf_str_from_cstr("groups");
-    xf_map_set(m, gkey, xf_val_ok_arr(grp_arr));
-    xf_str_release(gkey); xf_arr_release(grp_arr);
 
-    xf_Value tmp = xf_val_ok_map(m); xf_map_release(m); return tmp;
+    xf_Str *gkey = xf_str_from_cstr("groups");
+    if (!gkey) {
+        xf_arr_release(grp_arr);
+        xf_map_release(m);
+        return xf_val_nav(XF_TYPE_MAP);
+    }
+
+    xf_Value tmp_groups = xf_val_ok_arr(grp_arr);
+    xf_map_set(m, gkey, tmp_groups);
+    xf_value_release(tmp_groups);
+    xf_str_release(gkey);
+    xf_arr_release(grp_arr);
+
+    xf_Value tmp = xf_val_ok_map(m);
+    xf_map_release(m);
+    return tmp;
 }
 
 /* ── cr_match ─────────────────────────────────────────────────── */
@@ -151,7 +198,6 @@ static xf_Value cr_match(xf_Value *args, size_t argc) {
     size_t ngroups = re.re_nsub + 1;
     if (ngroups > CR_MAX_GROUPS) ngroups = CR_MAX_GROUPS;
     regmatch_t pm[CR_MAX_GROUPS];
-    /* retain subject pointer before any release */
     const char *subject = sv.data.str->data;
     int rc = regexec(&re, subject, ngroups, pm, 0);
     regfree(&re);
@@ -184,15 +230,22 @@ static xf_Value cr_search(xf_Value *args, size_t argc) {
     size_t ngroups = re.re_nsub + 1;
     if (ngroups > CR_MAX_GROUPS) ngroups = CR_MAX_GROUPS;
     regmatch_t pm[CR_MAX_GROUPS];
-    xf_arr_t   *results     = xf_arr_new();
-    /* save subject pointer — sv must stay alive for the whole loop */
+    xf_arr_t *results = xf_arr_new();
+    if (!results) {
+        regfree(&re);
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
     const char *subject     = sv.data.str->data;
     const char *cursor      = subject;
     size_t      base_offset = 0;
+
     while (*cursor) {
         int rc = regexec(&re, cursor, ngroups, pm,
                          base_offset ? REG_NOTBOL : 0);
         if (rc != 0) break;
+
         regmatch_t abs_pm[CR_MAX_GROUPS];
         for (size_t g = 0; g < ngroups; g++) {
             abs_pm[g] = pm[g];
@@ -201,17 +254,111 @@ static xf_Value cr_search(xf_Value *args, size_t argc) {
                 abs_pm[g].rm_eo += (regoff_t)base_offset;
             }
         }
+
         xf_Value mv = cr_build_match_map(subject, abs_pm, ngroups);
         xf_arr_push(results, mv);
         xf_value_release(mv);
-        size_t adv = (pm[0].rm_eo > pm[0].rm_so) ? (size_t)pm[0].rm_eo : 1;
-        base_offset += adv;
+
+        size_t adv = (pm[0].rm_eo > pm[0].rm_so)
+            ? (size_t)pm[0].rm_eo
+            : 1;
+
         cursor      += adv;
+        base_offset += adv;
     }
+
     regfree(&re);
-    xf_value_release(sv);   /* release exactly once, after the loop */
+    xf_value_release(sv);
+
     xf_Value rv = xf_val_ok_arr(results);
     xf_arr_release(results);
+    return rv;
+}
+
+/* ── cr_split ─────────────────────────────────────────────────── */
+
+static xf_Value cr_split(xf_Value *args, size_t argc) {
+    NEED(2);
+
+    xf_Value sv = xf_coerce_str(args[0]);
+    if (sv.state != XF_STATE_OK || !sv.data.str) {
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    const char *s   = sv.data.str->data;
+    size_t      len = sv.data.str->len;
+
+    long n = 0;
+    size_t flags_idx = 2;
+
+    if (argc > 2 &&
+        args[2].state == XF_STATE_OK &&
+        args[2].type == XF_TYPE_NUM) {
+        n = (long)args[2].data.num;
+        if (n < 0) n = 0;
+        flags_idx = 3;
+    }
+
+    const char *pat;
+    int cflags;
+    if (!cr_arg_pat(args, argc, 1, flags_idx, &pat, &cflags)) {
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    regex_t re;
+    char errmsg[256];
+    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg))) {
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    xf_arr_t *arr = xf_arr_new();
+    if (!arr) {
+        regfree(&re);
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
+    const char *cur = s;
+    const char *end = s + len;
+
+    while (cur <= end) {
+        if (n > 0 && (long)arr->len == n - 1) {
+            xf_Value part = make_str_val(cur, (size_t)(end - cur));
+            xf_arr_push(arr, part);
+            xf_value_release(part);
+            break;
+        }
+
+        regmatch_t pm[1];
+        int rc = regexec(&re, cur, 1, pm, cur > s ? REG_NOTBOL : 0);
+
+        if (rc != 0) {
+            xf_Value part = make_str_val(cur, (size_t)(end - cur));
+            xf_arr_push(arr, part);
+            xf_value_release(part);
+            break;
+        }
+
+        xf_Value part = make_str_val(cur, (size_t)pm[0].rm_so);
+        xf_arr_push(arr, part);
+        xf_value_release(part);
+
+        if (pm[0].rm_so == pm[0].rm_eo) {
+            if (cur < end) cur++;
+            else break;
+        } else {
+            cur += pm[0].rm_eo;
+        }
+    }
+
+    regfree(&re);
+    xf_value_release(sv);
+
+    xf_Value rv = xf_val_ok_arr(arr);
+    xf_arr_release(arr);
     return rv;
 }
 
@@ -219,6 +366,7 @@ static xf_Value cr_search(xf_Value *args, size_t argc) {
 
 static xf_Value cr_replace_impl(xf_Value *args, size_t argc, bool global) {
     NEED(3);
+
     xf_Value sv   = xf_coerce_str(args[0]);
     xf_Value repv = xf_coerce_str(args[2]);
     if (sv.state != XF_STATE_OK || repv.state != XF_STATE_OK) {
@@ -226,72 +374,154 @@ static xf_Value cr_replace_impl(xf_Value *args, size_t argc, bool global) {
         xf_value_release(repv);
         return xf_val_nav(XF_TYPE_STR);
     }
-    const char *pat; int cflags;
-    if (!cr_arg_pat(args, argc, 1, 3, &pat, &cflags)) return xf_val_nav(XF_TYPE_STR);
 
-    regex_t re; char errmsg[256];
-    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
+    const char *pat;
+    int cflags;
+    if (!cr_arg_pat(args, argc, 1, 3, &pat, &cflags)) {
+        xf_value_release(sv);
+        xf_value_release(repv);
         return xf_val_nav(XF_TYPE_STR);
+    }
+
+    regex_t re;
+    char errmsg[256];
+    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg))) {
+        xf_value_release(sv);
+        xf_value_release(repv);
+        return xf_val_nav(XF_TYPE_STR);
+    }
 
     size_t ngroups = re.re_nsub + 1;
     if (ngroups > CR_MAX_GROUPS) ngroups = CR_MAX_GROUPS;
     regmatch_t pm[CR_MAX_GROUPS];
+
     const char *subject = sv.data.str->data;
     const char *repl    = repv.data.str->data;
     size_t cap  = strlen(subject) * 2 + 256;
-    char  *out  = malloc(cap); size_t used = 0;
+    char  *out  = malloc(cap);
+    size_t used = 0;
+
+    if (!out) {
+        regfree(&re);
+        xf_value_release(sv);
+        xf_value_release(repv);
+        return xf_val_nav(XF_TYPE_STR);
+    }
 
 #define ENSURE(n) \
-    do { if (used+(n)+1>=cap){cap=cap*2+(n)+1;out=realloc(out,cap);} } while(0)
+    do { \
+        if (used + (n) + 1 >= cap) { \
+            size_t new_cap = cap * 2 + (n) + 1; \
+            char *tmp = realloc(out, new_cap); \
+            if (!tmp) { \
+                free(out); \
+                regfree(&re); \
+                xf_value_release(sv); \
+                xf_value_release(repv); \
+                return xf_val_nav(XF_TYPE_STR); \
+            } \
+            out = tmp; \
+            cap = new_cap; \
+        } \
+    } while (0)
 
-    const char *cursor = subject; int eflags = 0;
+    const char *cursor = subject;
+    int eflags = 0;
+
     while (*cursor) {
         int rc = regexec(&re, cursor, ngroups, pm, eflags);
         if (rc != 0) break;
+
         size_t pre = (size_t)pm[0].rm_so;
-        ENSURE(pre); memcpy(out+used, cursor, pre); used += pre;
+        ENSURE(pre);
+        memcpy(out + used, cursor, pre);
+        used += pre;
+
         xf_Str *rs = cr_apply_replacement(cursor, pm, ngroups, repl);
-        ENSURE(rs->len); memcpy(out+used, rs->data, rs->len); used += rs->len;
+        if (!rs) {
+            free(out);
+            regfree(&re);
+            xf_value_release(sv);
+            xf_value_release(repv);
+            return xf_val_nav(XF_TYPE_STR);
+        }
+
+        ENSURE(rs->len);
+        memcpy(out + used, rs->data, rs->len);
+        used += rs->len;
         xf_str_release(rs);
+
         size_t adv = (pm[0].rm_eo > pm[0].rm_so) ? (size_t)pm[0].rm_eo : 1;
-        if (adv == 0) { ENSURE(1); out[used++] = *cursor; adv = 1; }
-        cursor += adv; eflags = REG_NOTBOL;
+        if (adv == 0) {
+            ENSURE(1);
+            out[used++] = *cursor;
+            adv = 1;
+        }
+
+        cursor += adv;
+        eflags = REG_NOTBOL;
         if (!global) break;
     }
+
 #undef ENSURE
 
     size_t tail = strlen(cursor);
-    if (used+tail+1>=cap){cap=used+tail+2;out=realloc(out,cap);}
-    memcpy(out+used, cursor, tail); used += tail; out[used] = '\0';
+    if (used + tail + 1 >= cap) {
+        char *tmp = realloc(out, used + tail + 2);
+        if (!tmp) {
+            free(out);
+            regfree(&re);
+            xf_value_release(sv);
+            xf_value_release(repv);
+            return xf_val_nav(XF_TYPE_STR);
+        }
+        out = tmp;
+    }
+
+    memcpy(out + used, cursor, tail);
+    used += tail;
+    out[used] = '\0';
+
     regfree(&re);
-    xf_value_release(sv); xf_value_release(repv);
-    xf_Str *result = xf_str_new(out, used); free(out);
-    xf_Value rv = xf_val_ok_str(result); xf_str_release(result); return rv;
+    xf_value_release(sv);
+    xf_value_release(repv);
+
+    xf_Str *result = xf_str_new(out, used);
+    free(out);
+    if (!result) return xf_val_nav(XF_TYPE_STR);
+
+    xf_Value rv = xf_val_ok_str(result);
+    xf_str_release(result);
+    return rv;
 }
 
 static xf_Value cr_replace(xf_Value *args, size_t argc) {
     return cr_replace_impl(args, argc, false);
 }
+
 static xf_Value cr_replace_all(xf_Value *args, size_t argc) {
     return cr_replace_impl(args, argc, true);
 }
-
 /* ── cr_groups ────────────────────────────────────────────────── */
 
 static xf_Value cr_groups(xf_Value *args, size_t argc) {
     NEED(2);
+
     xf_Value sv = xf_coerce_str(args[0]);
     if (sv.state != XF_STATE_OK || !sv.data.str) {
         xf_value_release(sv);
         return xf_val_nav(XF_TYPE_ARR);
     }
-    const char *pat; int cflags;
+
+    const char *pat;
+    int cflags;
     if (!cr_arg_pat(args, argc, 1, 2, &pat, &cflags)) {
         xf_value_release(sv);
         return xf_val_nav(XF_TYPE_ARR);
     }
 
-    regex_t re; char errmsg[256];
+    regex_t re;
+    char errmsg[256];
     if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg))) {
         xf_value_release(sv);
         return xf_val_nav(XF_TYPE_ARR);
@@ -300,29 +530,57 @@ static xf_Value cr_groups(xf_Value *args, size_t argc) {
     size_t ngroups = re.re_nsub + 1;
     if (ngroups > CR_MAX_GROUPS) ngroups = CR_MAX_GROUPS;
     regmatch_t pm[CR_MAX_GROUPS];
+
     const char *subject = sv.data.str->data;
     int rc = regexec(&re, subject, ngroups, pm, 0);
     regfree(&re);
+
     if (rc != 0) {
         xf_value_release(sv);
         return xf_val_nav(XF_TYPE_ARR);
     }
 
     xf_arr_t *arr = xf_arr_new();
+    if (!arr) {
+        xf_value_release(sv);
+        return xf_val_nav(XF_TYPE_ARR);
+    }
+
     for (size_t g = 1; g < ngroups; g++) {
         if (pm[g].rm_so >= 0) {
             xf_Str *gs = xf_str_new(subject + pm[g].rm_so,
-                                     (size_t)(pm[g].rm_eo - pm[g].rm_so));
-            xf_arr_push(arr, xf_val_ok_str(gs)); xf_str_release(gs);
+                                    (size_t)(pm[g].rm_eo - pm[g].rm_so));
+            if (!gs) {
+                xf_arr_release(arr);
+                xf_value_release(sv);
+                return xf_val_nav(XF_TYPE_ARR);
+            }
+
+            xf_Value gv = xf_val_ok_str(gs);
+            xf_arr_push(arr, gv);
+            xf_value_release(gv);
+            xf_str_release(gs);
         } else {
             xf_Str *empty = xf_str_from_cstr("");
-            xf_arr_push(arr, xf_val_ok_str(empty)); xf_str_release(empty);
+            if (!empty) {
+                xf_arr_release(arr);
+                xf_value_release(sv);
+                return xf_val_nav(XF_TYPE_ARR);
+            }
+
+            xf_Value gv = xf_val_ok_str(empty);
+            xf_arr_push(arr, gv);
+            xf_value_release(gv);
+            xf_str_release(empty);
         }
     }
-    xf_value_release(sv);
-    xf_Value rv = xf_val_ok_arr(arr); xf_arr_release(arr); return rv;
-}
 
+    xf_value_release(sv);
+
+    xf_Value rv = xf_val_ok_arr(arr);
+    xf_arr_release(arr);
+    return rv;
+}
 /* ── cr_test ──────────────────────────────────────────────────── */
 
 
@@ -347,76 +605,6 @@ static xf_Value cr_test(xf_Value *args, size_t argc) {
 }
 
 
-/* ── cr_split ─────────────────────────────────────────────────── */
-static xf_Value cr_split(xf_Value *args, size_t argc) {
-    NEED(2);
-
-    xf_Value sv = xf_coerce_str(args[0]);
-    if (sv.state != XF_STATE_OK || !sv.data.str) {
-        xf_value_release(sv);
-        return xf_val_nav(XF_TYPE_ARR);
-    }
-
-    const char *s   = sv.data.str->data;
-    size_t      len = sv.data.str->len;
-
-    long n = 0; /* 0 => unlimited */
-    size_t flags_idx = 2;
-
-    if (argc > 2 &&
-        args[2].state == XF_STATE_OK &&
-        args[2].type == XF_TYPE_NUM) {
-        n = (long)args[2].data.num;
-        if (n < 0) n = 0;
-        flags_idx = 3;
-    }
-
-    const char *pat;
-    int cflags;
-    if (!cr_arg_pat(args, argc, 1, flags_idx, &pat, &cflags))
-        return xf_val_nav(XF_TYPE_ARR);
-
-    regex_t re;
-    char errmsg[256];
-    if (!cr_compile(pat, cflags, &re, errmsg, sizeof(errmsg)))
-        return xf_val_nav(XF_TYPE_ARR);
-
-    xf_arr_t *arr = xf_arr_new();
-    const char *cur = s;
-    const char *end = s + len;
-
-    while (cur <= end) {
-        if (n > 0 && (long)arr->len == n - 1) {
-            xf_arr_push(arr, make_str_val(cur, (size_t)(end - cur)));
-            break;
-        }
-
-        regmatch_t pm[1];
-        int rc = regexec(&re, cur, 1, pm, cur > s ? REG_NOTBOL : 0);
-
-        if (rc != 0) {
-            xf_arr_push(arr, make_str_val(cur, (size_t)(end - cur)));
-            break;
-        }
-
-        xf_arr_push(arr, make_str_val(cur, (size_t)pm[0].rm_so));
-
-        if (pm[0].rm_so == pm[0].rm_eo) {
-            if (cur < end) cur++;
-            else break;
-        } else {
-            cur += pm[0].rm_eo;
-        }
-    }
-
-    regfree(&re);
-    xf_value_release(sv);
-    xf_Value rv = xf_val_ok_arr(arr);
-    xf_arr_release(arr);
-    return rv;
-}
-
-/* ── build_regex ──────────────────────────────────────────────── */
 
 xf_module_t *build_regex(void) {
     xf_module_t *m = xf_module_new("core.regex");

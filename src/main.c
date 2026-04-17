@@ -1,3 +1,4 @@
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -120,9 +121,10 @@ static void bind_runtime_specials(Interp *it) {
         xf_Value value;
     } specs[5];
 
-    specs[0].name = "file";
-    specs[0].value = xf_val_ok_str(xf_str_from_cstr(""));
-
+specs[0].name = "file";
+xf_Str *file_s = xf_str_from_cstr("");
+specs[0].value = file_s ? xf_val_ok_str(file_s) : xf_val_null();
+xf_str_release(file_s);
     specs[1].name = "match";
     specs[1].value = xf_val_null();
 
@@ -178,7 +180,8 @@ xf_arr_release(arr);
 static int xf_run_program(Program *prog, int argc, char **argv) {
     VM vm;
     vm_init(&vm, 1);
-        SymTable syms;
+
+    SymTable syms;
     sym_init(&syms);
     if (syms.had_error) {
         fprintf(stderr, "xf: symtable init error: %s\n", syms.err_msg);
@@ -192,8 +195,10 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
     Interp it = {0};
     it.vm   = &vm;
     it.syms = &syms;
-core_set_fn_caller(&vm, &syms, interp_exec_xf_fn_bridge);
+
+    core_set_fn_caller(&vm, &syms, interp_exec_xf_fn_bridge);
     bind_runtime_specials(&it);
+
     if (!interp_compile_program(&it, prog)) {
         fprintf(stderr, "xf: compile failed\n");
         if (it.vm && it.vm->had_error) {
@@ -202,27 +207,38 @@ core_set_fn_caller(&vm, &syms, interp_exec_xf_fn_bridge);
         if (it.syms && it.syms->had_error) {
             fprintf(stderr, "xf: sym error: %s\n", it.syms->err_msg);
         }
+        interp_reset_global_bindings(&it);
         sym_free(&syms);
         vm_free(&vm);
         return 1;
     }
+
     inject_args(&it, argc, argv);
 
     VMResult begin_rc = vm_run_begin(&vm);
     if (begin_rc != VM_OK && !vm.should_exit) {
         fprintf(stderr, "BEGIN failed\n");
+        interp_reset_global_bindings(&it);
         sym_free(&syms);
         vm_free(&vm);
         return 1;
     }
-    char buf[4096];
+
+    /*
+     * Only read stdin when stdin is piped or redirected.
+     * If running interactively from a terminal, do not block waiting for input.
+     */
+    if (!vm.should_exit && !isatty(fileno(stdin))) {
+        char buf[4096];
         while (!vm.should_exit && fgets(buf, sizeof(buf), stdin)) {
-        size_t len = strlen(buf);
-        if (vm_feed_record(&vm, buf, len) != VM_OK) {
-            fprintf(stderr, "runtime error\n");
-            sym_free(&syms);
-            vm_free(&vm);
-            return 1;
+            size_t len = strlen(buf);
+            if (vm_feed_record(&vm, buf, len) != VM_OK) {
+                fprintf(stderr, "runtime error\n");
+                interp_reset_global_bindings(&it);
+                sym_free(&syms);
+                vm_free(&vm);
+                return 1;
+            }
         }
     }
 
@@ -230,11 +246,14 @@ core_set_fn_caller(&vm, &syms, interp_exec_xf_fn_bridge);
         VMResult end_rc = vm_run_end(&vm);
         if (end_rc != VM_OK && !vm.should_exit) {
             fprintf(stderr, "END failed\n");
+            interp_reset_global_bindings(&it);
             sym_free(&syms);
             vm_free(&vm);
             return 1;
         }
     }
+
+    interp_reset_global_bindings(&it);
     sym_free(&syms);
     vm_free(&vm);
     return 0;
@@ -243,22 +262,19 @@ int main(int argc, char **argv) {
     if (argc == 1) {
         return xf_run_repl();
     }
-
-    if (argc == 3 && strcmp(argv[1], "-r") == 0) {
-        char *source = read_file(argv[2]);
-        if (!source) {
-            return 1;
-        }
-
-        int rc = xf_run_source(argv[2], source, XF_SRC_FILE, 1, &argv[2]);
-        free(source);
-        return rc;
+if (argc >= 3 && strcmp(argv[1], "-r") == 0) {
+    char *source = read_file(argv[2]);
+    if (!source) {
+        return 1;
     }
 
-    if (argc == 3 && strcmp(argv[1], "-e") == 0) {
-        return xf_run_source("<inline>", argv[2], XF_SRC_INLINE, 1, &argv[2]);
-    }
-
+    int rc = xf_run_source(argv[2], source, XF_SRC_FILE, argc - 2, &argv[2]);
+    free(source);
+    return rc;
+}
+if (argc >= 3 && strcmp(argv[1], "-e") == 0) {
+    return xf_run_source("<inline>", argv[2], XF_SRC_INLINE, argc - 2, &argv[2]);
+}
     usage(argv[0]);
     return 1;
 }

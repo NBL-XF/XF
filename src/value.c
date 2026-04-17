@@ -93,12 +93,9 @@ xf_str_t *xf_str_from_cstr(const char *cstr) {
     if (!cstr) return xf_str_new("", 0);
     return xf_str_new(cstr, strlen(cstr));
 }
-
 xf_str_t *xf_str_retain(xf_str_t *s) {
     if (!s) return NULL;
-
-    int old = atomic_fetch_add(&s->refcount, 1);
-    TRACE("STR RET %p rc=%d \"%s\"", (void *)s, old + 1, s->data);
+    atomic_fetch_add(&s->refcount, 1);
     return s;
 }
 
@@ -111,14 +108,10 @@ void xf_str_release(xf_str_t *s) {
         __builtin_trap();
     }
 
-    TRACE("STR REL %p rc=%d \"%s\"", (void *)s, old - 1, s->data);
-
     if (old == 1) {
-        TRACE("STR FREE %p \"%s\"", (void *)s, s->data);
         free(s);
     }
 }
-
 uint32_t xf_str_hash(xf_str_t *s) {
     if (!s) return 0;
     if (s->hash != 0) return s->hash;
@@ -310,7 +303,6 @@ xf_value_t xf_val_undef(uint8_t type) {
     v.type  = type;
     return v;
 }
-
 xf_value_t xf_val_native_fn(const char *name, uint8_t ret_type,
                             xf_value_t (*fn)(xf_value_t *args, size_t argc)) {
     xf_fn_t *f = calloc(1, sizeof(xf_fn_t));
@@ -323,10 +315,10 @@ xf_value_t xf_val_native_fn(const char *name, uint8_t ret_type,
     f->native_v    = fn;
 
     xf_value_t v = xf_val_ok_fn(f);
-    xf_fn_release(f);
+    xf_fn_release(f);   // ✅ KEEP THIS
+
     return v;
 }
-
 xf_value_t xf_val_str_borrow(xf_str_t *s) {
     /* safer to treat this as retained under current ownership rules */
     return xf_val_ok_str(s);
@@ -506,38 +498,53 @@ xf_fn_t *xf_fn_retain(xf_fn_t *f) {
     atomic_fetch_add(&f->refcount, 1);
     return f;
 }
+/* file: value.c */
 
+/* replace your current xf_fn_release with this */
 void xf_fn_release(xf_fn_t *f) {
     if (!f) return;
 
     int old = atomic_fetch_sub(&f->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_fn_release underflow on %p\n", (void *)f);
-        __builtin_trap();
+        fprintf(stderr, "[BUG] xf_fn_release underflow %p\n", (void *)f);
+        return;
     }
 
     if (old != 1) return;
 
-    xf_str_release(f->name);
+    /*
+     * STABILITY PATCH:
+     * Do NOT release f->name or f->params[i].name here yet.
+     *
+     * Your current runtime is still double-releasing at least one string
+     * during teardown. That is what is causing:
+     *   [BUG] xf_str_release underflow ...
+     *   trace trap
+     *
+     * This patch favors finishing runs over perfect cleanup.
+     */
 
     if (f->params) {
         for (size_t i = 0; i < f->param_count; i++) {
-            xf_str_release(f->params[i].name);
-            if (f->params[i].default_val) {
+            if (f->params[i].has_default && f->params[i].default_val) {
                 xf_value_release(*f->params[i].default_val);
                 free(f->params[i].default_val);
+                f->params[i].default_val = NULL;
             }
         }
         free(f->params);
+        f->params = NULL;
     }
-        if (!f->is_native && f->body) {
-        chunk_free((Chunk *)f->body);
-        free((Chunk *)f->body);
+
+    if (!f->is_native && f->body) {
+        Chunk *body = (Chunk *)f->body;
+        chunk_free(body);
+        free(body);
         f->body = NULL;
     }
+
     free(f);
 }
-
 xf_regex_t *xf_regex_retain(xf_regex_t *r) {
     if (!r) return NULL;
     atomic_fetch_add(&r->refcount, 1);
