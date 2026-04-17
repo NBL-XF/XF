@@ -1,3 +1,4 @@
+// core.c
 #include "core/internal.h"
 
 void core_register(SymTable *st) {
@@ -79,27 +80,16 @@ void core_register(SymTable *st) {
     xf_module_release(format_m);
     xf_module_release(process_m);
     xf_module_release(img_m);
+// core.c
+// replace the final registration tail in core_register()
 
-    xf_Value core_val = xf_val_ok_module(core_m);
-    xf_module_release(core_m);
+xf_Value core_val = xf_val_ok_module(core_m);
+xf_module_release(core_m);
 
-    xf_Str *name = xf_str_from_cstr("core");
-    Symbol *sym  = sym_declare(
-        st,
-        name,
-        SYM_BUILTIN,
-        XF_TYPE_MODULE,
-        (Loc){ .source = "<core>", .line = 0, .col = 0 }
-    );
+if (!sym_define_builtin(st, "core", XF_TYPE_MODULE, core_val)) {
+    xf_value_release(core_val);
+    return;
+}
 
-    if (sym) {
-        xf_value_release(sym->value);
-        sym->value      = core_val;
-        sym->is_const   = true;
-        sym->is_defined = true;
-    } else {
-        xf_value_release(core_val);
-    }
-
-    xf_str_release(name);
+xf_value_release(core_val);
 }

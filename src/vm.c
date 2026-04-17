@@ -1077,14 +1077,30 @@ static void inject_args(VM *vm, int argc, char **argv) {
 void vm_free(VM *vm) {
     if (!vm) return;
 
+    /* release any live call frames */
+    for (size_t i = 0; i < vm->frame_count; i++) {
+        CallFrame *f = &vm->frames[i];
+
+        for (size_t j = 0; j < f->local_count; j++) {
+            xf_value_release(f->locals[j]);
+            f->locals[j] = xf_val_null();
+        }
+        f->local_count = 0;
+
+        xf_value_release(f->return_val);
+        f->return_val = xf_val_null();
+
+        f->chunk = NULL;
+        f->ip = 0;
+    }
+    vm->frame_count = 0;
+
     /* release any live task results */
     for (size_t i = 0; i < 256; i++) {
-        if (vm->tasks[i].used) {
-            xf_value_release(vm->tasks[i].result);
-            vm->tasks[i].result = xf_val_null();
-            vm->tasks[i].used = false;
-            vm->tasks[i].done = false;
-        }
+        xf_value_release(vm->tasks[i].result);
+        vm->tasks[i].result = xf_val_null();
+        vm->tasks[i].used = false;
+        vm->tasks[i].done = false;
     }
 
     /* release anything still on the VM stack */
@@ -1112,10 +1128,12 @@ void vm_free(VM *vm) {
     vm->rec.split_buf = NULL;
     vm->rec.split_buf_len = 0;
 
-    for (size_t i = 0; i < vm->rec.header_count; i++) {
-        free(vm->rec.headers[i]);
+    if (vm->rec.headers) {
+        for (size_t i = 0; i < vm->rec.header_count; i++) {
+            free(vm->rec.headers[i]);
+        }
+        free(vm->rec.headers);
     }
-    free(vm->rec.headers);
     vm->rec.headers = NULL;
     vm->rec.header_count = 0;
     vm->rec.headers_set = false;
@@ -1976,7 +1994,19 @@ static VMResult vm_run_chunk_internal(VM *vm, Chunk *chunk, xf_Value *args, size
             case OP_GT:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = (val_cmp(a,b) > 0) ? xf_val_true() : xf_val_false(); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
             case OP_LTE: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = (val_cmp(a,b) <= 0) ? xf_val_true() : xf_val_false(); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
             case OP_GTE: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = (val_cmp(a,b) >= 0) ? xf_val_true() : xf_val_false(); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
+            case OP_SPACESHIP: {
+    b = vm_pop(vm);
+    a = vm_pop(vm);
 
+    int cmp = val_cmp(a, b);
+    xf_Value r = xf_val_ok_num((double)cmp);
+
+    vm_push(vm, r);
+    xf_value_release(a);
+    xf_value_release(b);
+    xf_value_release(r);
+    break;
+}
             case OP_AND: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = (is_truthy(a) && is_truthy(b)) ? xf_val_true() : xf_val_false(); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
             case OP_OR:  b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = (is_truthy(a) || is_truthy(b)) ? xf_val_true() : xf_val_false(); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
             case OP_NOT: a = vm_pop(vm); { xf_Value r = is_truthy(a) ? xf_val_false() : xf_val_true(); vm_push(vm,r); xf_value_release(a); xf_value_release(r); } break;
@@ -2028,24 +2058,39 @@ static VMResult vm_run_chunk_internal(VM *vm, Chunk *chunk, xf_Value *args, size
                 break;
             }
 
+
             case OP_GET_STATE: {
-                a = vm_pop(vm);
-                xf_Value r = xf_val_ok_num((double)a.state);
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(r);
-                break;
-            }
+    a = vm_pop(vm);
 
-            case OP_GET_TYPE: {
-                a = vm_pop(vm);
-                xf_Value r = xf_val_ok_num((double)a.type);
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(r);
-                break;
-            }
+    const char *name =
+        (a.state < XF_STATE_COUNT) ? XF_STATE_NAMES[a.state] : "VOID";
 
+    xf_Str *s = xf_str_from_cstr(name);
+    xf_Value r = s ? xf_val_ok_str(s) : xf_val_nav(XF_TYPE_STR);
+
+    if (s) xf_str_release(s);
+    vm_push(vm, r);
+    xf_value_release(a);
+    xf_value_release(r);
+    break;
+}
+
+case OP_GET_TYPE: {
+    a = vm_pop(vm);
+
+    uint8_t t = a.type;
+    const char *name =
+        (t < XF_TYPE_COUNT) ? XF_TYPE_NAMES[t] : "void";
+
+    xf_Str *s = xf_str_from_cstr(name);
+    xf_Value r = s ? xf_val_ok_str(s) : xf_val_nav(XF_TYPE_STR);
+
+    if (s) xf_str_release(s);
+    vm_push(vm, r);
+    xf_value_release(a);
+    xf_value_release(r);
+    break;
+}
             case OP_GET_LEN: {
                 xf_Value v = vm_pop(vm);
                 xf_Value out;
@@ -2577,8 +2622,85 @@ done:
 err:
     return VM_ERR;
 }
+
+static void vm_drop_frame(VM *vm, size_t idx) {
+    if (!vm || idx >= VM_FRAMES_MAX) return;
+
+    CallFrame *f = &vm->frames[idx];
+
+    for (size_t i = 0; i < f->local_count; i++) {
+        xf_value_release(f->locals[i]);
+        f->locals[i] = xf_val_null();
+    }
+    f->local_count = 0;
+
+    xf_value_release(f->return_val);
+    f->return_val = xf_val_null();
+
+    memset(f, 0, sizeof(*f));
+    vm->frame_count = idx;
+}
+
 VMResult vm_run_chunk(VM *vm, Chunk *chunk) {
-    return vm_run_chunk_internal(vm, chunk, NULL, 0);
+    if (!vm || !chunk) return VM_ERR;
+
+    size_t before = vm->frame_count;
+    size_t stack_before = vm->stack_top;
+
+    VMResult r = vm_run_chunk_internal(vm, chunk, NULL, 0);
+
+    if (vm->frame_count == before + 1) {
+        vm_drop_frame(vm, before);
+    }
+
+    while (vm->stack_top > stack_before) {
+        xf_value_release(vm->stack[--vm->stack_top]);
+        vm->stack[vm->stack_top] = xf_val_null();
+    }
+
+    return r;
+}
+
+xf_Value vm_call_function_chunk(VM *vm, Chunk *chunk, xf_Value *args, size_t argc) {
+    if (!vm || !chunk) return xf_val_nav(XF_TYPE_VOID);
+
+    size_t before = vm->frame_count;
+    size_t stack_before = vm->stack_top;
+
+    VMResult r = vm_run_chunk_internal(vm, chunk, args, argc);
+
+    xf_Value ret = xf_val_null();
+    bool have_child = (vm->frame_count == before + 1);
+
+    if (have_child) {
+        CallFrame *child = &vm->frames[before];
+        ret = xf_value_retain(child->return_val);
+        vm_drop_frame(vm, before);
+    }
+
+    while (vm->stack_top > stack_before) {
+        xf_value_release(vm->stack[--vm->stack_top]);
+        vm->stack[vm->stack_top] = xf_val_null();
+    }
+
+    if (r == VM_EXIT) {
+        vm->should_exit = true;
+        xf_value_release(ret);
+        return xf_val_null();
+    }
+
+    if (r == VM_ERR) {
+        xf_value_release(ret);
+        return xf_val_nav(XF_TYPE_VOID);
+    }
+
+    if (!have_child) {
+        vm_error(vm, "bad frame state after function call");
+        xf_value_release(ret);
+        return xf_val_nav(XF_TYPE_VOID);
+    }
+
+    return ret;
 }
 /* ============================================================
  * Begin/rule/end
@@ -2632,38 +2754,4 @@ void vm_rec_snapshot_free(RecordCtx *snap) {
     xf_value_release(snap->last_captures);
     xf_value_release(snap->last_err);
     memset(snap, 0, sizeof(*snap));
-}
-xf_Value vm_call_function_chunk(VM *vm, Chunk *chunk, xf_Value *args, size_t argc) {
-    if (!vm || !chunk) return xf_val_nav(XF_TYPE_VOID);
-
-    size_t before = vm->frame_count;
-    VMResult r = vm_run_chunk_internal(vm, chunk, args, argc);
-
-    if (r == VM_EXIT) {
-        vm->should_exit = true;
-        return xf_val_null();
-    }
-
-    if (r == VM_ERR) {
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-
-    if (vm->frame_count != before + 1) {
-        vm_error(vm, "bad frame state after function call");
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-
-    CallFrame *child = &vm->frames[before];
-    xf_Value ret = xf_value_retain(child->return_val);
-
-    for (size_t i = 0; i < child->local_count; i++) {
-        xf_value_release(child->locals[i]);
-        child->locals[i] = xf_val_null();
-    }
-
-    xf_value_release(child->return_val);
-    memset(child, 0, sizeof(*child));
-    vm->frame_count = before;
-
-    return ret;
 }

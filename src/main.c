@@ -177,6 +177,14 @@ vm_set_global(it->vm, slot, arrv);
 xf_value_release(arrv);
 xf_arr_release(arr);
 }
+
+/* Drain any leftover values the VM left on the stack. */
+static void xf_drain_stack(VM *vm) {
+    while (vm->stack_top > 0) {
+        xf_value_release(vm_pop(vm));
+    }
+}
+
 static int xf_run_program(Program *prog, int argc, char **argv) {
     VM vm;
     vm_init(&vm, 1);
@@ -216,6 +224,7 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
     inject_args(&it, argc, argv);
 
     VMResult begin_rc = vm_run_begin(&vm);
+    xf_drain_stack(&vm);   /* discard any value the BEGIN block left */
     if (begin_rc != VM_OK && !vm.should_exit) {
         fprintf(stderr, "BEGIN failed\n");
         interp_reset_global_bindings(&it);
@@ -239,11 +248,13 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
                 vm_free(&vm);
                 return 1;
             }
+            xf_drain_stack(&vm);   /* discard any value each rule left */
         }
     }
 
     if (!vm.should_exit) {
         VMResult end_rc = vm_run_end(&vm);
+        xf_drain_stack(&vm);   /* discard any value the END block left */
         if (end_rc != VM_OK && !vm.should_exit) {
             fprintf(stderr, "END failed\n");
             interp_reset_global_bindings(&it);

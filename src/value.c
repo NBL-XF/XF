@@ -503,6 +503,12 @@ void xf_fn_release(xf_fn_t *f) {
     if (!f) return;
 
     int old = atomic_fetch_sub(&f->refcount, 1);
+    if (old == 1) {
+    fprintf(stderr, "[fn free] %p native=%d name=%s\n",
+            (void *)f,
+            f->is_native,
+            (f->name && f->name->data) ? f->name->data : "<null>");
+}
     if (old <= 0) {
         fprintf(stderr, "[BUG] xf_fn_release underflow %p\n", (void *)f);
         return;
@@ -523,11 +529,10 @@ void xf_fn_release(xf_fn_t *f) {
         free(f->params);
     }
 
-    if (f->body) {
-        chunk_free(f->body);
+   if (!f->is_native && f->body) {
+        chunk_free((Chunk *)f->body);
         free(f->body);
     }
-
     free(f);
 }
 xf_regex_t *xf_regex_retain(xf_regex_t *r) {

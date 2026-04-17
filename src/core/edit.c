@@ -197,9 +197,13 @@ static xf_Value ce_lines(xf_Value *args, size_t argc) {
     if (!buf) return xf_val_nav(XF_TYPE_ARR);
     size_t nlines; char **lines=ce_split_lines(buf,flen,&nlines); free(buf);
     xf_arr_t *out=xf_arr_new();
-    for (size_t i=0;i<nlines;i++) {
-        xf_Str *ls=xf_str_from_cstr(lines[i]); xf_arr_push(out,xf_val_ok_str(ls)); xf_str_release(ls);
-    }
+    for (size_t i = 0; i < nlines; i++) {
+    xf_Str *ls = xf_str_from_cstr(lines[i]);
+    xf_Value v = xf_val_ok_str(ls);
+    xf_arr_push(out, v);
+    xf_value_release(v);
+    xf_str_release(ls);
+}
     ce_free_lines(lines,nlines);
     xf_Value v=xf_val_ok_arr(out); xf_arr_release(out); return v;
 }
@@ -236,10 +240,15 @@ static xf_Value ce_glob(xf_Value *args, size_t argc) {
     const char *pat; size_t plen; if (!arg_str(args,argc,0,&pat,&plen)) return propagate(args,argc);
     glob_t gl; int rc=glob(pat,GLOB_TILDE,NULL,&gl);
     xf_arr_t *out=xf_arr_new();
-    if (rc==0) for (size_t i=0;i<gl.gl_pathc;i++) {
-        xf_Str *s=xf_str_from_cstr(gl.gl_pathv[i]);
-        xf_arr_push(out,xf_val_ok_str(s)); xf_str_release(s);
+    if (rc == 0) {
+    for (size_t i = 0; i < gl.gl_pathc; i++) {
+        xf_Str *s = xf_str_from_cstr(gl.gl_pathv[i]);
+        xf_Value v = xf_val_ok_str(s);
+        xf_arr_push(out, v);
+        xf_value_release(v);
+        xf_str_release(s);
     }
+}
     globfree(&gl);
     xf_Value v=xf_val_ok_arr(out); xf_arr_release(out); return v;
 }
@@ -294,7 +303,10 @@ xf_map_set(m, kf, tmp_vp);
 xf_value_release(tmp_vp);
             xf_str_release(kl);xf_str_release(kn);xf_str_release(kf);
             xf_str_release(vs);xf_str_release(vp);
-            xf_Value rv=xf_val_ok_map(m); xf_arr_push(out,rv); xf_map_release(m);
+            xf_Value rv = xf_val_ok_map(m);
+xf_arr_push(out, rv);
+xf_value_release(rv);
+xf_map_release(m);
         }
     }
     if (is_regex&&compiled) regfree(&re);
@@ -313,7 +325,11 @@ static xf_Value ce_diff(xf_Value *args, size_t argc) {
     while (fgets(line,sizeof(line),fp)) {
         size_t ln=strlen(line);
         while (ln>0&&(line[ln-1]=='\n'||line[ln-1]=='\r')) line[--ln]='\0';
-        xf_Str *ls=xf_str_new(line,ln); xf_arr_push(arr,xf_val_ok_str(ls)); xf_str_release(ls);
+        xf_Str *ls = xf_str_new(line, ln);
+xf_Value v = xf_val_ok_str(ls);
+xf_arr_push(arr, v);
+xf_value_release(v);
+xf_str_release(ls);
     }
     pclose(fp);
     xf_Value rv=xf_val_ok_arr(arr); xf_arr_release(arr); return rv;
