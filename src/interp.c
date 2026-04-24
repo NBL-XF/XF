@@ -474,9 +474,9 @@ bool interp_compile_program(Interp *it, Program *prog) {
     if (!it || !it->vm || !prog) return false;
 bool ok = false;
 bool top_level_compile = (g_compile_depth == 0);
-if (top_level_compile && !g_interp_preserve_bindings) {
+/*if (top_level_compile && !g_interp_preserve_bindings) {
     interp_reset_global_bindings(it);
-}
+}*/
     g_compile_depth++;
 
     VM *vm = it->vm;

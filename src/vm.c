@@ -952,6 +952,129 @@ static VMResult vm_run_chunk_internal(VM *vm, Chunk *chunk, xf_Value *args, size
     xf_value_release(out);
     break;
 }
+case OP_MAKE_ARR: {
+    uint16_t n = (uint16_t)((frame->chunk->code[frame->ip] << 8) |
+                             frame->chunk->code[frame->ip + 1]);
+    frame->ip += 2;
+
+    if (vm->stack_top < n) {
+        vm_error(vm, "MAKE_ARR underflow: need %u, have %zu", n, vm->stack_top);
+        goto err;
+    }
+
+    xf_arr_t *a = xf_arr_new();
+    if (!a) { vm_error(vm, "MAKE_ARR: out of memory"); goto err; }
+
+    /* items are on the stack with the first one deepest; copy in order */
+    size_t base = vm->stack_top - n;
+    for (size_t i = 0; i < n; i++) {
+        xf_arr_push(a, vm->stack[base + i]);   /* xf_arr_push retains */
+    }
+    /* drop n source items */
+    for (size_t i = 0; i < n; i++) {
+        xf_value_release(vm->stack[--vm->stack_top]);
+        vm->stack[vm->stack_top] = xf_val_null();
+    }
+
+    xf_Value v = xf_val_ok_arr(a);   /* retains a → rc=2 */
+    xf_arr_release(a);                /* rc=1 (only the value owns) */
+    vm_push(vm, v);                   /* stack retains → rc=2 */
+    xf_value_release(v);              /* rc=1, stack owns */
+    break;
+}
+
+case OP_MAKE_TUPLE: {
+    uint16_t n = (uint16_t)((frame->chunk->code[frame->ip] << 8) |
+                             frame->chunk->code[frame->ip + 1]);
+    frame->ip += 2;
+
+    if (vm->stack_top < n) {
+        vm_error(vm, "MAKE_TUPLE underflow: need %u, have %zu", n, vm->stack_top);
+        goto err;
+    }
+
+    size_t base = vm->stack_top - n;
+    xf_tuple_t *t = xf_tuple_new(&vm->stack[base], n);  /* retains each item */
+    if (!t) { vm_error(vm, "MAKE_TUPLE: out of memory"); goto err; }
+
+    for (size_t i = 0; i < n; i++) {
+        xf_value_release(vm->stack[--vm->stack_top]);
+        vm->stack[vm->stack_top] = xf_val_null();
+    }
+
+    xf_Value v = xf_val_ok_tuple(t);
+    xf_tuple_release(t);
+    vm_push(vm, v);
+    xf_value_release(v);
+    break;
+}
+
+case OP_MAKE_SET: {
+    uint16_t n = (uint16_t)((frame->chunk->code[frame->ip] << 8) |
+                             frame->chunk->code[frame->ip + 1]);
+    frame->ip += 2;
+
+    if (vm->stack_top < n) {
+        vm_error(vm, "MAKE_SET underflow: need %u, have %zu", n, vm->stack_top);
+        goto err;
+    }
+
+    xf_set_t *s = xf_set_new();
+    if (!s) { vm_error(vm, "MAKE_SET: out of memory"); goto err; }
+
+    size_t base = vm->stack_top - n;
+    for (size_t i = 0; i < n; i++) {
+        xf_set_add(s, vm->stack[base + i]);   /* set_add → map_set retains */
+    }
+    for (size_t i = 0; i < n; i++) {
+        xf_value_release(vm->stack[--vm->stack_top]);
+        vm->stack[vm->stack_top] = xf_val_null();
+    }
+
+    xf_Value v = xf_val_ok_set(s);
+    xf_set_release(s);
+    vm_push(vm, v);
+    xf_value_release(v);
+    break;
+}
+
+case OP_MAKE_MAP: {
+    /* n is number of *pairs*, so 2n stack items */
+    uint16_t n = (uint16_t)((frame->chunk->code[frame->ip] << 8) |
+                             frame->chunk->code[frame->ip + 1]);
+    frame->ip += 2;
+
+    size_t need = (size_t)n * 2;
+    if (vm->stack_top < need) {
+        vm_error(vm, "MAKE_MAP underflow: need %zu, have %zu", need, vm->stack_top);
+        goto err;
+    }
+
+    xf_map_t *m = xf_map_new();
+    if (!m) { vm_error(vm, "MAKE_MAP: out of memory"); goto err; }
+
+    size_t base = vm->stack_top - need;
+    for (size_t i = 0; i < n; i++) {
+        xf_Value k = vm->stack[base + 2*i];
+        xf_Value v = vm->stack[base + 2*i + 1];
+
+        xf_Value ks = xf_coerce_str(k);   /* map keys are strings */
+        if (ks.state == XF_STATE_OK && ks.type == XF_TYPE_STR && ks.data.str) {
+            xf_map_set(m, ks.data.str, v);    /* retains v internally */
+        }
+        xf_value_release(ks);
+    }
+    for (size_t i = 0; i < need; i++) {
+        xf_value_release(vm->stack[--vm->stack_top]);
+        vm->stack[vm->stack_top] = xf_val_null();
+    }
+
+    xf_Value mv = xf_val_ok_map(m);
+    xf_map_release(m);
+    vm_push(vm, mv);
+    xf_value_release(mv);
+    break;
+}
             case OP_SET_IDX: {
                 xf_Value retv = vm_pop(vm);
                 xf_Value val  = vm_pop(vm);
