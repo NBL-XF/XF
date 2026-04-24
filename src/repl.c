@@ -137,9 +137,7 @@ static int xf_repl_eval_line(VM *vm, SymTable *syms, const char *line) {
     Interp it = {0};
     it.vm   = vm;
     it.syms = syms;
-
-    core_set_fn_caller(vm, syms, interp_exec_xf_fn_bridge);
-    bind_runtime_specials(&it);
+core_set_fn_caller(vm, syms, interp_exec_xf_fn_bridge);
 if (prog->count == 1 &&
     prog->items[0] &&
     prog->items[0]->kind == TOP_STMT &&

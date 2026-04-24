@@ -1119,26 +1119,40 @@ case OP_LOAD_GLOBAL: {
     break;
 }
             case OP_STORE_GLOBAL: {
-                uint32_t idx =
-                    ((uint32_t)frame->chunk->code[frame->ip] << 24) |
-                    ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
-                    ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
-                    (uint32_t)frame->chunk->code[frame->ip + 3];
-                frame->ip += 4;
+    uint32_t idx = READ_U32();
+    xf_Value v = vm_pop(vm);
 
-                xf_Value v = vm_pop(vm);
-                if (idx < vm->global_count) {
-                    xf_value_release(vm->globals[idx]);
-                    vm->globals[idx] = xf_value_retain(v);
-                } else {
-                    xf_value_release(v);
-                    vm_error(vm, "bad global slot");
-                    goto err;
-                }
-                xf_value_release(v);
-                break;
-            }
+    fprintf(stderr,
+            "[STORE_GLOBAL] idx=%u global_count=%zu value=%s/%s\n",
+            idx,
+            vm->global_count,
+            v.state < XF_STATE_COUNT ? XF_STATE_NAMES[v.state] : "?",
+            v.type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[v.type]   : "?");
 
+    if (idx < vm->global_count) {
+        fprintf(stderr,
+                "[STORE_GLOBAL before] idx=%u old=%s/%s\n",
+                idx,
+                vm->globals[idx].state < XF_STATE_COUNT ? XF_STATE_NAMES[vm->globals[idx].state] : "?",
+                vm->globals[idx].type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[vm->globals[idx].type]   : "?");
+
+        xf_value_release(vm->globals[idx]);
+        vm->globals[idx] = xf_value_retain(v);
+
+        fprintf(stderr,
+                "[STORE_GLOBAL after ] idx=%u new=%s/%s\n",
+                idx,
+                vm->globals[idx].state < XF_STATE_COUNT ? XF_STATE_NAMES[vm->globals[idx].state] : "?",
+                vm->globals[idx].type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[vm->globals[idx].type]   : "?");
+    } else {
+        xf_value_release(v);
+        vm_error(vm, "bad global slot");
+        goto err;
+    }
+
+    xf_value_release(v);
+    break;
+}
             case OP_GET_MEMBER: {
                 uint32_t idx = READ_U32();
                 if (idx >= frame->chunk->const_len) {

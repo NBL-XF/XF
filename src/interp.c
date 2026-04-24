@@ -785,6 +785,8 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
 
             return true;
         }
+        case STMT_PRINT:
+    return compile_print_stmt(it, c, s);
                 case STMT_PRINTF: {
             size_t argc = s->as.io.count;
 
