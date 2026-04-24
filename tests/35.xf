@@ -1,0 +1,25 @@
+BEGIN {
+    print void.state
+    print UNDEF.state
+    print NAV.state
+    print UNDET.state
+    print NULL.state
+    print TRUE.state
+
+    arr fn ret_arr() { return [1, 2, 3] }
+    tuple fn ret_tuple() { return (1, "x") }
+    map fn ret_map() { return {"a": 1} }
+    set fn ret_set() { return set{"alpha", "beta"} }
+
+    fn fn ret_fn() {
+        return fn(num n) { return n + 1 }
+    }
+
+    print ret_arr()
+    print ret_tuple()
+    print ret_map()
+    print ret_set()
+    print ret_fn()(5)
+
+    exit
+}

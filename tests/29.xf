@@ -1,0 +1,6 @@
+import "libraries/testmod.xf"
+
+BEGIN {
+    print add(2, 3)
+    exit
+}

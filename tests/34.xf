@@ -1,0 +1,44 @@
+BEGIN {
+
+    print "── fn return tests ──"
+
+    # ── primitives / states ─────────────────────
+    void fn ret_void() { return void }
+    num  fn ret_nav()  { return NAV }
+    num  fn ret_null() { return NULL }
+    bool fn ret_bool() { return TRUE }
+
+    print "void  :", ret_void() 
+    print "NAV   :", ret_nav()
+    print "NULL  :", ret_null()
+    print "bool  :", ret_bool()
+
+    # ── collections ─────────────────────────────
+    arr fn ret_arr() { return [1, 2, 3] }
+    map fn ret_map() { return {"a": 1, "b": 2} }
+    set fn ret_set() { return set{"x", "y"} }
+
+    print "arr   :", ret_arr()
+    print "map   :", ret_map()
+    print "set   :", ret_set()
+
+    # ── function return ─────────────────────────
+    fn fn ret_fn() {
+        return fn(num n) {
+            return n + 1
+        }
+    }
+
+    fn f = ret_fn()
+    print "fn(5) :", f(5)
+
+    # ── nested / composition ────────────────────
+    arr fn ret_nested() {
+        return [ {"x": 1}, {"y": 2} ]
+    }
+
+    print "nested:", ret_nested()
+
+    print "── done ──"
+    exit
+}

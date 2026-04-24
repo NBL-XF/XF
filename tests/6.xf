@@ -1,0 +1,13 @@
+BEGIN {
+    print "init"
+}
+
+if (1) {
+    print "yes"
+} else {
+    print "no"
+}
+
+END {
+    print "done"
+}

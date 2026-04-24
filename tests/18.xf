@@ -1,0 +1,22 @@
+BEGIN {
+    print "--- tuple ---"
+    tuple t = (1, 2, 3)
+    for (x in t) {
+        print x
+    }
+
+    print "--- string ---"
+    str s = "abc"
+    for (x in s) {
+        print x
+    }
+
+    print "--- map ---"
+    map m = {"name": "alice", "age": 30}
+    print m["name"]
+    print m["age"]
+
+    print "--- set ---"
+    set s2 = {"red", "green", "blue"}
+    print s2.len
+}

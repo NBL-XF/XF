@@ -1,0 +1,5 @@
+BEGIN {
+    printf("hello %s %s\n", "big", "world")
+    printf("%s = %s\n", "x", "42")
+    exit
+}

@@ -1,0 +1,4 @@
+BEGIN {
+    print ARGS[0]
+    print ARGS.len
+}

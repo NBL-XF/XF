@@ -1,0 +1,19 @@
+BEGIN {
+    print "--- map iter ---"
+    map m = {"name": "alice", "age": 30}
+    for ((k, v) in m) {
+        print k
+        print v
+    }
+
+    print "--- map keys ---"
+    for (x in m) {
+        print x
+    }
+
+    print "--- set iter ---"
+    set s = {"red", "green", "blue"}
+    for (x in s) {
+        print x
+    }
+}

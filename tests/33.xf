@@ -1,0 +1,21 @@
+map fn mark_row(map row) {
+    row["_checked"] = 1
+    return row
+}
+
+BEGIN {
+    arr dataset = [
+        {"a": 1},
+        {"a": 2},
+        {"a": 3}
+    ]
+
+    arr assigned = core.process.assign(dataset, mark_row)
+
+    print assigned
+    print assigned[0]
+    print assigned[1]
+    print assigned[2]
+
+    exit
+}

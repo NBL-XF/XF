@@ -1,0 +1,12 @@
+BEGIN {
+    outfmt "csv"
+    print "a", "b", "c"
+
+    outfmt "tsv"
+    print "x", "y", "z"
+
+    outfmt "text"
+    print "1", "2", "3"
+
+    exit
+}

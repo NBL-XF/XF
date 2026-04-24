@@ -1,0 +1,20 @@
+num fn maybe(num x) {
+    if (x > 0) {
+        return x
+    }
+    return
+}
+
+BEGIN {
+    num a = 1 / 0
+    print a.state
+    print a ?? 42
+
+    num x = 5
+    print x.type
+    print x.state
+
+    if ((y := 7) > 3) {
+        print y
+    }
+}
