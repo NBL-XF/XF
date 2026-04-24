@@ -56,6 +56,13 @@ static void scope_free(Scope *sc) {
         Symbol *s = &sc->entries[i];
         if (!s->name) continue;
 
+        if (strcmp(s->name->data, "core") == 0) {
+            fprintf(stderr,
+                    "[FREE SYMBOL core] state=%s type=%s\n",
+                    s->value.state < XF_STATE_COUNT ? XF_STATE_NAMES[s->value.state] : "?",
+                    s->value.type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[s->value.type]   : "?");
+        }
+
         xf_str_release(s->name);
         xf_value_release(s->value);
         s->name = NULL;
@@ -64,7 +71,6 @@ static void scope_free(Scope *sc) {
     free(sc->entries);
     free(sc);
 }
-
 
 /* ============================================================
  * SymTable init / free
@@ -311,17 +317,25 @@ Symbol *sym_define_builtin(SymTable *st, const char *name,
                            uint8_t type, xf_Value val) {
     if (!st || !st->global || !name) return NULL;
 
-    xf_Str *s = xf_str_from_cstr(name);
-    if (!s) return NULL;
+    size_t len = strlen(name);
 
-    Symbol *sym = scope_insert(st->global, s);
-    xf_str_release(s);
+    Symbol *sym = scope_find(st->global, name, len);
 
     if (!sym) {
-        st->had_error = true;
-        snprintf(st->err_msg, sizeof(st->err_msg),
-                 "failed to define builtin '%s'", name);
-        return NULL;
+        xf_Str *s = xf_str_from_cstr(name);
+        if (!s) return NULL;
+
+        sym = scope_insert(st->global, s);
+        xf_str_release(s);
+
+        if (!sym) {
+            st->had_error = true;
+            snprintf(st->err_msg, sizeof(st->err_msg),
+                     "failed to define builtin '%s'", name);
+            return NULL;
+        }
+    } else {
+        xf_value_release(sym->value);
     }
 
     sym->kind       = SYM_BUILTIN;
@@ -332,7 +346,6 @@ Symbol *sym_define_builtin(SymTable *st, const char *name,
 
     return sym;
 }
-
 
 /* ============================================================
  * Scope query helpers
@@ -971,7 +984,6 @@ void sym_register_builtins(SymTable *st) {
     xf_value_t keys_v      = xf_val_native_fn("keys",      XF_TYPE_ARR,   builtin_keys);
     xf_value_t values_v    = xf_val_native_fn("values",    XF_TYPE_ARR,   builtin_values);
     xf_value_t print_v     = xf_val_native_fn("print",     XF_TYPE_VOID,  builtin_print_fn);
-
     sym_define_builtin(st, "regex",     XF_TYPE_FN, regex_v);
     sym_define_builtin(st, "len",       XF_TYPE_FN, len_v);
     sym_define_builtin(st, "filter",    XF_TYPE_FN, filter_v);
@@ -1008,68 +1020,7 @@ void sym_register_builtins(SymTable *st) {
     xf_value_release(merge_v);
     xf_value_release(split_v);
 
-    xf_Value fn_undef = xf_val_undef(XF_TYPE_FN);
-
-    for (size_t i = 0; i < BUILTIN_COUNT; i++) {
-        const char *name = k_builtins[i];
-
-        if (strcmp(name, "sin") == 0 ||
-            strcmp(name, "cos") == 0 ||
-            strcmp(name, "sqrt") == 0 ||
-            strcmp(name, "abs") == 0 ||
-            strcmp(name, "int") == 0 ||
-            strcmp(name, "sub") == 0 ||
-            strcmp(name, "gsub") == 0 ||
-            strcmp(name, "match") == 0 ||
-            strcmp(name, "substr") == 0 ||
-            strcmp(name, "index") == 0 ||
-            strcmp(name, "toupper") == 0 ||
-            strcmp(name, "tolower") == 0 ||
-            strcmp(name, "trim") == 0 ||
-            strcmp(name, "sprintf") == 0 ||
-            strcmp(name, "column") == 0 ||
-            strcmp(name, "getline") == 0 ||
-            strcmp(name, "close") == 0 ||
-            strcmp(name, "flush") == 0 ||
-            strcmp(name, "read") == 0 ||
-            strcmp(name, "lines") == 0 ||
-            strcmp(name, "write") == 0 ||
-            strcmp(name, "append") == 0 ||
-            strcmp(name, "system") == 0 ||
-            strcmp(name, "time") == 0 ||
-            strcmp(name, "rand") == 0 ||
-            strcmp(name, "srand") == 0) {
-            sym_define_builtin(st, name, XF_TYPE_FN, fn_undef);
-            continue;
-        }
-
-        if (strcmp(name, "len") == 0 ||
-            strcmp(name, "split") == 0 ||
-            strcmp(name, "filter") == 0 ||
-            strcmp(name, "transform") == 0 ||
-            strcmp(name, "push") == 0 ||
-            strcmp(name, "pop") == 0 ||
-            strcmp(name, "shift") == 0 ||
-            strcmp(name, "unshift") == 0 ||
-            strcmp(name, "remove") == 0 ||
-            strcmp(name, "has") == 0 ||
-            strcmp(name, "keys") == 0 ||
-            strcmp(name, "values") == 0 ||
-            strcmp(name, "print") == 0 ||
-            strcmp(name, "merge") == 0 ||
-            strcmp(name, "expand") == 0 ||
-            strcmp(name, "flatten") == 0 ||
-            strcmp(name, "regex") == 0) {
-            continue;
-        }
-
-        /* If "exit" is not a real builtin in this runtime, skip it too. */
-        if (strcmp(name, "exit") == 0) {
-            continue;
-        }
-
-        sym_define_builtin(st, name, XF_TYPE_FN, fn_undef);
-    }
+    fprintf(stderr, "[sym_register_builtins] locals released\n");
 }
 /* ============================================================
  * Debug

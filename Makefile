@@ -2,7 +2,7 @@
 CC      = /opt/homebrew/opt/llvm/bin/clang
 AR      = /opt/homebrew/opt/llvm/bin/llvm-ar
 WARNFLAGS    = -Wall -Wextra -Wpedantic -std=c11
-DEBUGFLAGS   = -O1 -g -fsanitize=address,leak,undefined -fno-omit-frame-pointer
+DEBUGFLAGS   = -O0 -g -fsanitize=address,leak,undefined -fno-omit-frame-pointer
 THREADFLAGS  = -O0 -g -fsanitize=thread -fno-omit-frame-pointer
 RELEASEFLAGS = -O3
 MODE ?= release
@@ -59,7 +59,8 @@ all: $(LIBXF) $(BIN)
 $(patsubst %.c,$(OBJDIR)/%.o,$(CORE_SRCS)): src/core/internal.h
 run: $(BIN)
 ifeq ($(MODE),debug)
-	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+	ASAN_SYMBOLIZER_PATH=/opt/homebrew/opt/llvm/bin/llvm-symbolizer \
+	ASAN_OPTIONS=symbolize=1:detect_leaks=1:halt_on_error=1:abort_on_error=1 \
 	LSAN_OPTIONS=verbosity=1:report_objects=1 \
 	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
 	$(BIN) -r tests/torture.xf
@@ -90,4 +91,5 @@ uninstall:
 	rm -rf $(DESTDIR)$(PREFIX)/include/xf
 clean:
 	rm -rf obj/* bin/*
+export ASAN_SYMBOLIZER_PATH=/opt/homebrew/opt/llvm/bin/llvm-symbolizer
 .PHONY: all run install uninstall clean

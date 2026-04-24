@@ -1,0 +1,37 @@
+ASAN_SYMBOLIZER_PATH=/opt/homebrew/opt/llvm/bin/llvm-symbolizer \
+	ASAN_OPTIONS=symbolize=1:detect_leaks=1:halt_on_error=1:abort_on_error=1 \
+	LSAN_OPTIONS=verbosity=1:report_objects=1 \
+	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+	bin/debug/xf -r tests/torture.xf
+PASS  lit/int
+PASS  lit/float
+PASS  lit/str/dq
+PASS  lit/str/sq
+PASS  lit/str/esc
+PASS  lit/TRUE
+PASS  lit/FALSE
+PASS  lit/hex
+PASS  arith/add
+PASS  arith/sub
+PASS  arith/mul
+PASS  arith/div
+PASS  arith/mod
+PASS  arith/pow
+PASS  arith/neg
+PASS  arith/prec
+PASS  arith/parens
+PASS  arith/unary
+PASS  concat/basic
+PASS  concat/num
+PASS  concat/chain
+PASS  concat/empty
+PASS  cmp/eq_num
+PASS  cmp/eq_str
+PASS  cmp/neq
+PASS  cmp/lt
+PASS  cmp/gt
+PASS  cmp/lte_eq
+PASS  cmp/gte_eq
+PASS  cmp/ship_lt
+PASS  cmp/ship_eq
+PASS  cmp/ship_gt

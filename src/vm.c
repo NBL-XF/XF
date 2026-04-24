@@ -22,784 +22,6 @@ static int      val_cmp(xf_Value a, xf_Value b);
 static bool     val_eq(xf_Value a, xf_Value b);
 static xf_Value val_concat(xf_Value a, xf_Value b);
 static uint32_t read_u32(const Chunk *c, size_t off);
-static xf_Value vm_call_compiled_fn(VM *vm, Chunk *chunk, xf_Value *args, size_t argc) {
-    if (!vm || !chunk) return xf_val_nav(XF_TYPE_VOID);
-
-    if (vm->frame_count >= VM_FRAMES_MAX) {
-        vm_error(vm, "call stack overflow");
-        return xf_val_nav(XF_TYPE_VOID);
-    }
-
-    CallFrame *frame = &vm->frames[vm->frame_count++];
-    memset(frame, 0, sizeof(*frame));
-    frame->chunk = chunk;
-    frame->ip = 0;
-    frame->return_val = xf_val_null();
-
-    for (size_t i = 0; i < argc && i < 256; i++) {
-        frame->locals[i] = xf_value_retain(args[i]);
-        frame->local_count = i + 1;
-    }
-
-    for (;;) {
-        if (frame->ip >= frame->chunk->len) break;
-
-        OpCode op = (OpCode)frame->chunk->code[frame->ip++];
-        xf_Value a, b;
-
-        switch (op) {
-            case OP_NOP:
-                break;
-
-            case OP_HALT:
-                goto done;
-
-            case OP_PUSH_NUM: {
-                uint64_t bits = 0;
-                for (int i = 0; i < 8; i++) bits = (bits << 8) | frame->chunk->code[frame->ip++];
-                double v;
-                memcpy(&v, &bits, 8);
-                vm_push(vm, xf_val_ok_num(v));
-                break;
-            }
-            
-                        case OP_SET_IDX: {
-                /* current compiler emits: obj, key, value, DUP(value), SET_IDX */
-                xf_Value retv = vm_pop(vm);   /* duplicated assigned value */
-                xf_Value val  = vm_pop(vm);   /* original assigned value */
-                xf_Value key  = vm_pop(vm);
-                xf_Value obj  = vm_pop(vm);
-
-                xf_Value out = xf_value_retain(retv);
-
-                if (obj.state == XF_STATE_OK &&
-                    obj.type  == XF_TYPE_MAP &&
-                    obj.data.map) {
-                    xf_Value ks = xf_coerce_str(key);
-                    if (ks.state == XF_STATE_OK && ks.data.str) {
-                        xf_map_set(obj.data.map, ks.data.str, val);
-                    } else {
-                        xf_value_release(out);
-                        out = xf_val_nav(XF_TYPE_VOID);
-                    }
-                    xf_value_release(ks);
-                } else {
-                    xf_value_release(out);
-                    out = xf_val_nav(XF_TYPE_VOID);
-                }
-
-                xf_value_release(obj);
-                xf_value_release(key);
-                xf_value_release(val);
-                xf_value_release(retv);
-
-                vm_push(vm, out);
-                xf_value_release(out);
-                break;
-            }
-            case OP_PRINT: {
-    uint8_t argc = frame->chunk->code[frame->ip++];
-    xf_Value args[64];
-
-    for (int i = (int)argc - 1; i >= 0; i--) {
-        args[i] = vm_pop(vm);
-    }
-
-    for (int i = 0; i < (int)argc; i++) {
-        if (i > 0) printf("%s", vm->rec.ofs);
-        xf_Value sv = xf_coerce_str(args[i]);
-        if (sv.state == XF_STATE_OK && sv.data.str) {
-            printf("%s", sv.data.str->data);
-        } else {
-            printf("%s", XF_STATE_NAMES[args[i].state]);
-        }
-        xf_value_release(sv);
-        xf_value_release(args[i]);
-    }
-    printf("%s", vm->rec.ors);
-    break;
-}
-case OP_PRINTF: {
-    uint8_t argc = frame->chunk->code[frame->ip++];
-    xf_Value args[64];
-
-    if (argc > 64) {
-        vm_error(vm, "printf: too many args");
-        goto err;
-    }
-
-    for (int i = (int)argc - 1; i >= 0; i--) {
-        args[i] = vm_pop(vm);
-    }
-
-    if (argc == 0) break;
-
-    xf_Value fmtv = xf_coerce_str(args[0]);
-    if (fmtv.state != XF_STATE_OK || !fmtv.data.str) {
-        xf_value_release(fmtv);
-        for (int i = 0; i < (int)argc; i++) xf_value_release(args[i]);
-        vm_error(vm, "printf format must be a string");
-        goto err;
-    }
-
-    const char *fmt = fmtv.data.str->data;
-    size_t argi = 1;
-
-    for (size_t i = 0; fmt[i] != '\0'; i++) {
-        if (fmt[i] == '%' && fmt[i + 1] != '\0') {
-            char spec = fmt[i + 1];
-
-            if (spec == '%') {
-                putchar('%');
-                i++;
-                continue;
-            }
-
-            if (argi >= argc) {
-                putchar('%');
-                putchar(spec);
-                i++;
-                continue;
-            }
-
-            xf_Value sv = xf_coerce_str(args[argi]);
-            if (sv.state == XF_STATE_OK && sv.data.str) {
-                fputs(sv.data.str->data, stdout);
-            } else {
-                fputs(XF_STATE_NAMES[args[argi].state], stdout);
-            }
-            xf_value_release(sv);
-
-            argi++;
-            i++;
-            continue;
-        }
-
-        putchar((unsigned char)fmt[i]);
-    }
-
-    xf_value_release(fmtv);
-    for (int i = 0; i < (int)argc; i++) {
-        xf_value_release(args[i]);
-    }
-    break;
-}
-                                                case OP_MAKE_ARR: {
-                uint16_t n = (uint16_t)((frame->chunk->code[frame->ip] << 8) |
-                                        frame->chunk->code[frame->ip + 1]);
-                frame->ip += 2;
-
-                xf_arr_t *a = xf_arr_new();
-                if (!a) {
-                    vm_error(vm, "failed to allocate array");
-                    goto err;
-                }
-
-                xf_Value *items = n ? calloc(n, sizeof(xf_Value)) : NULL;
-                if (n && !items) {
-                    xf_arr_release(a);
-                    vm_error(vm, "failed to allocate array staging");
-                    goto err;
-                }
-
-                for (uint16_t i = 0; i < n; i++) {
-                    items[n - 1 - i] = vm_pop(vm);
-                }
-
-                for (uint16_t i = 0; i < n; i++) {
-                    xf_arr_push(a, items[i]);
-                    xf_value_release(items[i]);
-                }
-                free(items);
-
-                xf_Value out = xf_val_ok_arr(a);
-                xf_arr_release(a);
-                vm_push(vm, out);
-                xf_value_release(out);
-                break;
-            }
-
-            case OP_MAKE_TUPLE: {
-                uint16_t n = (uint16_t)((frame->chunk->code[frame->ip] << 8) |
-                                        frame->chunk->code[frame->ip + 1]);
-                frame->ip += 2;
-
-                xf_Value *items = n ? calloc(n, sizeof(xf_Value)) : NULL;
-                if (n && !items) {
-                    vm_error(vm, "failed to allocate tuple staging");
-                    goto err;
-                }
-
-                for (uint16_t i = 0; i < n; i++) {
-                    items[n - 1 - i] = vm_pop(vm);
-                }
-
-                xf_tuple_t *t = xf_tuple_new(items, n);
-
-                for (uint16_t i = 0; i < n; i++) {
-                    xf_value_release(items[i]);
-                }
-                free(items);
-
-                if (!t) {
-                    vm_error(vm, "failed to allocate tuple");
-                    goto err;
-                }
-
-                xf_Value out = xf_val_ok_tuple(t);
-                xf_tuple_release(t);
-                vm_push(vm, out);
-                xf_value_release(out);
-                break;
-            }
-
-            case OP_MAKE_MAP: {
-                uint16_t n = (uint16_t)((frame->chunk->code[frame->ip] << 8) |
-                                        frame->chunk->code[frame->ip + 1]);
-                frame->ip += 2;
-
-                xf_map_t *m = xf_map_new();
-                if (!m) {
-                    vm_error(vm, "failed to allocate map");
-                    goto err;
-                }
-
-                xf_Value *keys = n ? calloc(n, sizeof(xf_Value)) : NULL;
-                xf_Value *vals = n ? calloc(n, sizeof(xf_Value)) : NULL;
-                if (n && (!keys || !vals)) {
-                    free(keys);
-                    free(vals);
-                    xf_map_release(m);
-                    vm_error(vm, "failed to allocate map staging");
-                    goto err;
-                }
-
-                for (uint16_t i = 0; i < n; i++) {
-                    vals[n - 1 - i] = vm_pop(vm);
-                    keys[n - 1 - i] = vm_pop(vm);
-                }
-
-                for (uint16_t i = 0; i < n; i++) {
-                    xf_Value ks = xf_coerce_str(keys[i]);
-                    if (ks.state == XF_STATE_OK && ks.data.str) {
-                        xf_map_set(m, ks.data.str, vals[i]);
-                    }
-                    xf_value_release(ks);
-                    xf_value_release(keys[i]);
-                    xf_value_release(vals[i]);
-                }
-
-                free(keys);
-                free(vals);
-
-                xf_Value out = xf_val_ok_map(m);
-                xf_map_release(m);
-                vm_push(vm, out);
-                xf_value_release(out);
-                break;
-            }
-
-            case OP_MAKE_SET: {
-                uint16_t n = (uint16_t)((frame->chunk->code[frame->ip] << 8) |
-                                        frame->chunk->code[frame->ip + 1]);
-                frame->ip += 2;
-
-                xf_set_t *s = xf_set_new();
-                if (!s) {
-                    vm_error(vm, "failed to allocate set");
-                    goto err;
-                }
-
-                xf_Value *items = n ? calloc(n, sizeof(xf_Value)) : NULL;
-                if (n && !items) {
-                    xf_set_release(s);
-                    vm_error(vm, "failed to allocate set staging");
-                    goto err;
-                }
-
-                for (uint16_t i = 0; i < n; i++) {
-                    items[n - 1 - i] = vm_pop(vm);
-                }
-
-                for (uint16_t i = 0; i < n; i++) {
-                    xf_set_add(s, items[i]);
-                    xf_value_release(items[i]);
-                }
-                free(items);
-
-                xf_Value out = xf_val_ok_set(s);
-                xf_set_release(s);
-                vm_push(vm, out);
-                xf_value_release(out);
-                break;
-            }
-            case OP_PUSH_CONST: {
-    uint32_t idx = read_u32(frame->chunk, frame->ip);
-    frame->ip += 4;
-
-    if (idx >= frame->chunk->const_len) {
-        vm_error(vm, "PUSH_CONST constant index out of range");
-        goto err;
-    }
-
-    xf_Value v = xf_value_retain(frame->chunk->consts[idx]);
-    vm_push(vm, v);
-    xf_value_release(v);
-    break;
-}
-
-case OP_PUSH_STR: {
-    uint32_t idx =
-        ((uint32_t)frame->chunk->code[frame->ip] << 24) |
-        ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
-        ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
-        (uint32_t)frame->chunk->code[frame->ip + 3];
-    frame->ip += 4;
-
-    if (idx >= frame->chunk->const_len) {
-        vm_error(vm, "PUSH_STR constant index out of range");
-        goto err;
-    }
-
-    xf_Value v = xf_value_retain(frame->chunk->consts[idx]);
-    vm_push(vm, v);
-    xf_value_release(v);
-    break;
-}
-
-            case OP_PUSH_TRUE:  vm_push(vm, xf_val_true()); break;
-            case OP_PUSH_FALSE: vm_push(vm, xf_val_false()); break;
-            case OP_PUSH_NULL:  vm_push(vm, xf_val_null()); break;
-            case OP_PUSH_UNDEF: vm_push(vm, xf_val_undef(XF_TYPE_VOID)); break;
-
-            case OP_POP:
-                xf_value_release(vm_pop(vm));
-                break;
-
-            case OP_DUP:
-                vm_push(vm, vm_peek(vm, 0));
-                break;
-
-            case OP_SWAP: {
-                xf_Value top = vm_pop(vm);
-                xf_Value sec = vm_pop(vm);
-                vm_push(vm, top);
-                vm_push(vm, sec);
-                xf_value_release(top);
-                xf_value_release(sec);
-                break;
-            }
-            case OP_GET_MEMBER: {
-    uint32_t idx = read_u32(frame->chunk, frame->ip);
-    frame->ip += 4;
-
-    if (idx >= frame->chunk->const_len) {
-        vm_error(vm, "GET_MEMBER constant index out of range");
-        goto err;
-    }
-
-    xf_Value obj  = vm_pop(vm);
-    xf_Value keyv = xf_value_retain(frame->chunk->consts[idx]);
-
-    if (keyv.state != XF_STATE_OK || keyv.type != XF_TYPE_STR || !keyv.data.str) {
-        xf_value_release(obj);
-        xf_value_release(keyv);
-        vm_error(vm, "GET_MEMBER requires string field name");
-        goto err;
-    }
-
-    const char *field = keyv.data.str->data;
-    xf_Value out = xf_val_nav(XF_TYPE_VOID);
-
-    if (obj.state == XF_STATE_OK &&
-        obj.type == XF_TYPE_MODULE &&
-        obj.data.mod) {
-        out = xf_module_get(obj.data.mod, field);
-    }
-
-    xf_value_release(obj);
-    xf_value_release(keyv);
-    vm_push(vm, out);
-    xf_value_release(out);
-    break;
-}
-            case OP_LOAD_LOCAL: {
-                uint8_t slot = frame->chunk->code[frame->ip++];
-                vm_push(vm, frame->locals[slot]);
-                break;
-            }
-
-            case OP_LOAD_GLOBAL: {
-                uint32_t idx =
-                    ((uint32_t)frame->chunk->code[frame->ip] << 24) |
-                    ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
-                    ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
-                    (uint32_t)frame->chunk->code[frame->ip + 3];
-                frame->ip += 4;
-                vm_push(vm, idx < vm->global_count ? vm->globals[idx] : xf_val_undef(XF_TYPE_VOID));
-                break;
-            }
-            case OP_STORE_LOCAL: {
-    uint8_t slot = frame->chunk->code[frame->ip++];
-
-    xf_Value v = vm_pop(vm);
-
-    xf_value_release(frame->locals[slot]);
-    frame->locals[slot] = xf_value_retain(v);
-    if (frame->local_count <= slot) frame->local_count = slot + 1;
-
-    xf_value_release(v);
-    break;
-}
-case OP_STORE_GLOBAL: {
-    uint32_t idx =
-        ((uint32_t)frame->chunk->code[frame->ip] << 24) |
-        ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
-        ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
-        (uint32_t)frame->chunk->code[frame->ip + 3];
-    frame->ip += 4;
-
-    xf_Value v = vm_pop(vm);
-    if (idx < vm->global_count) {
-        xf_value_release(vm->globals[idx]);
-        vm->globals[idx] = xf_value_retain(v);
-    } else {
-        xf_value_release(v);
-        vm_error(vm, "bad global slot");
-        goto err;
-    }
-
-    break;
-}
-            case OP_ADD: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value r = val_add(a, b);
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(r);
-                break;
-            }
-
-            case OP_SUB: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value r = val_sub(a, b);
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(r);
-                break;
-            }
-
-            case OP_MUL: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value r = val_mul(a, b);
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(r);
-                break;
-            }
-
-            case OP_DIV: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value r = val_div(vm, a, b);
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(r);
-                break;
-            }
-
-            case OP_MOD: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value r = val_mod(vm, a, b);
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(r);
-                break;
-            }
-            case OP_NEG: {
-    a = vm_pop(vm);
-    xf_Value n = xf_coerce_num(a);
-
-    if (n.state == XF_STATE_OK) {
-        xf_Value r = xf_val_ok_num(-n.data.num);
-        vm_push(vm, r);
-        xf_value_release(r);
-        xf_value_release(n);
-    } else {
-        vm_push(vm, n);
-        xf_value_release(n);
-    }
-
-    xf_value_release(a);
-    break;
-}
-
-            case OP_EQ: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value r = val_eq(a, b) ? xf_val_true() : xf_val_false();
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(r);
-                break;
-            }
-
-            case OP_NEQ: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value r = val_eq(a, b) ? xf_val_false() : xf_val_true();
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(r);
-                break;
-            }
-
-            case OP_LT: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value r = (val_cmp(a, b) < 0) ? xf_val_true() : xf_val_false();
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(r);
-                break;
-            }
-
-            case OP_GT: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value r = (val_cmp(a, b) > 0) ? xf_val_true() : xf_val_false();
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(r);
-                break;
-            }
-
-            case OP_LTE: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value r = (val_cmp(a, b) <= 0) ? xf_val_true() : xf_val_false();
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(r);
-                break;
-            }
-
-            case OP_GTE: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value r = (val_cmp(a, b) >= 0) ? xf_val_true() : xf_val_false();
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(r);
-                break;
-            }
-
-            case OP_CONCAT: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value r = val_concat(a, b);
-                vm_push(vm, r);
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(r);
-                break;
-            }
-
-            case OP_GET_LEN: {
-                a = vm_pop(vm);
-                xf_Value r;
-                if (a.state != XF_STATE_OK) {
-                    r = xf_value_retain(a);
-                } else {
-                    switch (a.type) {
-                        case XF_TYPE_STR:   r = xf_val_ok_num(a.data.str ? (double)a.data.str->len : 0.0); break;
-                        case XF_TYPE_ARR:   r = xf_val_ok_num(a.data.arr ? (double)a.data.arr->len : 0.0); break;
-                        case XF_TYPE_TUPLE: r = xf_val_ok_num(a.data.tuple ? (double)xf_tuple_len(a.data.tuple) : 0.0); break;
-                        case XF_TYPE_MAP:   r = xf_val_ok_num(a.data.map ? (double)xf_map_count(a.data.map) : 0.0); break;
-                        case XF_TYPE_SET:   r = xf_val_ok_num(a.data.set ? (double)xf_set_count(a.data.set) : 0.0); break;
-                        default:            r = xf_val_nav(XF_TYPE_NUM); break;
-                    }
-                }
-                xf_value_release(a);
-                vm_push(vm, r);
-                xf_value_release(r);
-                break;
-            }
-
-            case OP_GET_IDX: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                xf_Value out = xf_val_nav(XF_TYPE_VOID);
-
-                if (a.state != XF_STATE_OK) {
-                    out = xf_value_retain(a);
-                } else if (b.state != XF_STATE_OK) {
-                    out = xf_value_retain(b);
-                } else if (a.type == XF_TYPE_ARR) {
-                    xf_Value nk = xf_coerce_num(b);
-                    if (nk.state == XF_STATE_OK && a.data.arr) {
-                        long idx = (long)nk.data.num;
-                        if (idx >= 0 && (size_t)idx < a.data.arr->len)
-                            out = xf_arr_get(a.data.arr, (size_t)idx);
-                    }
-                    xf_value_release(nk);
-                } else if (a.type == XF_TYPE_TUPLE) {
-                    xf_Value nk = xf_coerce_num(b);
-                    if (nk.state == XF_STATE_OK && a.data.tuple) {
-                        long idx = (long)nk.data.num;
-                        if (idx >= 0 && (size_t)idx < xf_tuple_len(a.data.tuple))
-                            out = xf_tuple_get(a.data.tuple, (size_t)idx);
-                    }
-                    xf_value_release(nk);
-                } else if (a.type == XF_TYPE_MAP) {
-                    xf_Value ks = xf_coerce_str(b);
-                    if (ks.state == XF_STATE_OK && ks.data.str && a.data.map)
-                        out = xf_map_get(a.data.map, ks.data.str);
-                    xf_value_release(ks);
-                } else if (a.type == XF_TYPE_STR) {
-                    xf_Value nk = xf_coerce_num(b);
-                    if (nk.state == XF_STATE_OK && a.data.str) {
-                        long idx = (long)nk.data.num;
-                        if (idx >= 0 && (size_t)idx < a.data.str->len) {
-                            char ch[2] = { a.data.str->data[idx], '\0' };
-                            xf_Str *s = xf_str_from_cstr(ch);
-                            out = xf_val_ok_str(s);
-                            xf_str_release(s);
-                        }
-                    }
-                    xf_value_release(nk);
-                }
-
-                xf_value_release(a);
-                xf_value_release(b);
-                vm_push(vm, out);
-                xf_value_release(out);
-                break;
-            }
-
-            case OP_JUMP: {
-                int16_t delta = (int16_t)((frame->chunk->code[frame->ip] << 8) | frame->chunk->code[frame->ip + 1]);
-                frame->ip += 2;
-                frame->ip += (size_t)((int)delta);
-                break;
-            }
-
-            case OP_JUMP_IF: {
-                int16_t delta = (int16_t)((frame->chunk->code[frame->ip] << 8) | frame->chunk->code[frame->ip + 1]);
-                frame->ip += 2;
-                a = vm_pop(vm);
-                if (((a.state == XF_STATE_TRUE) ||
-                     (a.state == XF_STATE_OK && a.type == XF_TYPE_NUM && a.data.num != 0.0))) {
-                    frame->ip += (size_t)((int)delta);
-                }
-                xf_value_release(a);
-                break;
-            }
-
-            case OP_JUMP_NOT: {
-                int16_t delta = (int16_t)((frame->chunk->code[frame->ip] << 8) | frame->chunk->code[frame->ip + 1]);
-                frame->ip += 2;
-                a = vm_pop(vm);
-                bool truth =
-                    (a.state == XF_STATE_TRUE) ||
-                    (a.state == XF_STATE_OK && a.type == XF_TYPE_NUM && a.data.num != 0.0);
-                if (!truth) frame->ip += (size_t)((int)delta);
-                xf_value_release(a);
-                break;
-            }
-
-            case OP_RETURN:
-                frame->return_val = vm_pop(vm);
-                goto done;
-
-            case OP_RETURN_NULL:
-                frame->return_val = xf_val_null();
-                goto done;
-
-            case OP_CALL: {
-                uint8_t argc_u8 = frame->chunk->code[frame->ip++];
-                size_t argc2 = (size_t)argc_u8;
-                xf_Value argv2[64];
-
-                if (argc2 > 64) {
-                    vm_error(vm, "too many call args");
-                    goto err;
-                }
-
-                for (int i = (int)argc2 - 1; i >= 0; i--) {
-                    argv2[i] = vm_pop(vm);
-                }
-
-                xf_Value callee = vm_pop(vm);
-
-                if (callee.state != XF_STATE_OK || callee.type != XF_TYPE_FN || !callee.data.fn) {
-                    for (size_t i = 0; i < argc2; i++) xf_value_release(argv2[i]);
-                    xf_value_release(callee);
-                    vm_error(vm, "attempt to call non-function");
-                    goto err;
-                }
-
-                xf_fn_t *fn = callee.data.fn;
-                xf_Value ret = xf_val_null();
-
-                if (fn->is_native && fn->native_v) {
-                    ret = fn->native_v(argv2, argc2);
-                } else {
-                    Chunk *fn_chunk = (Chunk *)fn->body;
-                    ret = vm_call_compiled_fn(vm, fn_chunk, argv2, argc2);
-                }
-
-                for (size_t i = 0; i < argc2; i++) xf_value_release(argv2[i]);
-                xf_value_release(callee);
-
-                vm_push(vm, ret);
-                xf_value_release(ret);
-                break;
-            }
-
-            default:
-                vm_error(vm, "opcode not implemented in compiled fn: %d", op);
-                goto err;
-        }
-
-        if (vm->had_error) goto err;
-    }
-
-done: {
-        xf_Value ret = frame->return_val;
-
-        for (size_t i = 0; i < frame->local_count; i++) {
-            xf_value_release(frame->locals[i]);
-        }
-        frame->local_count = 0;
-
-        vm->frame_count--;
-        return ret;
-    }
-
-err:
-    for (size_t i = 0; i < frame->local_count; i++) {
-        xf_value_release(frame->locals[i]);
-    }
-    frame->local_count = 0;
-    vm->frame_count--;
-    return xf_val_nav(XF_TYPE_VOID);
-}
 void chunk_init(Chunk *c, const char *source) {
     memset(c, 0, sizeof(*c));
     c->source    = source;
@@ -809,12 +31,23 @@ void chunk_init(Chunk *c, const char *source) {
     c->const_cap = 16;
     c->consts    = malloc(sizeof(xf_Value) * c->const_cap);
 }
-
 void chunk_free(Chunk *c) {
     if (!c) return;
 
+    fprintf(stderr,
+            "[chunk_free] chunk=%p const_len=%zu code_len=%zu\n",
+            (void *)c,
+            c->const_len,
+            c->len);
+
     if (c->consts) {
         for (size_t i = 0; i < c->const_len; i++) {
+            fprintf(stderr,
+                    "  [free const %zu] state=%s type=%s\n",
+                    i,
+                    c->consts[i].state < XF_STATE_COUNT ? XF_STATE_NAMES[c->consts[i].state] : "?",
+                    c->consts[i].type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[c->consts[i].type]   : "?");
+
             xf_value_release(c->consts[i]);
         }
     }
@@ -860,14 +93,25 @@ void chunk_write_f64(Chunk *c, double v, uint32_t line) {
 }
 
 uint32_t chunk_add_const(Chunk *c, xf_Value v) {
-    if (c->const_len >= c->const_cap) {
-        c->const_cap *= 2;
-        c->consts = realloc(c->consts, sizeof(xf_Value) * c->const_cap);
-    }
-    c->consts[c->const_len] = xf_value_retain(v);
-    return (uint32_t)c->const_len++;
-}
+    if (!c) return UINT32_MAX;
 
+    if (c->const_len >= c->const_cap) {
+        size_t new_cap = c->const_cap ? c->const_cap * 2 : 8;
+        xf_Value *tmp = realloc(c->consts, new_cap * sizeof(xf_Value));
+        if (!tmp) return UINT32_MAX;
+
+        for (size_t i = c->const_cap; i < new_cap; i++) {
+            tmp[i] = xf_val_null();
+        }
+
+        c->consts = tmp;
+        c->const_cap = new_cap;
+    }
+
+    uint32_t idx = (uint32_t)c->const_len;
+    c->consts[c->const_len++] = xf_value_retain(v);
+    return idx;
+}
 uint32_t chunk_add_str_const(Chunk *c, const char *s, size_t len) {
     xf_Str *str = xf_str_new(s, len);
     xf_Value v  = xf_val_ok_str(str);
@@ -917,6 +161,7 @@ const char *opcode_name(OpCode op) {
         case OP_LOAD_ORS: return "LOAD_ORS";
         case OP_ADD: return "ADD";
         case OP_SUB: return "SUB";
+        case OP_INSPECT: return "INSPECT";
         case OP_MUL: return "MUL";
         case OP_DIV: return "DIV";
         case OP_MOD: return "MOD";
@@ -1213,7 +458,7 @@ xf_Value vm_pop(VM *vm) {
 
     xf_Value v = vm->stack[--vm->stack_top];
     vm->stack[vm->stack_top] = xf_val_null();
-    return xf_value_retain(v);
+    return v;
 }
 xf_Value vm_peek(const VM *vm, int dist) {
     if ((size_t)dist >= vm->stack_top) return xf_val_nav(XF_TYPE_VOID);
@@ -1779,14 +1024,29 @@ static VMResult vm_run_chunk_internal(VM *vm, Chunk *chunk, xf_Value *args, size
             case OP_PUSH_FALSE: vm_push(vm, xf_val_false()); break;
             case OP_PUSH_NULL:  vm_push(vm, xf_val_null()); break;
             case OP_PUSH_UNDEF: vm_push(vm, xf_val_undef(XF_TYPE_VOID)); break;
+            case OP_POP: {
+    xf_Value v = vm_pop(vm);
+    xf_value_release(v);
+    break;
+}
+case OP_INSPECT: {
+    xf_Value v = vm_pop(vm);
 
-            case OP_POP:
-                xf_value_release(vm_pop(vm));
-                break;
+    xf_value_print(v);
+    printf("                                              [%s,%s]\n",
+           v.type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[v.type]   : "?",
+           v.state < XF_STATE_COUNT ? XF_STATE_NAMES[v.state] : "?");
 
-            case OP_DUP:
-                vm_push(vm, vm_peek(vm, 0));
-                break;
+    xf_value_release(v);
+    break;
+}
+            case OP_DUP: {
+    xf_Value v = xf_value_retain(vm_peek(vm, 0));
+    vm_push(vm, v);
+    xf_value_release(v);
+    break;
+}
+
 
             case OP_SWAP: {
                 xf_Value top = vm_pop(vm);
@@ -1797,12 +1057,22 @@ static VMResult vm_run_chunk_internal(VM *vm, Chunk *chunk, xf_Value *args, size
                 xf_value_release(sec);
                 break;
             }
-
             case OP_LOAD_LOCAL: {
-                uint8_t slot = READ_U8();
-                vm_push(vm, frame->locals[slot]);
-                break;
-            }
+    uint8_t slot = READ_U8();
+
+    if (slot >= frame->local_count) {
+        xf_Value undef = xf_val_undef(XF_TYPE_VOID);
+        vm_push(vm, undef);
+        xf_value_release(undef);
+        break;
+    }
+
+    xf_Value v = xf_value_retain(frame->locals[slot]);
+    vm_push(vm, v);
+    xf_value_release(v);
+    break;
+}
+
 
             case OP_STORE_LOCAL: {
                 uint8_t slot = READ_U8();
@@ -1814,18 +1084,40 @@ static VMResult vm_run_chunk_internal(VM *vm, Chunk *chunk, xf_Value *args, size
                 break;
             }
 
-            case OP_LOAD_GLOBAL: {
-                uint32_t idx =
-                    ((uint32_t)frame->chunk->code[frame->ip] << 24) |
-                    ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
-                    ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
-                    (uint32_t)frame->chunk->code[frame->ip + 3];
-                frame->ip += 4;
-                xf_Value gv = (idx < vm->global_count) ? vm->globals[idx] : xf_val_undef(XF_TYPE_VOID);
-                vm_push(vm, gv);
-                break;
-            }
+/*            case OP_LOAD_GLOBAL: {
+    uint32_t idx =
+        ((uint32_t)frame->chunk->code[frame->ip] << 24) |
+        ((uint32_t)frame->chunk->code[frame->ip + 1] << 16) |
+        ((uint32_t)frame->chunk->code[frame->ip + 2] << 8) |
+        (uint32_t)frame->chunk->code[frame->ip + 3];
+    frame->ip += 4;
 
+    xf_Value gv = (idx < vm->global_count)
+        ? xf_value_retain(vm->globals[idx])
+        : xf_val_undef(XF_TYPE_VOID);
+
+    vm_push(vm, gv);
+    xf_value_release(gv);
+    break;
+}
+*/
+case OP_LOAD_GLOBAL: {
+    uint32_t idx = READ_U32();
+
+    xf_Value gv = (idx < vm->global_count)
+        ? vm->globals[idx]
+        : xf_val_undef(XF_TYPE_VOID);
+
+    fprintf(stderr,
+            "[LOAD_GLOBAL] ip=%zu idx=%u state=%s type=%s\n",
+            frame->ip - 5,
+            idx,
+            gv.state < XF_STATE_COUNT ? XF_STATE_NAMES[gv.state] : "?",
+            gv.type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[gv.type]   : "?");
+
+    vm_push(vm, gv);
+    break;
+}
             case OP_STORE_GLOBAL: {
                 uint32_t idx =
                     ((uint32_t)frame->chunk->code[frame->ip] << 24) |
@@ -2014,50 +1306,60 @@ static VMResult vm_run_chunk_internal(VM *vm, Chunk *chunk, xf_Value *args, size
             case OP_CONCAT: b = vm_pop(vm); a = vm_pop(vm); { xf_Value r = val_concat(a,b); vm_push(vm,r); xf_value_release(a); xf_value_release(b); xf_value_release(r); } break;
 
             case OP_MATCH:
-            case OP_NMATCH: {
-                b = vm_pop(vm);
-                a = vm_pop(vm);
+case OP_NMATCH: {
+    b = vm_pop(vm);
+    a = vm_pop(vm);
 
-                xf_Value sa = xf_coerce_str(a);
-                bool found = false;
+    xf_Value sa = xf_coerce_str(a);
+    bool found = false;
 
-                if (sa.state == XF_STATE_OK && sa.type == XF_TYPE_STR && sa.data.str &&
-                    b.state == XF_STATE_OK) {
-                    const char *pat = NULL;
-                    int cflags = REG_EXTENDED;
+    if (sa.state == XF_STATE_OK &&
+        sa.type == XF_TYPE_STR &&
+        sa.data.str &&
+        b.state == XF_STATE_OK) {
 
-                    if (b.type == XF_TYPE_REGEX && b.data.re && b.data.re->pattern) {
-                        pat = b.data.re->pattern->data;
-                        if (b.data.re->flags & XF_RE_ICASE)     cflags |= REG_ICASE;
-                        if (b.data.re->flags & XF_RE_MULTILINE) cflags |= REG_NEWLINE;
-                    } else {
-                        xf_Value sb = xf_coerce_str(b);
-                        if (sb.state == XF_STATE_OK && sb.type == XF_TYPE_STR && sb.data.str) {
-                            pat = sb.data.str->data;
-                        }
-                        xf_value_release(sb);
-                    }
+        const char *pat = NULL;
+        xf_Value sb = xf_val_null();
+        bool using_sb = false;
+        int cflags = REG_EXTENDED;
 
-                    if (pat) {
-                        regex_t re;
-                        int rc = regcomp(&re, pat, cflags);
-                        if (rc == 0) {
-                            found = (regexec(&re, sa.data.str->data, 0, NULL, 0) == 0);
-                            regfree(&re);
-                        }
-                    }
-                }
-
-                xf_Value r = ((op == OP_MATCH) == found) ? xf_val_true() : xf_val_false();
-                vm_push(vm, r);
-
-                xf_value_release(a);
-                xf_value_release(b);
-                xf_value_release(sa);
-                xf_value_release(r);
-                break;
+        if (b.type == XF_TYPE_REGEX && b.data.re && b.data.re->pattern) {
+            pat = b.data.re->pattern->data;
+            if (b.data.re->flags & XF_RE_ICASE)     cflags |= REG_ICASE;
+            if (b.data.re->flags & XF_RE_MULTILINE) cflags |= REG_NEWLINE;
+        } else {
+            sb = xf_coerce_str(b);
+            if (sb.state == XF_STATE_OK &&
+                sb.type == XF_TYPE_STR &&
+                sb.data.str) {
+                pat = sb.data.str->data;
+                using_sb = true;
             }
+        }
 
+        if (pat) {
+            regex_t re;
+            int rc = regcomp(&re, pat, cflags);
+            if (rc == 0) {
+                found = (regexec(&re, sa.data.str->data, 0, NULL, 0) == 0);
+                regfree(&re);
+            }
+        }
+
+        if (using_sb) {
+            xf_value_release(sb);
+        }
+    }
+
+    xf_Value r = ((op == OP_MATCH) == found) ? xf_val_true() : xf_val_false();
+    vm_push(vm, r);
+
+    xf_value_release(a);
+    xf_value_release(b);
+    xf_value_release(sa);
+    xf_value_release(r);
+    break;
+}
 
             case OP_GET_STATE: {
     a = vm_pop(vm);
@@ -2156,15 +1458,21 @@ case OP_GET_TYPE: {
                 break;
             }
 
-            case OP_COALESCE:
-                b = vm_pop(vm);
-                a = vm_pop(vm);
-                if (a.state == XF_STATE_OK) vm_push(vm, a);
-                else vm_push(vm, b);
-                xf_value_release(a);
-                xf_value_release(b);
-                break;
+            case OP_COALESCE: {
+    b = vm_pop(vm);
+    a = vm_pop(vm);
 
+    xf_Value out = (a.state == XF_STATE_OK)
+        ? xf_value_retain(a)
+        : xf_value_retain(b);
+
+    vm_push(vm, out);
+
+    xf_value_release(out);
+    xf_value_release(a);
+    xf_value_release(b);
+    break;
+}
             case OP_PRINT: {
                 uint8_t argc = READ_U8();
                 xf_Value args[64];
@@ -2278,341 +1586,159 @@ case OP_GET_TYPE: {
                 xf_value_release(a);
                 break;
             }
-
             case OP_CALL: {
-                uint8_t argc2 = READ_U8();
-                xf_Value argv2[64];
+    uint8_t argc2 = READ_U8();
+    xf_Value argv2[64];
 
-                if (argc2 > 64) {
-                    vm_error(vm, "too many call args");
-                    goto err;
-                }
+    /*
+     * frame->ip is already past OP_CALL + argc byte because READ_U8()
+     * consumed the argc operand. So the opcode itself is ip - 2.
+     */
+    size_t call_ip = frame->ip >= 2 ? (size_t)(frame->ip - 2) : 0;
 
-                for (int i = (int)argc2 - 1; i >= 0; i--) {
-                    argv2[i] = vm_pop(vm);
-                }
-
-                xf_Value callee = vm_pop(vm);
-
-                if (callee.state != XF_STATE_OK ||
-                    callee.type  != XF_TYPE_FN ||
-                    !callee.data.fn) {
-                    for (size_t i = 0; i < argc2; i++) xf_value_release(argv2[i]);
-                    xf_value_release(callee);
-                    vm_error(vm, "attempt to call non-function");
-                    goto err;
-                }
-
-                xf_fn_t *fn = callee.data.fn;
-                xf_Value ret = xf_val_null();
-
-                if (fn->is_native && fn->native_v) {
-                    ret = fn->native_v(argv2, argc2);
-                    } else {
-    Chunk *fn_chunk = (Chunk *)fn->body;
-    ret = vm_call_function_chunk(vm, fn_chunk, argv2, argc2);
-
-    if (vm->should_exit) {
-        for (size_t i = 0; i < argc2; i++) xf_value_release(argv2[i]);
-        xf_value_release(callee);
-        xf_value_release(ret);
-        return VM_EXIT;
+    uint32_t call_line = 0;
+    if (frame->chunk && frame->chunk->lines && call_ip < frame->chunk->len) {
+        call_line = frame->chunk->lines[call_ip];
     }
 
-    if (ret.state == XF_STATE_NAV && vm->had_error) {
-        for (size_t i = 0; i < argc2; i++) xf_value_release(argv2[i]);
-        xf_value_release(callee);
-        xf_value_release(ret);
-        goto err;
-    }
-}
-                for (size_t i = 0; i < argc2; i++) xf_value_release(argv2[i]);
-                xf_value_release(callee);
+    const char *chunk_name = "<chunk>";
 
-                vm_push(vm, ret);
-                xf_value_release(ret);
-                break;
-            }
+    fprintf(stderr,
+            "\n[OP_CALL ENTER] chunk=%s line=%u ip=%zu argc=%u stack_top=%zu\n",
+            chunk_name,
+            call_line,
+            call_ip,
+            (unsigned)argc2,
+            vm->stack_top);
 
-            case OP_SPAWN: {
-                uint8_t argc2 = READ_U8();
-                xf_Value argv2[64];
-
-                if (argc2 > 64) {
-                    vm_error(vm, "too many spawn args");
-                    goto err;
-                }
-
-                for (int i = (int)argc2 - 1; i >= 0; i--) {
-                    argv2[i] = vm_pop(vm);
-                }
-
-                xf_Value callee = vm_pop(vm);
-
-                if (callee.state != XF_STATE_OK ||
-                    callee.type  != XF_TYPE_FN ||
-                    !callee.data.fn) {
-                    for (size_t i = 0; i < argc2; i++) xf_value_release(argv2[i]);
-                    xf_value_release(callee);
-                    vm_error(vm, "attempt to spawn non-function");
-                    goto err;
-                }
-
-                xf_fn_t *fn = callee.data.fn;
-                xf_Value ret = xf_val_null();
-
-                if (fn->is_native && fn->native_v) {
-                    ret = fn->native_v(argv2, argc2);
-                    } else {
-    Chunk *fn_chunk = (Chunk *)fn->body;
-    ret = vm_call_function_chunk(vm, fn_chunk, argv2, argc2);
-
-    if (vm->should_exit) {
-        for (size_t i = 0; i < argc2; i++) xf_value_release(argv2[i]);
-        xf_value_release(callee);
-        xf_value_release(ret);
-        return VM_EXIT;
+    fprintf(stderr, "  stack before pop:\n");
+    size_t before_start = vm->stack_top > 16 ? vm->stack_top - 16 : 0;
+    for (size_t si = before_start; si < vm->stack_top; si++) {
+        xf_Value sv = vm->stack[si];
+        fprintf(stderr,
+                "    stack[%zu] state=%s type=%s\n",
+                si,
+                sv.state < XF_STATE_COUNT ? XF_STATE_NAMES[sv.state] : "?",
+                sv.type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[sv.type]   : "?");
     }
 
-    if (ret.state == XF_STATE_NAV && vm->had_error) {
-        for (size_t i = 0; i < argc2; i++) xf_value_release(argv2[i]);
-        xf_value_release(callee);
-        xf_value_release(ret);
-        goto err;
-    }
-}
+    if (argc2 > 64) {
+        fprintf(stderr,
+                "VM ERR [%s:%u ip=%zu]: too many call args: %u\n",
+                chunk_name,
+                call_line,
+                call_ip,
+                (unsigned)argc2);
 
-                int handle = -1;
-                for (int i = 0; i < 256; i++) {
-                    if (!vm->tasks[i].used) {
-                        handle = i;
-                        break;
-                    }
-                }
-
-                if (handle < 0) {
-                    for (size_t i = 0; i < argc2; i++) xf_value_release(argv2[i]);
-                    xf_value_release(callee);
-                    xf_value_release(ret);
-                    vm_error(vm, "no free task slots");
-                    goto err;
-                }
-
-                vm->tasks[handle].used   = true;
-                vm->tasks[handle].done   = true;
-                xf_value_release(vm->tasks[handle].result);
-                vm->tasks[handle].result = xf_value_retain(ret);
-
-                for (size_t i = 0; i < argc2; i++) xf_value_release(argv2[i]);
-                xf_value_release(callee);
-                xf_value_release(ret);
-
-                xf_Value hv = xf_val_ok_num((double)handle);
-                vm_push(vm, hv);
-                xf_value_release(hv);
-                break;
-            }
-
-            case OP_JOIN: {
-                xf_Value handle_v = vm_pop(vm);
-                xf_Value nk = xf_coerce_num(handle_v);
-
-                if (nk.state != XF_STATE_OK) {
-                    xf_value_release(handle_v);
-                    xf_value_release(nk);
-                    vm_error(vm, "join expects numeric handle");
-                    goto err;
-                }
-
-                long h = (long)nk.data.num;
-                xf_value_release(handle_v);
-                xf_value_release(nk);
-
-                if (h < 0 || h >= 256 || !vm->tasks[h].used) {
-                    vm_error(vm, "invalid join handle");
-                    goto err;
-                }
-
-                xf_Value out = xf_value_retain(vm->tasks[h].result);
-
-                vm->tasks[h].used = false;
-                vm->tasks[h].done = false;
-                xf_value_release(vm->tasks[h].result);
-                vm->tasks[h].result = xf_val_null();
-
-                vm_push(vm, out);
-                xf_value_release(out);
-                break;
-            }
-
-            case OP_RETURN:
-                frame->return_val = vm_pop(vm);
-                goto done;
-
-            case OP_RETURN_NULL:
-                frame->return_val = xf_val_null();
-                goto done;
-
-            case OP_EXIT:
-                vm->should_exit = true;
-                goto done;
-
-            case OP_SUBST:
-            case OP_TRANS:
-            case OP_STORE_FIELD:
-            case OP_YIELD:
-                vm_error(vm, "opcode not implemented yet: %s", opcode_name(op));
-                goto err;
-            case OP_MAKE_ARR: {
-    uint16_t n = read_u16(frame->chunk, frame->ip);
-    frame->ip += 2;
-
-    xf_arr_t *a = xf_arr_new();
-    if (!a) {
-        vm_error(vm, "failed to allocate array");
+        vm_error(vm, "too many call args");
         goto err;
     }
 
-    xf_Value *items = n ? malloc(sizeof(xf_Value) * n) : NULL;
-    if (n && !items) {
-        xf_arr_release(a);
-        vm_error(vm, "failed to allocate array staging buffer");
-        goto err;
+    for (int i = (int)argc2 - 1; i >= 0; i--) {
+        argv2[i] = vm_pop(vm);
     }
 
-    for (uint16_t i = 0; i < n; i++) {
-        items[n - 1 - i] = vm_pop(vm);
-    }
+    xf_Value callee = vm_pop(vm);
 
-    for (uint16_t i = 0; i < n; i++) {
-        xf_arr_push(a, items[i]);
-        xf_value_release(items[i]);
-    }
-    free(items);
+    if (callee.state != XF_STATE_OK ||
+        callee.type  != XF_TYPE_FN ||
+        !callee.data.fn) {
 
-    xf_Value out = xf_val_ok_arr(a);
-    xf_arr_release(a);
-    vm_push(vm, out);
-    xf_value_release(out);
-    break;
-}
+        fprintf(stderr,
+                "\nVM ERR [%s:%u ip=%zu]: attempt to call non-function\n",
+                chunk_name,
+                call_line,
+                call_ip);
 
-case OP_MAKE_MAP: {
-    uint16_t n = read_u16(frame->chunk, frame->ip);
-    frame->ip += 2;
+        fprintf(stderr,
+                "  argc=%u callee state=%s type=%s stack_top=%zu\n",
+                (unsigned)argc2,
+                callee.state < XF_STATE_COUNT ? XF_STATE_NAMES[callee.state] : "?",
+                callee.type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[callee.type]   : "?",
+                vm->stack_top);
 
-    xf_map_t *m = xf_map_new();
-    if (!m) {
-        vm_error(vm, "failed to allocate map");
-        goto err;
-    }
-
-    xf_Value *vals = n ? malloc(sizeof(xf_Value) * n) : NULL;
-    xf_Value *keys = n ? malloc(sizeof(xf_Value) * n) : NULL;
-    if (n && (!vals || !keys)) {
-        free(vals);
-        free(keys);
-        xf_map_release(m);
-        vm_error(vm, "failed to allocate map staging buffers");
-        goto err;
-    }
-
-    for (uint16_t i = 0; i < n; i++) {
-        vals[n - 1 - i] = vm_pop(vm);
-        keys[n - 1 - i] = vm_pop(vm);
-    }
-
-    for (uint16_t i = 0; i < n; i++) {
-        xf_Value ks = xf_coerce_str(keys[i]);
-        if (ks.state == XF_STATE_OK && ks.data.str) {
-            xf_map_set(m, ks.data.str, vals[i]);
-        }
-        xf_value_release(ks);
-        xf_value_release(keys[i]);
-        xf_value_release(vals[i]);
-    }
-
-    free(keys);
-    free(vals);
-
-    xf_Value out = xf_val_ok_map(m);
-    xf_map_release(m);
-    vm_push(vm, out);
-    xf_value_release(out);
-    break;
-}
-
-case OP_MAKE_SET: {
-    uint16_t n = read_u16(frame->chunk, frame->ip);
-    frame->ip += 2;
-
-    xf_set_t *s = xf_set_new();
-    if (!s) {
-        vm_error(vm, "failed to allocate set");
-        goto err;
-    }
-
-    xf_Value *items = n ? malloc(sizeof(xf_Value) * n) : NULL;
-    if (n && !items) {
-        xf_set_release(s);
-        vm_error(vm, "failed to allocate set staging buffer");
-        goto err;
-    }
-
-    for (uint16_t i = 0; i < n; i++) {
-        items[n - 1 - i] = vm_pop(vm);
-    }
-
-    for (uint16_t i = 0; i < n; i++) {
-        xf_set_add(s, items[i]);
-        xf_value_release(items[i]);
-    }
-    free(items);
-
-    xf_Value out = xf_val_ok_set(s);
-    xf_set_release(s);
-    vm_push(vm, out);
-    xf_value_release(out);
-    break;
-}
-
-case OP_MAKE_TUPLE: {
-    uint16_t n = read_u16(frame->chunk, frame->ip);
-    frame->ip += 2;
-
-    xf_Value *items = n ? malloc(sizeof(xf_Value) * n) : NULL;
-    if (n && !items) {
-        vm_error(vm, "failed to allocate tuple staging buffer");
-        goto err;
-    }
-
-    for (uint16_t i = 0; i < n; i++) {
-        items[n - 1 - i] = vm_pop(vm);
-    }
-
-    xf_tuple_t *t = xf_tuple_new(items, n);
-
-    for (uint16_t i = 0; i < n; i++) {
-        xf_value_release(items[i]);
-    }
-    free(items);
-
-    if (!t) {
-        vm_error(vm, "failed to allocate tuple");
-        goto err;
-    }
-
-    xf_Value out = xf_val_ok_tuple(t);
-    xf_tuple_release(t);
-    vm_push(vm, out);
-    xf_value_release(out);
-    break;
-}
-            default:
-                vm_error(vm, "unknown opcode %d", op);
-                goto err;
+        for (size_t i = 0; i < argc2; i++) {
+            fprintf(stderr,
+                    "  arg[%zu] state=%s type=%s\n",
+                    i,
+                    argv2[i].state < XF_STATE_COUNT ? XF_STATE_NAMES[argv2[i].state] : "?",
+                    argv2[i].type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[argv2[i].type]   : "?");
         }
 
+        fprintf(stderr, "  stack after pop:\n");
+        size_t after_start = vm->stack_top > 16 ? vm->stack_top - 16 : 0;
+        for (size_t si = after_start; si < vm->stack_top; si++) {
+            xf_Value sv = vm->stack[si];
+            fprintf(stderr,
+                    "    stack[%zu] state=%s type=%s\n",
+                    si,
+                    sv.state < XF_STATE_COUNT ? XF_STATE_NAMES[sv.state] : "?",
+                    sv.type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[sv.type]   : "?");
+        }
+
+        for (size_t i = 0; i < argc2; i++) {
+            xf_value_release(argv2[i]);
+        }
+
+        xf_value_release(callee);
+        vm_error(vm, "attempt to call non-function");
+        goto err;
+    }
+
+    xf_fn_t *fn = callee.data.fn;
+    xf_Value ret = xf_val_null();
+
+    if (fn->is_native && fn->native_v) {
+        ret = fn->native_v(argv2, argc2);
+    } else {
+        Chunk *fn_chunk = (Chunk *)fn->body;
+        ret = vm_call_function_chunk(vm, fn_chunk, argv2, argc2);
+
+        if (vm->should_exit) {
+            for (size_t i = 0; i < argc2; i++) {
+                xf_value_release(argv2[i]);
+            }
+
+            xf_value_release(callee);
+            xf_value_release(ret);
+            return VM_EXIT;
+        }
+    }
+
+    /*
+     * Handle both native and compiled function errors here.
+     */
+    if (ret.state == XF_STATE_NAV && vm->had_error) {
+        fprintf(stderr,
+                "VM ERR [%s:%u ip=%zu]: call returned NAV with vm error\n",
+                chunk_name,
+                call_line,
+                call_ip);
+
+        for (size_t i = 0; i < argc2; i++) {
+            xf_value_release(argv2[i]);
+        }
+
+        xf_value_release(callee);
+        xf_value_release(ret);
+        goto err;
+    }
+
+    /*
+     * vm_push retains ret, so we release our local ret afterward.
+     */
+    vm_push(vm, ret);
+
+    for (size_t i = 0; i < argc2; i++) {
+        xf_value_release(argv2[i]);
+    }
+
+    xf_value_release(callee);
+    xf_value_release(ret);
+    break;
+}
+
+}
         if (vm->had_error) goto err;
     }
 

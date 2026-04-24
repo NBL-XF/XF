@@ -151,7 +151,7 @@ void parser_sync(Parser *p) {
 /* ============================================================
  * Primary expressions
  * ============================================================ */
- 
+
  static bool token_is_type_kw(TokenKind k) {
     switch (k) {
         case TK_KW_NUM:
@@ -2456,6 +2456,15 @@ Stmt *parse_while(Parser *p) {
 
     return ast_while(cond, body, kw->loc);
 }
+ 
+static void parser_free_params(Param *params, size_t count) {
+    if (!params) return;
+    for (size_t i = 0; i < count; i++) {
+        xf_str_release(params[i].name);
+        ast_expr_free(params[i].default_val);
+    }
+    free(params);
+}
 Stmt *parse_fn_decl(Parser *p, uint8_t ret_type) {
     Token *fn_tok = parser_previous(p);
 
@@ -2474,25 +2483,25 @@ Stmt *parse_fn_decl(Parser *p, uint8_t ret_type) {
     Param *params = parse_paramlist(p, &param_count);
     if (p->had_error) { /* ignore if your compiler wants p->had_error here */
         xf_str_release(name);
+        parser_free_params(params, param_count);
         return NULL;
     }
 
     if (!parser_consume(p, TK_RPAREN, "expected ')' after parameter list")) {
         xf_str_release(name);
-        free(params);
+        parser_free_params(params, param_count);
         return NULL;
     }
 
     if (!parser_consume(p, TK_LBRACE, "expected '{' before function body")) {
         xf_str_release(name);
-        free(params);
         return NULL;
     }
 
     Stmt *body = parse_block(p);
     if (!body) {
         xf_str_release(name);
-        free(params);
+         parser_free_params(params, param_count);
         return NULL;
     }
 
@@ -2544,7 +2553,7 @@ Param *parse_paramlist(Parser *p, size_t *out_count) {
             Param *tmp = realloc(params, new_cap * sizeof(Param));
             if (!tmp) {
                 xf_str_release(name);
-                free(params);
+                 parser_free_params(params, count);
                 return NULL;
             }
             params = tmp;

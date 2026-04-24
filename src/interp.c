@@ -227,8 +227,10 @@ static xf_fn_t *compile_named_function(Interp *it,
                                        Loc loc) {
     (void)loc;
 
+    xf_fn_t *out = NULL;
     Chunk *fn_chunk = calloc(1, sizeof(Chunk));
     if (!fn_chunk) return NULL;
+
     chunk_init(fn_chunk, name ? name->data : "<fn>");
 
     FnCompileCtx fnctx = {0};
@@ -239,29 +241,34 @@ static xf_fn_t *compile_named_function(Interp *it,
 
     for (size_t i = 0; i < param_count; i++) {
         if (fn_local_add(params[i].name, params[i].type) < 0) {
-            g_fn_ctx = saved_ctx;
-            fn_ctx_cleanup(&fnctx);
-            chunk_free(fn_chunk);
-            free(fn_chunk);
-            return NULL;
+            goto cleanup;
         }
     }
 
-    bool ok = compile_stmt(it, fn_chunk, body);
-    if (!ok) {
-        g_fn_ctx = saved_ctx;
-        fn_ctx_cleanup(&fnctx);
-        chunk_free(fn_chunk);
-        free(fn_chunk);
-        return NULL;
+    if (!compile_stmt(it, fn_chunk, body)) {
+        goto cleanup;
     }
 
     chunk_write(fn_chunk, OP_RETURN_NULL, 0);
 
+    out = build_compiled_fn(name, return_type, params, param_count, fn_chunk);
+
+    /*
+     * If build_compiled_fn succeeds, fn_chunk ownership moved into out->body.
+     * If it fails, build_compiled_fn already frees fn_chunk.
+     */
+    fn_chunk = NULL;
+
+cleanup:
     g_fn_ctx = saved_ctx;
     fn_ctx_cleanup(&fnctx);
 
-    return build_compiled_fn(name, return_type, params, param_count, fn_chunk);
+    if (!out && fn_chunk) {
+        chunk_free(fn_chunk);
+        free(fn_chunk);
+    }
+
+    return out;
 }
 static int compiler_global_find_str(xf_Str *name) {
     if (!name) return -1;
@@ -730,20 +737,16 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
             return true;
         }
         case STMT_EXPR:
-            if (!compile_expr(it, c, s->as.expr.expr)) return false;
-            chunk_write(c, OP_POP, s->loc.line);
-            return true;
-                    case STMT_PRINT: {
-            size_t argc = s->as.io.count;
+    if (!compile_expr(it, c, s->as.expr.expr)) return false;
 
-            for (size_t i = 0; i < argc; i++) {
-                if (!compile_expr(it, c, s->as.io.args[i])) return false;
-            }
+    fprintf(stderr,
+            "[compile STMT_EXPR] line=%u emit OP_INSPECT=%d\n",
+            s->loc.line,
+            OP_INSPECT);
 
-            chunk_write(c, OP_PRINT, s->loc.line);
-            chunk_write(c, (uint8_t)argc, s->loc.line);
-            return true;
-        }
+    chunk_write(c, OP_INSPECT, s->loc.line);
+    return true;
+ 
                 case STMT_OUTFMT: {
             const char *sep = " ";
 
@@ -1653,37 +1656,31 @@ case EXPR_PIPE_FN: {
 
 case EXPR_BINARY: {
     switch (e->as.binary.op) {
-        case BINOP_AND: {
-            if (!compile_expr(it, c, e->as.binary.left)) return false;
+    case BINOP_AND: {
+    if (!compile_expr(it, c, e->as.binary.left)) {
+        return false;
+    }
 
-            size_t eval_rhs = emit_jump(c, OP_JUMP_IF, e->loc.line);
-            chunk_write(c, OP_PUSH_FALSE, e->loc.line);
-            size_t done = emit_jump(c, OP_JUMP, e->loc.line);
+    if (!compile_expr(it, c, e->as.binary.right)) {
+        return false;
+    }
 
-            patch_jump_here(c, eval_rhs);
-            if (!compile_expr(it, c, e->as.binary.right)) return false;
-            chunk_write(c, OP_NOT, e->loc.line);
-            chunk_write(c, OP_NOT, e->loc.line);
+    chunk_write(c, OP_AND, e->loc.line);
+    return true;
+}
 
-            patch_jump_here(c, done);
-            return true;
-        }
+case BINOP_OR: {
+    if (!compile_expr(it, c, e->as.binary.left)) {
+        return false;
+    }
 
-        case BINOP_OR: {
-            if (!compile_expr(it, c, e->as.binary.left)) return false;
+    if (!compile_expr(it, c, e->as.binary.right)) {
+        return false;
+    }
 
-            size_t eval_rhs = emit_jump(c, OP_JUMP_NOT, e->loc.line);
-            chunk_write(c, OP_PUSH_TRUE, e->loc.line);
-            size_t done = emit_jump(c, OP_JUMP, e->loc.line);
-
-            patch_jump_here(c, eval_rhs);
-            if (!compile_expr(it, c, e->as.binary.right)) return false;
-            chunk_write(c, OP_NOT, e->loc.line);
-            chunk_write(c, OP_NOT, e->loc.line);
-
-            patch_jump_here(c, done);
-            return true;
-        }
+    chunk_write(c, OP_OR, e->loc.line);
+    return true;
+}
 
         default:
             if (!compile_expr(it, c, e->as.binary.left)) return false;

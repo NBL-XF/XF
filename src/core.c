@@ -69,7 +69,6 @@ void core_register(SymTable *st) {
     tmp = xf_val_ok_module(generics_m);
     xf_module_set(core_m, "generics", tmp);
     xf_value_release(tmp);
-
     xf_module_release(math_m);
     xf_module_release(str_m);
     xf_module_release(os_m);
@@ -80,16 +79,15 @@ void core_register(SymTable *st) {
     xf_module_release(format_m);
     xf_module_release(process_m);
     xf_module_release(img_m);
-// core.c
-// replace the final registration tail in core_register()
 
-xf_Value core_val = xf_val_ok_module(core_m);
-xf_module_release(core_m);
+    xf_Value core_val = xf_val_ok_module(core_m);
 
-if (!sym_define_builtin(st, "core", XF_TYPE_MODULE, core_val)) {
+    if (!sym_define_builtin(st, "core", XF_TYPE_MODULE, core_val)) {
+        xf_value_release(core_val);
+        xf_module_release(core_m);
+        return;
+    }
+
     xf_value_release(core_val);
-    return;
-}
-
-xf_value_release(core_val);
+    xf_module_release(core_m);
 }

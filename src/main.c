@@ -184,7 +184,6 @@ static void xf_drain_stack(VM *vm) {
         xf_value_release(vm_pop(vm));
     }
 }
-
 static int xf_run_program(Program *prog, int argc, char **argv) {
     VM vm;
     vm_init(&vm, 1);
@@ -194,6 +193,7 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
     if (syms.had_error) {
         fprintf(stderr, "xf: symtable init error: %s\n", syms.err_msg);
         vm_free(&vm);
+        sym_free(&syms);
         return 1;
     }
 
@@ -209,64 +209,68 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
 
     if (!interp_compile_program(&it, prog)) {
         fprintf(stderr, "xf: compile failed\n");
+
         if (it.vm && it.vm->had_error) {
             fprintf(stderr, "xf: vm error: %s\n", it.vm->err_msg);
         }
+
         if (it.syms && it.syms->had_error) {
             fprintf(stderr, "xf: sym error: %s\n", it.syms->err_msg);
         }
+
         interp_reset_global_bindings(&it);
-        sym_free(&syms);
         vm_free(&vm);
+        sym_free(&syms);
         return 1;
     }
 
     inject_args(&it, argc, argv);
 
     VMResult begin_rc = vm_run_begin(&vm);
-    xf_drain_stack(&vm);   /* discard any value the BEGIN block left */
+    xf_drain_stack(&vm);
+
     if (begin_rc != VM_OK && !vm.should_exit) {
         fprintf(stderr, "BEGIN failed\n");
         interp_reset_global_bindings(&it);
-        sym_free(&syms);
         vm_free(&vm);
+        sym_free(&syms);
         return 1;
     }
 
-    /*
-     * Only read stdin when stdin is piped or redirected.
-     * If running interactively from a terminal, do not block waiting for input.
-     */
     if (!vm.should_exit && !isatty(fileno(stdin))) {
         char buf[4096];
+
         while (!vm.should_exit && fgets(buf, sizeof(buf), stdin)) {
             size_t len = strlen(buf);
+
             if (vm_feed_record(&vm, buf, len) != VM_OK) {
                 fprintf(stderr, "runtime error\n");
                 interp_reset_global_bindings(&it);
-                sym_free(&syms);
                 vm_free(&vm);
+                sym_free(&syms);
                 return 1;
             }
-            xf_drain_stack(&vm);   /* discard any value each rule left */
+
+            xf_drain_stack(&vm);
         }
     }
 
     if (!vm.should_exit) {
         VMResult end_rc = vm_run_end(&vm);
-        xf_drain_stack(&vm);   /* discard any value the END block left */
+        xf_drain_stack(&vm);
+
         if (end_rc != VM_OK && !vm.should_exit) {
             fprintf(stderr, "END failed\n");
             interp_reset_global_bindings(&it);
-            sym_free(&syms);
             vm_free(&vm);
+            sym_free(&syms);
             return 1;
         }
     }
 
     interp_reset_global_bindings(&it);
-    sym_free(&syms);
     vm_free(&vm);
+    sym_free(&syms);
     return 0;
 }
 int main(int argc, char **argv) {

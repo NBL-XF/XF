@@ -106,7 +106,8 @@ typedef enum {
     OP_NEXT_RECORD,
     OP_EXIT,
     OP_NOP,
-    OP_HALT
+    OP_HALT,
+    OP_INSPECT
 } OpCode;
 
 typedef struct {
