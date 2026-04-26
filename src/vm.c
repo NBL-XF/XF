@@ -450,7 +450,7 @@ void vm_push(VM *vm, xf_Value v) {
     vm->stack[vm->stack_top++] = xf_value_retain(v);
 }
 
-xf_Value vm_pop(VM *vm) {
+/*xf_Value vm_pop(VM *vm) {
     if (vm->stack_top == 0) {
         vm_error(vm, "stack underflow");
         return xf_val_nav(XF_TYPE_VOID);
@@ -458,6 +458,25 @@ xf_Value vm_pop(VM *vm) {
 
     xf_Value v = vm->stack[--vm->stack_top];
     vm->stack[vm->stack_top] = xf_val_null();
+    return v;
+}*/
+xf_Value vm_pop(VM *vm) {
+    if (!vm || vm->stack_top == 0) {
+        if (vm) vm_error(vm, "stack underflow");
+        return xf_val_nav(XF_TYPE_VOID);
+    }
+
+    xf_Value v = vm->stack[--vm->stack_top];
+
+    /*
+     * Important:
+     * Do NOT release v here.
+     * The caller now owns the popped stack reference.
+     *
+     * Clear stale slot without releasing it.
+     */
+    vm->stack[vm->stack_top] = xf_val_nav(XF_TYPE_VOID);
+
     return v;
 }
 xf_Value vm_peek(const VM *vm, int dist) {
@@ -899,6 +918,28 @@ static VMResult vm_run_chunk_internal(VM *vm, Chunk *chunk, xf_Value *args, size
                 xf_value_release(obj);
                 break;
             }
+            case OP_RETURN: {
+    /*
+     * vm_pop() removes the stack-owned value and transfers ownership
+     * to this block.
+     */
+    xf_Value rv = vm_pop(vm);
+
+    /*
+     * Replace the frame's current return value.
+     * Do NOT retain+release here; just move ownership into the frame.
+     */
+    xf_value_release(frame->return_val);
+    frame->return_val = rv;
+
+    goto done;
+}
+
+case OP_RETURN_NULL: {
+    xf_value_release(frame->return_val);
+    frame->return_val = xf_val_null();
+    goto done;
+}
             case OP_GET_IDX: {
     b = vm_pop(vm);
     a = vm_pop(vm);
@@ -1824,9 +1865,22 @@ case OP_GET_TYPE: {
 
     xf_fn_t *fn = callee.data.fn;
     xf_Value ret = xf_val_null();
-
-    if (fn->is_native && fn->native_v) {
+if (fn->is_native && fn->native_v) {
         ret = fn->native_v(argv2, argc2);
+
+        /* Defensive: if a native returned one of its args without retaining
+         * (a contract violation), `ret` aliases an argv2[i] that we're about
+         * to release. Retain so `ret` has independent ownership. */
+        if (ret.state == XF_STATE_OK) {
+            for (size_t i = 0; i < argc2; i++) {
+                if (ret.type  == argv2[i].type  &&
+                    ret.state == argv2[i].state &&
+                    memcmp(&ret.data, &argv2[i].data, sizeof(ret.data)) == 0) {
+                    xf_value_retain(ret);
+                    break;
+                }
+            }
+        }
     } else {
         Chunk *fn_chunk = (Chunk *)fn->body;
         ret = vm_call_function_chunk(vm, fn_chunk, argv2, argc2);

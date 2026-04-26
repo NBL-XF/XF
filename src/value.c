@@ -98,19 +98,21 @@ xf_str_t *xf_str_retain(xf_str_t *s) {
     atomic_fetch_add(&s->refcount, 1);
     return s;
 }
-
 void xf_str_release(xf_str_t *s) {
     if (!s) return;
 
-    int old = atomic_fetch_sub(&s->refcount, 1);
-    if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_str_release underflow on %p\n", (void *)s);
+    int prev = atomic_load(&s->refcount);
+    fprintf(stderr, "[STR REL] %p rc:%d->%d \"%.*s\"\n",
+            (void *)s, prev, prev - 1,
+            (int)(s->len > 40 ? 40 : s->len), s->data);
+
+    if (prev <= 0) {
+        fprintf(stderr, "[BUG] underflow on %p\n", (void *)s);
         __builtin_trap();
     }
 
-    if (old == 1) {
-        free(s);
-    }
+    int old = atomic_fetch_sub(&s->refcount, 1);
+    if (old == 1) free(s);
 }
 uint32_t xf_str_hash(xf_str_t *s) {
     if (!s) return 0;
