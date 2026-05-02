@@ -56,12 +56,6 @@ static void scope_free(Scope *sc) {
         Symbol *s = &sc->entries[i];
         if (!s->name) continue;
 
-        if (strcmp(s->name->data, "core") == 0) {
-            fprintf(stderr,
-                    "[FREE SYMBOL core] state=%s type=%s\n",
-                    s->value.state < XF_STATE_COUNT ? XF_STATE_NAMES[s->value.state] : "?",
-                    s->value.type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[s->value.type]   : "?");
-        }
 
         xf_str_release(s->name);
         xf_value_release(s->value);
@@ -636,12 +630,12 @@ static xf_value_t builtin_push(xf_value_t *args, size_t argc) {
     if (coll.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_VOID);
 
     if (coll.type == XF_TYPE_ARR && coll.data.arr) {
-        xf_arr_push(coll.data.arr, xf_value_retain(val));
+    xf_arr_push(coll.data.arr, val);
         return xf_val_void(xf_val_null());
     }
 
     if (coll.type == XF_TYPE_SET && coll.data.set) {
-        if (!xf_set_add(coll.data.set, xf_value_retain(val))) {
+    if (!xf_set_add(coll.data.set, val)) {
             return xf_val_nav(XF_TYPE_VOID);
         }
         return xf_val_void(xf_val_null());
@@ -1020,7 +1014,6 @@ void sym_register_builtins(SymTable *st) {
     xf_value_release(merge_v);
     xf_value_release(split_v);
 
-    fprintf(stderr, "[sym_register_builtins] locals released\n");
 }
 /* ============================================================
  * Debug

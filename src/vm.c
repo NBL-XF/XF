@@ -34,19 +34,9 @@ void chunk_init(Chunk *c, const char *source) {
 void chunk_free(Chunk *c) {
     if (!c) return;
 
-    fprintf(stderr,
-            "[chunk_free] chunk=%p const_len=%zu code_len=%zu\n",
-            (void *)c,
-            c->const_len,
-            c->len);
 
     if (c->consts) {
         for (size_t i = 0; i < c->const_len; i++) {
-            fprintf(stderr,
-                    "  [free const %zu] state=%s type=%s\n",
-                    i,
-                    c->consts[i].state < XF_STATE_COUNT ? XF_STATE_NAMES[c->consts[i].state] : "?",
-                    c->consts[i].type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[c->consts[i].type]   : "?");
 
             xf_value_release(c->consts[i]);
         }
@@ -433,7 +423,17 @@ void vm_free(VM *vm) {
 
     /* flush redirects / files */
     vm_redir_flush(vm);
-
+/* release globals */
+    if (vm->globals) {
+        for (size_t i = 0; i < vm->global_count; i++) {
+            xf_value_release(vm->globals[i]);
+            vm->globals[i] = xf_val_null();
+        }
+        free(vm->globals);
+        vm->globals = NULL;
+    }
+    vm->global_count = 0;
+    vm->global_cap = 0;
     pthread_mutex_destroy(&vm->rec_mu);
 
     memset(vm, 0, sizeof(*vm));
@@ -1272,12 +1272,6 @@ case OP_LOAD_GLOBAL: {
         ? vm->globals[idx]
         : xf_val_undef(XF_TYPE_VOID);
 
-    fprintf(stderr,
-            "[LOAD_GLOBAL] ip=%zu idx=%u state=%s type=%s\n",
-            frame->ip - 5,
-            idx,
-            gv.state < XF_STATE_COUNT ? XF_STATE_NAMES[gv.state] : "?",
-            gv.type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[gv.type]   : "?");
 
     vm_push(vm, gv);
     break;
@@ -1285,13 +1279,6 @@ case OP_LOAD_GLOBAL: {
             case OP_STORE_GLOBAL: {
     uint32_t idx = READ_U32();
     xf_Value v = vm_pop(vm);
-
-    fprintf(stderr,
-            "[STORE_GLOBAL] idx=%u global_count=%zu value=%s/%s\n",
-            idx,
-            vm->global_count,
-            v.state < XF_STATE_COUNT ? XF_STATE_NAMES[v.state] : "?",
-            v.type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[v.type]   : "?");
 
     if (idx < vm->global_count) {
         fprintf(stderr,
@@ -1781,32 +1768,12 @@ case OP_GET_TYPE: {
 
     const char *chunk_name = "<chunk>";
 
-    fprintf(stderr,
-            "\n[OP_CALL ENTER] chunk=%s line=%u ip=%zu argc=%u stack_top=%zu\n",
-            chunk_name,
-            call_line,
-            call_ip,
-            (unsigned)argc2,
-            vm->stack_top);
-
-    fprintf(stderr, "  stack before pop:\n");
     size_t before_start = vm->stack_top > 16 ? vm->stack_top - 16 : 0;
     for (size_t si = before_start; si < vm->stack_top; si++) {
         xf_Value sv = vm->stack[si];
-        fprintf(stderr,
-                "    stack[%zu] state=%s type=%s\n",
-                si,
-                sv.state < XF_STATE_COUNT ? XF_STATE_NAMES[sv.state] : "?",
-                sv.type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[sv.type]   : "?");
     }
 
     if (argc2 > 64) {
-        fprintf(stderr,
-                "VM ERR [%s:%u ip=%zu]: too many call args: %u\n",
-                chunk_name,
-                call_line,
-                call_ip,
-                (unsigned)argc2);
 
         vm_error(vm, "too many call args");
         goto err;

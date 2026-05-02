@@ -1,13 +1,14 @@
 v1.0.1 leaks
-v1.0.2 shorthand for
-v1.0.3 shorthand while 
-v1.0.4. "a","b" should split with OFS
-v1.0.5. expr spread
-v1.0.6. auto gc
-v1.0.7. manual gc
-v1.0.8. printf
-v1.1.0. multithreading
-v1.2.0. SIMD
+       shorthand for
+       shorthand while
+       "a","b" should split with OFS
+       expr spread
+       auto gc
+       manual gc rip
+       check state type val check var
+       printf
+v1.0.2.multithreading
+        SIMD
 
 EE
 1. Java Interop/FFI

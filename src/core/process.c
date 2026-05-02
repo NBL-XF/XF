@@ -75,6 +75,7 @@ static xf_Value cp_split(xf_Value *args, size_t argc) {
         xf_Value cv = xf_val_ok_arr(chunk);
         xf_arr_release(chunk);
         xf_arr_push(out, cv);
+        xf_value_release(cv);
 
         if (to >= sz)
             break;

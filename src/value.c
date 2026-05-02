@@ -10,15 +10,6 @@
  * Debug / trace
  * ============================================================ */
 
-#ifndef XF_REF_TRACE
-#define XF_REF_TRACE 0
-#endif
-
-#if XF_REF_TRACE
-#define TRACE(fmt, ...) fprintf(stderr, "[REF] " fmt "\n", ##__VA_ARGS__)
-#else
-#define TRACE(fmt, ...) ((void)0)
-#endif
 
 /* ============================================================
  * Global name tables
@@ -85,7 +76,6 @@ xf_str_t *xf_str_new(const char *data, size_t len) {
     }
     s->data[len] = '\0';
 
-    TRACE("STR NEW %p rc=1 \"%s\"", (void *)s, s->data);
     return s;
 }
 
@@ -102,12 +92,8 @@ void xf_str_release(xf_str_t *s) {
     if (!s) return;
 
     int prev = atomic_load(&s->refcount);
-    fprintf(stderr, "[STR REL] %p rc:%d->%d \"%.*s\"\n",
-            (void *)s, prev, prev - 1,
-            (int)(s->len > 40 ? 40 : s->len), s->data);
 
     if (prev <= 0) {
-        fprintf(stderr, "[BUG] underflow on %p\n", (void *)s);
         __builtin_trap();
     }
 
@@ -364,7 +350,6 @@ void xf_err_release(xf_err_t *e) {
 
     int old = atomic_fetch_sub(&e->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_err_release underflow on %p\n", (void *)e);
         __builtin_trap();
     }
 
@@ -478,13 +463,6 @@ void xf_value_release(xf_Value v) {
         case XF_TYPE_MAP:    xf_map_release(v.data.map);     break;
         case XF_TYPE_ARR:    xf_arr_release(v.data.arr);     break;
         case XF_TYPE_FN:
-    if (v.data.fn) {
-        fprintf(stderr,
-                "[value release fn] ptr=%p name=%s rc_before=%d\n",
-                (void *)v.data.fn,
-                v.data.fn->name ? v.data.fn->name->data : "?",
-                atomic_load(&v.data.fn->refcount));
-    }
     xf_fn_release(v.data.fn);
     break;
         case XF_TYPE_SET:    xf_set_release(v.data.set);    break;
@@ -516,7 +494,6 @@ void xf_fn_release(xf_fn_t *f) {
     int old = atomic_fetch_sub(&f->refcount, 1);
 
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_fn_release underflow on %p\n", (void *)f);
         __builtin_trap();
     }
 
@@ -524,10 +501,6 @@ void xf_fn_release(xf_fn_t *f) {
         return;
     }
 
-    fprintf(stderr,
-            "[fn free] ptr=%p name=%s\n",
-            (void *)f,
-            f->name ? f->name->data : "?");
 
     if (f->name) {
         xf_str_release(f->name);
@@ -565,7 +538,6 @@ void xf_regex_release(xf_regex_t *r) {
 
     int old = atomic_fetch_sub(&r->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_regex_release underflow on %p\n", (void *)r);
         __builtin_trap();
     }
 
@@ -619,7 +591,6 @@ void xf_tuple_release(xf_tuple_t *t) {
 
     int old = atomic_fetch_sub(&t->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_tuple_release underflow on %p\n", (void *)t);
         __builtin_trap();
     }
 
@@ -718,7 +689,6 @@ void xf_set_release(xf_set_t *s) {
 
     int old = atomic_fetch_sub(&s->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_set_release underflow on %p\n", (void *)s);
         __builtin_trap();
     }
 
@@ -837,7 +807,6 @@ void xf_arr_release(xf_arr_t *a) {
 
     int old = atomic_fetch_sub(&a->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_arr_release underflow on %p\n", (void *)a);
         __builtin_trap();
     }
 
@@ -1029,7 +998,6 @@ void xf_map_release(xf_map_t *m) {
 
     int old = atomic_fetch_sub(&m->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_map_release underflow on %p\n", (void *)m);
         __builtin_trap();
     }
 
@@ -1173,30 +1141,14 @@ void xf_module_release(xf_module_t *m) {
 
     int before = atomic_load(&m->refcount);
 
-    if (m->name) {
-        fprintf(stderr,
-                "[module release] %p name=%s rc_before=%d count=%zu\n",
-                (void *)m,
-                m->name,
-                before,
-                m->count);
-    }
 
     int old = atomic_fetch_sub(&m->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_module_release underflow on %p\n", (void *)m);
         __builtin_trap();
     }
 
     if (old != 1) return;
 
-    if (m->name) {
-        fprintf(stderr,
-                "[module free] %p name=%s count=%zu\n",
-                (void *)m,
-                m->name,
-                m->count);
-    }
 
     for (size_t i = 0; i < m->count; i++) {
         xf_value_release(m->entries[i].val);

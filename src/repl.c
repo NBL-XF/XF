@@ -106,14 +106,7 @@ static int xf_repl_eval_line(VM *vm, SymTable *syms, const char *line) {
 
 if (vm->global_count > 5) {
         xf_Value g5 = vm->globals[5];
-        fprintf(stderr, "[pre-eval] slot5 state=%s type=%s addr=%p\n",
-                g5.state < XF_STATE_COUNT ? XF_STATE_NAMES[g5.state] : "?",
-                g5.type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[g5.type]   : "?",
-                (g5.state == XF_STATE_OK && g5.type == XF_TYPE_ARR) ? (void*)g5.data.arr : NULL);
-    } else {
-        fprintf(stderr, "[pre-eval] global_count=%zu (slot 5 not yet allocated)\n",
-                vm->global_count);
-    }
+    } 
 
     Lexer lex = {0};
     Program *prog = NULL;
