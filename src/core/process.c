@@ -51,12 +51,16 @@ static xf_Value cp_worker(xf_Value *args, size_t argc) {
 static xf_Value cp_split(xf_Value *args, size_t argc) {
     NEED(2);
 
-    if (args[0].state != XF_STATE_OK || args[0].type != XF_TYPE_ARR || !args[0].data.arr)
+    if (args[0].state != XF_STATE_OK ||
+        args[0].type  != XF_TYPE_ARR ||
+        !args[0].data.arr) {
         return xf_val_nav(XF_TYPE_ARR);
+    }
 
     double dn;
-    if (!arg_num(args, argc, 1, &dn) || dn < 1)
+    if (!arg_num(args, argc, 1, &dn) || dn < 1) {
         return xf_val_nav(XF_TYPE_ARR);
+    }
 
     xf_arr_t *in = args[0].data.arr;
     size_t n = (size_t)dn;
@@ -64,33 +68,42 @@ static xf_Value cp_split(xf_Value *args, size_t argc) {
     size_t per = (sz + n - 1) / n;
 
     xf_arr_t *out = xf_arr_new();
+    if (!out) return xf_val_nav(XF_TYPE_ARR);
+
     for (size_t i = 0; i < n; i++) {
         size_t from = i * per;
         size_t to = from + per < sz ? from + per : sz;
 
         xf_arr_t *chunk = xf_arr_new();
-        for (size_t j = from; j < to; j++)
-            xf_arr_push(chunk, xf_value_retain(in->items[j]));
+        if (!chunk) {
+            xf_arr_release(out);
+            return xf_val_nav(XF_TYPE_ARR);
+        }
+
+        for (size_t j = from; j < to; j++) {
+            xf_arr_push(chunk, in->items[j]);
+        }
 
         xf_Value cv = xf_val_ok_arr(chunk);
         xf_arr_release(chunk);
+
         xf_arr_push(out, cv);
         xf_value_release(cv);
 
-        if (to >= sz)
+        if (to >= sz) {
             break;
+        }
     }
 
     xf_Value v = xf_val_ok_arr(out);
     xf_arr_release(out);
     return v;
 }
-
 static xf_Value cp_assign(xf_Value *args, size_t argc) {
     NEED(1);
 
     if (args[0].state != XF_STATE_OK ||
-        args[0].type != XF_TYPE_ARR ||
+        args[0].type  != XF_TYPE_ARR ||
         !args[0].data.arr) {
         return xf_val_nav(XF_TYPE_ARR);
     }
@@ -100,20 +113,21 @@ static xf_Value cp_assign(xf_Value *args, size_t argc) {
 
     if (argc >= 2 &&
         args[1].state == XF_STATE_OK &&
-        args[1].type == XF_TYPE_FN &&
+        args[1].type  == XF_TYPE_FN &&
         args[1].data.fn) {
         fn = args[1].data.fn;
     }
 
     xf_arr_t *out = xf_arr_new();
-    if (!out)
+    if (!out) {
         return xf_val_nav(XF_TYPE_ARR);
+    }
 
     for (size_t r = 0; r < in->len; r++) {
-        xf_Value row = in->items[r];
+        xf_Value row = in->items[r];  /* borrowed */
 
         if (!fn) {
-            xf_arr_push(out, xf_value_retain(row));
+            xf_arr_push(out, row);    /* arr retains */
             continue;
         }
 
@@ -125,17 +139,22 @@ static xf_Value cp_assign(xf_Value *args, size_t argc) {
             xf_fn_caller_t caller = core_get_fn_caller();
             void *vm = core_get_fn_caller_vm();
             void *sy = core_get_fn_caller_syms();
-            if (caller && vm)
+
+            if (caller && vm) {
                 xformed = caller(vm, sy, fn, &row, 1);
+            }
         }
 
         if (xformed.state == XF_STATE_OK &&
-            xformed.type == XF_TYPE_MAP &&
+            xformed.type  == XF_TYPE_MAP &&
             xformed.data.map) {
-            xf_arr_push(out, xformed);
+
+            xf_arr_push(out, xformed);      /* arr retains */
+            xf_value_release(xformed);      /* drop local return ownership */
+
         } else {
             xf_value_release(xformed);
-            xf_arr_push(out, xf_value_retain(row));
+            xf_arr_push(out, row);          /* arr retains borrowed row */
         }
     }
 
@@ -143,7 +162,6 @@ static xf_Value cp_assign(xf_Value *args, size_t argc) {
     xf_arr_release(out);
     return v;
 }
-
 static xf_Value cp_index(xf_Value *args, size_t argc) {
     NEED(1);
 

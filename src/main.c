@@ -185,6 +185,8 @@ static void xf_drain_stack(VM *vm) {
     }
 }
 static int xf_run_program(Program *prog, int argc, char **argv) {
+    int rc = 1;
+
     VM vm;
     vm_init(&vm, 1);
 
@@ -218,10 +220,7 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
             fprintf(stderr, "xf: sym error: %s\n", it.syms->err_msg);
         }
 
-        interp_reset_global_bindings(&it);
-        vm_free(&vm);
-        sym_free(&syms);
-        return 1;
+        goto cleanup;
     }
 
     inject_args(&it, argc, argv);
@@ -231,10 +230,7 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
 
     if (begin_rc != VM_OK && !vm.should_exit) {
         fprintf(stderr, "BEGIN failed\n");
-        interp_reset_global_bindings(&it);
-        vm_free(&vm);
-        sym_free(&syms);
-        return 1;
+        goto cleanup;
     }
 
     if (!vm.should_exit && !isatty(fileno(stdin))) {
@@ -245,10 +241,8 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
 
             if (vm_feed_record(&vm, buf, len) != VM_OK) {
                 fprintf(stderr, "runtime error\n");
-                interp_reset_global_bindings(&it);
-                vm_free(&vm);
-                sym_free(&syms);
-                return 1;
+                xf_drain_stack(&vm);
+                goto cleanup;
             }
 
             xf_drain_stack(&vm);
@@ -261,17 +255,25 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
 
         if (end_rc != VM_OK && !vm.should_exit) {
             fprintf(stderr, "END failed\n");
-            interp_reset_global_bindings(&it);
-            vm_free(&vm);
-            sym_free(&syms);
-            return 1;
+            goto cleanup;
         }
     }
 
-    interp_reset_global_bindings(&it);
+    rc = 0;
+
+cleanup:
+    xf_drain_stack(&vm);
+
+    /*
+     * Release VM values/chunks first.
+     * Then clear compiler-global name bindings.
+     * Then release symbol-table values.
+     */
     vm_free(&vm);
+    interp_reset_global_bindings(&it);
     sym_free(&syms);
-    return 0;
+
+    return rc;
 }
 int main(int argc, char **argv) {
     if (argc == 1) {

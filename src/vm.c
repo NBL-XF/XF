@@ -34,7 +34,6 @@ void chunk_init(Chunk *c, const char *source) {
 void chunk_free(Chunk *c) {
     if (!c) return;
 
-
     if (c->consts) {
         for (size_t i = 0; i < c->const_len; i++) {
 
