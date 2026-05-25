@@ -147,6 +147,7 @@ static xf_Value cd_sort(xf_Value *args, size_t argc) {
 
 static xf_Value cd_agg(xf_Value *args, size_t argc) {
     NEED(2);
+
     xf_arr_t *ds;
     if (!ds_arg_arr(args, argc, 0, &ds)) return propagate(args, argc);
 
@@ -159,6 +160,7 @@ static xf_Value cd_agg(xf_Value *args, size_t argc) {
     bool has_akey = (argc >= 3 && arg_str(args, argc, 2, &akey, &alen));
 
     xf_map_t *out = xf_map_new();
+    if (!out) return xf_val_nav(XF_TYPE_MAP);
 
     for (size_t i = 0; i < ds->len; i++) {
         xf_map_t *row = ds_row_map(ds, i);
@@ -178,19 +180,49 @@ static xf_Value cd_agg(xf_Value *args, size_t argc) {
         xf_Value bucket = xf_map_get(out, gstr); /* retained */
         xf_arr_t *ba = NULL;
 
-        if (bucket.state != XF_STATE_OK || bucket.type != XF_TYPE_ARR || !bucket.data.arr) {
+        if (bucket.state != XF_STATE_OK ||
+            bucket.type  != XF_TYPE_ARR ||
+            !bucket.data.arr) {
+
+            /*
+             * Release the old lookup result before overwriting bucket.
+             * This matters if the key exists but contains a non-array value.
+             */
+            xf_value_release(bucket);
+
             ba = xf_arr_new();
+            if (!ba) {
+                xf_value_release(gs);
+                xf_map_release(out);
+                return xf_val_nav(XF_TYPE_MAP);
+            }
+
             xf_Value bav = xf_val_ok_arr(ba);
+
+            /*
+             * xf_val_ok_arr() takes/retains value-level ownership.
+             * Drop the raw container ownership from xf_arr_new().
+             */
+            xf_arr_release(ba);
+
             xf_map_set(out, gstr, bav);
             xf_value_release(bav);
+
             bucket = xf_map_get(out, gstr);      /* retained */
         }
 
-        if (bucket.state == XF_STATE_OK && bucket.type == XF_TYPE_ARR && bucket.data.arr) {
+        if (bucket.state == XF_STATE_OK &&
+            bucket.type  == XF_TYPE_ARR &&
+            bucket.data.arr) {
+
             ba = bucket.data.arr;
 
-            xf_Value push_val = has_akey ? ds_cell(row, akey) : xf_value_retain(ds->items[i]);
+            xf_Value push_val = has_akey
+                ? ds_cell(row, akey)
+                : xf_value_retain(ds->items[i]);
+
             xf_arr_push(ba, push_val);
+            xf_value_release(push_val);
         }
 
         xf_value_release(bucket);
@@ -201,7 +233,6 @@ static xf_Value cd_agg(xf_Value *args, size_t argc) {
     xf_map_release(out);
     return rv;
 }
-
 /* ── merge ────────────────────────────────────────────────────── */
 
 static xf_Value cd_merge(xf_Value *args, size_t argc) {
