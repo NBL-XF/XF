@@ -1,6 +1,4 @@
-v1.0.1 leaks
-       shorthand for
-       shorthand while
+v1.0.1 shorthand while
        "a","b" should split with OFS
        expr spread
        auto gc

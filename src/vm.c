@@ -203,23 +203,23 @@ static uint32_t read_u32(const Chunk *c, size_t off) {
 }
 
 size_t chunk_disasm_instr(const Chunk *c, size_t off) {
-    printf("%04zu  ", off);
-    if (off > 0 && c->lines[off] == c->lines[off - 1]) printf("   | ");
-    else printf("%4u ", c->lines[off]);
+   // printf("%04zu  ", off);
+  //  if (off > 0 && c->lines[off] == c->lines[off - 1]) printf("   | ");
+//    else printf("%4u ", c->lines[off]);
 
     OpCode op = (OpCode)c->code[off++];
-    printf("%-16s", opcode_name(op));
+//    printf("%-16s", opcode_name(op));
 
     switch (op) {
         case OP_MAKE_ARR:
 case OP_MAKE_MAP:
 case OP_MAKE_SET:
 case OP_MAKE_TUPLE:
-    printf("  %u", read_u16(c, off));
+  //  printf("  %u", read_u16(c, off));
     off += 2;
     break;
         case OP_PUSH_NUM:
-            printf("  <f64>");
+//            printf("  <f64>");
             off += 8;
             break;
         case OP_PUSH_STR:
@@ -227,21 +227,21 @@ case OP_MAKE_TUPLE:
         case OP_STORE_GLOBAL:
         case OP_PUSH_CONST:
         case OP_GET_MEMBER:
-            printf("  %u", read_u32(c, off));
+//            printf("  %u", read_u32(c, off));
             off += 4;
             break;
         case OP_STORE_FIELD:
         case OP_PRINT:
         case OP_PRINTF:
         case OP_CALL:
-            printf("  %u", c->code[off++]);
+  //          printf("  %u", c->code[off++]);
             break;
         case OP_JUMP:
         case OP_JUMP_IF:
         case OP_JUMP_NOT:
         case OP_JUMP_NAV: {
             int16_t delta = (int16_t)read_u16(c, off);
-            printf("  %+d", delta);
+    //        printf("  %+d", delta);
             off += 2;
             break;
         }
@@ -1280,21 +1280,22 @@ case OP_LOAD_GLOBAL: {
     xf_Value v = vm_pop(vm);
 
     if (idx < vm->global_count) {
-        fprintf(stderr,
+/*        fprintf(stderr,
                 "[STORE_GLOBAL before] idx=%u old=%s/%s\n",
                 idx,
                 vm->globals[idx].state < XF_STATE_COUNT ? XF_STATE_NAMES[vm->globals[idx].state] : "?",
                 vm->globals[idx].type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[vm->globals[idx].type]   : "?");
-
+*/
         xf_value_release(vm->globals[idx]);
         vm->globals[idx] = xf_value_retain(v);
 
-        fprintf(stderr,
+/*        fprintf(stderr,
                 "[STORE_GLOBAL after ] idx=%u new=%s/%s\n",
                 idx,
                 vm->globals[idx].state < XF_STATE_COUNT ? XF_STATE_NAMES[vm->globals[idx].state] : "?",
                 vm->globals[idx].type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[vm->globals[idx].type]   : "?");
-    } else {
+*/
+        } else {
         xf_value_release(v);
         vm_error(vm, "bad global slot");
         goto err;

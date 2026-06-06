@@ -151,7 +151,13 @@ void parser_sync(Parser *p) {
 /* ============================================================
  * Primary expressions
  * ============================================================ */
-
+static bool looks_like_shorthand_for(Parser *p) {
+    return parser_peek(p, 0)->kind == TK_IDENT &&
+           parser_peek(p, 1)->kind == TK_LBRACKET &&
+           parser_peek(p, 2)->kind == TK_IDENT &&
+           parser_peek(p, 3)->kind == TK_RBRACKET &&
+           parser_peek(p, 4)->kind == TK_GT;
+}
  static bool token_is_type_kw(TokenKind k) {
     switch (k) {
         case TK_KW_NUM:
@@ -2347,7 +2353,11 @@ TopLevel *parse_top_level(Parser *p) {
         char   save_err_msg[sizeof(p->err_msg)];
         memcpy(save_err_msg, p->err_msg, sizeof(p->err_msg));
         Loc    save_err_loc = p->err_loc;
-
+if (looks_like_shorthand_for(p)) {
+    Stmt *s = parse_stmt(p);
+    if (!s) return NULL;
+    return ast_top_stmt(s, s->loc);
+}
         TopLevel *rule = parse_rule(p);
         if (rule) return rule;
 
@@ -2456,7 +2466,7 @@ Stmt *parse_while(Parser *p) {
 
     return ast_while(cond, body, kw->loc);
 }
- 
+
 static void parser_free_params(Param *params, size_t count) {
     if (!params) return;
     for (size_t i = 0; i < count; i++) {
