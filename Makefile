@@ -45,6 +45,7 @@ RUNTIME_SRCS = \
 	src/symTable.c \
 	src/value.c \
 	src/vm.c \
+ src/gc.c \
 	$(CORE_SRCS)
 # Optional later:
 # lib/driver.c

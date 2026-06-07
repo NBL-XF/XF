@@ -1,7 +1,6 @@
 v1.0.1 
        auto gc
        manual gc rip
-       check state type val check var
 v1.0.2.multithreading
         SIMD
 
