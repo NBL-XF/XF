@@ -106,7 +106,7 @@ static int xf_repl_eval_line(VM *vm, SymTable *syms, const char *line) {
 
 if (vm->global_count > 5) {
         xf_Value g5 = vm->globals[5];
-    } 
+    }
 
     Lexer lex = {0};
     Program *prog = NULL;
@@ -170,7 +170,7 @@ if (prog->count == 1 &&
         return 1;
     }
 
-    chunk_write(vm->begin_chunk, OP_INSPECT, expr_stmt->loc.line);
+    chunk_write(vm->begin_chunk, OP_POP, expr_stmt->loc.line);
     chunk_write(vm->begin_chunk, OP_HALT, 0);
 }
  else {

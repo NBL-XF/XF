@@ -1,5 +1,4 @@
-v1.0.1 shorthand while
-       "a","b" should split with OFS
+v1.0.1 "a","b" should split with OFS
        expr spread
        auto gc
        manual gc rip

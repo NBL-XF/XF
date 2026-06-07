@@ -736,17 +736,15 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
             chunk_write(c, OP_POP, s->loc.line);
             return true;
         }
-        case STMT_EXPR:
-    if (!compile_expr(it, c, s->as.expr.expr)) return false;
+                case STMT_EXPR: {
+            if (!compile_expr(it, c, s->as.expr.expr)) {
+                return false;
+            }
 
-    fprintf(stderr,
-            "[compile STMT_EXPR] line=%u emit OP_INSPECT=%d\n",
-            s->loc.line,
-            OP_INSPECT);
+            chunk_write(c, OP_POP, s->loc.line);
+            return true;
+        }
 
-    chunk_write(c, OP_INSPECT, s->loc.line);
-    return true;
- 
                 case STMT_OUTFMT: {
             const char *sep = " ";
 
