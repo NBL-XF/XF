@@ -168,6 +168,7 @@ static const char *stmt_kind_name(StmtKind k) {
         case STMT_FOR_SHORT: return "STMT_FOR_SHORT";
         case STMT_RETURN: return "STMT_RETURN";
         case STMT_NEXT: return "STMT_NEXT";
+        case STMT_CHECK: return "STMT_CHECK";
         case STMT_EXIT: return "STMT_EXIT";
         case STMT_BREAK: return "STMT_BREAK";
         case STMT_PRINT: return "STMT_PRINT";
@@ -720,7 +721,11 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
             chunk_write(c, OP_POP, s->loc.line);
             return true;
         }
-
+        case STMT_CHECK:{
+    if (!compile_expr(it, c, s->as.check_stmt.expr)) return false;
+    chunk_write(c, OP_INSPECT, s->loc.line);
+    return true;
+}
         case STMT_JOIN: {
             if (!s->as.join.handle) {
                 fprintf(stderr, "compile_stmt: join expects handle expression at %u:%u\n",

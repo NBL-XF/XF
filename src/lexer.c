@@ -100,6 +100,10 @@ const Keyword keywords[] = {
     "break",
     TK_KW_BREAK
   },
+      {
+    "check",
+    TK_KW_CHECK  
+  },
   {
     "delete",
     TK_KW_DELETE
@@ -1409,6 +1413,8 @@ const char * xf_token_kind_name(TokenKind kind) {
     return "kw:in";
   case TK_KW_RETURN:
     return "kw:return";
+  case TK_KW_CHECK:
+    return "kw:check";
   case TK_KW_PRINT:
     return "kw:print";
   case TK_KW_PRINTF:

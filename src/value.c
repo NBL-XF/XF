@@ -1672,20 +1672,23 @@ static void print_value_data(xf_value_t v) {
             break;
     }
 }
+void xf_value_inspect_print(xf_value_t v) {
+    print_value_data(v);
 
+    uint8_t type = xf_state_is_boolish(v.state) ? XF_TYPE_BOOL : v.type;
+
+    printf("  [%s,%s]\n",
+           XF_TYPE_NAMES[type < XF_TYPE_COUNT ? type : 0],
+           XF_STATE_NAMES[v.state < XF_STATE_COUNT ? v.state : 0]);
+}
 void xf_value_print(xf_value_t v) {
     print_value_data(v);
 }
 
 void xf_value_repl_print(xf_value_t v) {
     printf("=> ");
-    print_value_data(v);
-    uint8_t type = xf_state_is_boolish(v.state) ? XF_TYPE_BOOL : v.type;
-    printf("  [%s, %s]\n",
-           XF_TYPE_NAMES[type < XF_TYPE_COUNT ? type : 0],
-           XF_STATE_NAMES[v.state < XF_STATE_COUNT ? v.state : 0]);
+    xf_value_inspect_print(v);
 }
-
 void xf_err_print(xf_err_t *e) {
     if (!e) return;
 

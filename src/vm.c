@@ -1195,11 +1195,7 @@ case OP_MAKE_MAP: {
 case OP_INSPECT: {
     xf_Value v = vm_pop(vm);
 
-    xf_value_print(v);
-    printf("                                              [%s,%s]\n",
-           v.type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[v.type]   : "?",
-           v.state < XF_STATE_COUNT ? XF_STATE_NAMES[v.state] : "?");
-
+    xf_value_inspect_print(v);
     xf_value_release(v);
     break;
 }

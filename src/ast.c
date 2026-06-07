@@ -342,7 +342,13 @@ Stmt *ast_expr_stmt(Expr *expr, Loc loc) {
     s->as.expr.expr = expr;
     return s;
 }
+Stmt *ast_check(Expr *expr, Loc loc) {
+    Stmt *s = stmt_alloc(STMT_CHECK, loc);
+    if (!s) return NULL;
 
+    s->as.check_stmt.expr = expr;
+    return s;
+}
 Stmt *ast_var_decl(uint8_t type, xf_Str *name, Expr *init, Loc loc) {
     Stmt *s = stmt_alloc(STMT_VAR_DECL, loc);
     if (!s) return NULL;
@@ -794,7 +800,9 @@ void ast_stmt_free(Stmt *s) {
             ast_loop_bind_free(s->as.for_short.iter_val);
             ast_stmt_free(s->as.for_short.body);
             break;
-
+        case STMT_CHECK:
+            ast_expr_free(s->as.check_stmt.expr);
+            break;
         case STMT_RETURN:
             ast_expr_free(s->as.ret.value);
             break;

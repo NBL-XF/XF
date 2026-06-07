@@ -387,6 +387,7 @@ typedef enum {
 
     STMT_SUBST,
     STMT_TRANS,
+    STMT_CHECK,
 } StmtKind;
 
 
@@ -420,6 +421,9 @@ struct Stmt {
         struct {
             Expr *expr; /* owned */
         } expr;
+        struct {
+    Expr *expr;
+} check_stmt;
 
         /* STMT_VAR_DECL */
         struct {
@@ -698,7 +702,7 @@ void     ast_program_free(Program *p);
 void ast_expr_free(Expr *e);
 void ast_stmt_free(Stmt *s);
 void ast_top_free(TopLevel *t);
-
+Stmt *ast_check(Expr *expr, Loc loc);
 /* debug print */
 void ast_expr_print(const Expr *e, int indent);
 void ast_stmt_print(const Stmt *s, int indent);

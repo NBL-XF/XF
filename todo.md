@@ -1,9 +1,7 @@
-v1.0.1 "a","b" should split with OFS
-       expr spread
+v1.0.1 
        auto gc
        manual gc rip
        check state type val check var
-       printf
 v1.0.2.multithreading
         SIMD
 

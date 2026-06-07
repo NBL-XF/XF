@@ -18,6 +18,7 @@ static Expr *parse_sugar(Parser *p);
 static Expr *parse_pipe(Parser *p);
 static Stmt *parse_shorthand_while(Parser *p, Expr *cond);
 static Stmt *try_parse_shorthand_while(Parser *p);
+Stmt *parse_check(Parser *p);
 void parser_init(Parser *p, Lexer *lex, SymTable *syms) {
     p->lex        = lex;
     p->pos        = 0;
@@ -138,6 +139,7 @@ void parser_sync(Parser *p) {
             case TK_KW_FOR:
             case TK_KW_WHILE:
             case TK_KW_RETURN:
+            case TK_KW_CHECK:
             case TK_KW_PRINT:
             case TK_KW_IMPORT:
                 return;
@@ -171,6 +173,14 @@ static bool looks_like_shorthand_while(Parser *p) {
 
         i++;
     }
+}
+Stmt *parse_check(Parser *p) {
+    Token *kw = parser_previous(p);
+
+    Expr *expr = parse_expr(p);
+    if (!expr) return NULL;
+
+    return ast_check(expr, kw->loc);
 }
 static Stmt *parse_shorthand_while(Parser *p, Expr *cond) {
     if (!cond) return NULL;
@@ -2014,7 +2024,9 @@ Stmt *parse_stmt(Parser *p) {
     if (parser_match(p, TK_LBRACE)) {
         return parse_block(p);
     }
-
+    if (parser_match(p, TK_KW_CHECK)) {
+    return parse_check(p);
+}
     if (parser_match(p, TK_KW_BREAK)) {
         return ast_break(parser_previous(p)->loc);
     }
@@ -2379,6 +2391,7 @@ TopLevel *parse_top_level(Parser *p) {
         case TK_KW_NEXT:
         case TK_KW_EXIT:
         case TK_KW_DELETE:
+        case TK_KW_CHECK:
         case TK_KW_OUTFMT: {
             Stmt *s = parse_stmt(p);
             if (!s) return NULL;

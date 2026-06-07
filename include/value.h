@@ -360,5 +360,5 @@ xf_arr_t *xf_set_to_arr(const xf_set_t *s);
 void xf_value_print(xf_value_t v);
 void xf_value_repl_print(xf_value_t v);
 void xf_err_print(xf_err_t * e);
-
+void xf_value_inspect_print(xf_value_t v);
 #endif
