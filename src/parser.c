@@ -16,6 +16,8 @@ static Expr *make_call1_named_expr(Expr *callee, Expr *a0, Loc loc);
 static Expr *parse_flow_postfix(Parser *p);
 static Expr *parse_sugar(Parser *p);
 static Expr *parse_pipe(Parser *p);
+static Stmt *parse_shorthand_while(Parser *p, Expr *cond);
+static Stmt *try_parse_shorthand_while(Parser *p);
 void parser_init(Parser *p, Lexer *lex, SymTable *syms) {
     p->lex        = lex;
     p->pos        = 0;
@@ -151,6 +153,63 @@ void parser_sync(Parser *p) {
 /* ============================================================
  * Primary expressions
  * ============================================================ */
+static bool looks_like_shorthand_while(Parser *p) {
+    size_t i = 0;
+
+    for (;;) {
+        TokenKind k = parser_peek(p, i)->kind;
+
+        if (k == TK_DIAMOND) return true;
+
+        if (k == TK_EOF ||
+            k == TK_NEWLINE ||
+            k == TK_SEMICOLON ||
+            k == TK_LBRACE ||
+            k == TK_RBRACE) {
+            return false;
+        }
+
+        i++;
+    }
+}
+static Stmt *parse_shorthand_while(Parser *p, Expr *cond) {
+    if (!cond) return NULL;
+
+    Token *op = parser_previous(p); /* TK_DIAMOND */
+
+    Stmt *body = parse_stmt(p);
+    if (!body) {
+        ast_expr_free(cond);
+        return NULL;
+    }
+
+    return ast_while_short(cond, body, op->loc);
+}
+
+static Stmt *try_parse_shorthand_while(Parser *p) {
+    size_t save_pos = p->pos;
+    bool save_had_error = p->had_error;
+    bool save_panic = p->panic_mode;
+    char save_err_msg[sizeof(p->err_msg)];
+    memcpy(save_err_msg, p->err_msg, sizeof(p->err_msg));
+    Loc save_err_loc = p->err_loc;
+
+    Expr *cond = parse_expr(p);
+
+    if (cond && parser_match(p, TK_DIAMOND)) {
+        return parse_shorthand_while(p, cond);
+    }
+
+    ast_expr_free(cond);
+
+    p->pos = save_pos;
+    p->had_error = save_had_error;
+    p->panic_mode = save_panic;
+    memcpy(p->err_msg, save_err_msg, sizeof(p->err_msg));
+    p->err_loc = save_err_loc;
+
+    return NULL;
+}
 static bool looks_like_shorthand_for(Parser *p) {
     return parser_peek(p, 0)->kind == TK_IDENT &&
            parser_peek(p, 1)->kind == TK_LBRACKET &&
@@ -158,6 +217,7 @@ static bool looks_like_shorthand_for(Parser *p) {
            parser_peek(p, 3)->kind == TK_RBRACKET &&
            parser_peek(p, 4)->kind == TK_GT;
 }
+
  static bool token_is_type_kw(TokenKind k) {
     switch (k) {
         case TK_KW_NUM:
@@ -1862,19 +1922,6 @@ static Stmt *parse_stmt_body(Parser *p) {
     }
     return parse_stmt(p);
 }
-
-static Stmt *parse_shorthand_while(Parser *p, Expr *cond) {
-    if (!cond) return NULL;
-
-    Token *op = parser_previous(p); /* TK_DIAMOND */
-    Stmt *body = parse_stmt_body(p);
-    if (!body) {
-        ast_expr_free(cond);
-        return NULL;
-    }
-
-    return ast_while_short(cond, body, op->loc);
-}
 static TopLevel *parse_pattern_rule(Parser *p, Expr *pattern) {
     if (!pattern) return NULL;
 
@@ -2056,13 +2103,11 @@ if (parser_check(p, TK_KW_PRINTF)) {
     char save_err_msg[sizeof(p->err_msg)];
     memcpy(save_err_msg, p->err_msg, sizeof(p->err_msg));
     Loc save_err_loc = p->err_loc;
-
+Stmt *sw = try_parse_shorthand_while(p);
+if (sw) return sw;
     Expr *head = parse_stmt_head(p);
     if (!head) return NULL;
-
-    if (parser_match(p, TK_DIAMOND)) {
-        return parse_shorthand_while(p, head);
-    }
+    
 
     /*
      * Only treat '>' as shorthand-for if the left side is actually
@@ -2342,6 +2387,11 @@ TopLevel *parse_top_level(Parser *p) {
         default:
             break;
     }
+    if (looks_like_shorthand_while(p)) {
+    Stmt *s = parse_stmt(p);
+    if (!s) return NULL;
+    return ast_top_stmt(s, s->loc);
+}
     /*
      * Try rule parsing first for expression-headed top-level forms,
      * then fall back to stmt parsing.
@@ -2353,6 +2403,7 @@ TopLevel *parse_top_level(Parser *p) {
         char   save_err_msg[sizeof(p->err_msg)];
         memcpy(save_err_msg, p->err_msg, sizeof(p->err_msg));
         Loc    save_err_loc = p->err_loc;
+        
 if (looks_like_shorthand_for(p)) {
     Stmt *s = parse_stmt(p);
     if (!s) return NULL;
