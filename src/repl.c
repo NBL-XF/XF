@@ -12,7 +12,7 @@
 #include "../include/vm.h"
 #include "../include/value.h"
 #include "../include/interp.h"
-#define VERSION "1.0.0"
+#define VERSION "1.0.1"
 
 static void bind_runtime_specials(Interp *it) {
     if (!it || !it->vm) return;

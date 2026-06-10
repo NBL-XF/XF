@@ -3,7 +3,7 @@
 #endif
 
 #include "../include/vm.h"
-
+#include "../include/gc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -187,6 +187,7 @@ const char *opcode_name(OpCode op) {
         case OP_EXIT: return "EXIT";
         case OP_NOP: return "NOP";
         case OP_HALT: return "HALT";
+        case OP_RIP_GLOBAL: return "RIP_GLOBAL";
         default: return "?";
     }
 }
@@ -483,15 +484,17 @@ xf_Value vm_peek(const VM *vm, int dist) {
     return vm->stack[vm->stack_top - 1 - dist];
 }
 
-uint32_t vm_alloc_global(VM *vm, xf_Value init) {
-    if (vm->global_count >= vm->global_cap) {
-        vm->global_cap *= 2;
-        vm->globals = realloc(vm->globals, sizeof(xf_Value) * vm->global_cap);
+    uint32_t vm_alloc_global(VM *vm, xf_Value init) {
+        if (vm->global_count >= vm->global_cap) {
+            vm->global_cap *= 2;
+            vm->globals = realloc(vm->globals, sizeof(xf_Value) * vm->global_cap);
+        }
+        vm->globals[vm->global_count] = xf_value_retain(init);
+        uint32_t slot = (uint32_t)vm->global_count++;
+        xf_gc_check_threshold(vm);   /* fire GC every N globals */
+        return slot;
     }
-    vm->globals[vm->global_count] = xf_value_retain(init);
-    return (uint32_t)vm->global_count++;
-}
-
+ 
 xf_Value vm_get_global(VM *vm, uint32_t idx) {
     if (!vm || idx >= vm->global_count) return xf_val_undef(XF_TYPE_VOID);
     return xf_value_retain(vm->globals[idx]);
@@ -1271,6 +1274,27 @@ case OP_LOAD_GLOBAL: {
     vm_push(vm, gv);
     break;
 }
+case OP_RIP_GLOBAL: {
+    uint32_t idx = READ_U32();
+
+    if (idx >= vm->global_count) {
+        vm_error(vm, "rip: invalid global slot");
+        goto err;
+    }
+
+    xf_Value old = vm->globals[idx];
+
+    /*
+     * Mark this binding as no longer claimed.
+     * Store replacement first, then release old.
+     */
+    vm->globals[idx] = xf_val_undet(XF_TYPE_VOID);
+    xf_value_release(old);
+
+    xf_gc_check_threshold(vm);
+
+    break;
+}
             case OP_STORE_GLOBAL: {
     uint32_t idx = READ_U32();
     xf_Value v = vm_pop(vm);
@@ -1986,16 +2010,20 @@ xf_Value vm_call_function_chunk(VM *vm, Chunk *chunk, xf_Value *args, size_t arg
  * Begin/rule/end
  * ============================================================ */
 
-VMResult vm_run_begin(VM *vm) {
-    if (!vm->begin_chunk) return VM_OK;
-    return vm_run_chunk(vm, vm->begin_chunk);
-}
 
-VMResult vm_run_end(VM *vm) {
-    if (!vm->end_chunk) return VM_OK;
-    return vm_run_chunk(vm, vm->end_chunk);
-}
-
+    VMResult vm_run_begin(VM *vm) {
+        if (!vm->begin_chunk) return VM_OK;
+        VMResult r = vm_run_chunk(vm, vm->begin_chunk);
+        xf_gc_collect(vm);   /* sweep stack+frames after BEGIN */
+        return r;
+    }
+ 
+    VMResult vm_run_end(VM *vm) {
+        if (!vm->end_chunk) return VM_OK;
+        VMResult r = vm_run_chunk(vm, vm->end_chunk);
+        xf_gc_collect(vm);   /* sweep stack+frames after END */
+        return r;
+    }
 VMResult vm_feed_record(VM *vm, const char *rec, size_t len) {
         if (vm->should_exit) return VM_OK;
     split_record(vm, rec, len);

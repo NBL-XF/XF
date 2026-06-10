@@ -54,7 +54,7 @@ typedef enum {
     TK_KW_CHECK,
     TK_KW_DELETE,
     TK_KW_IMPORT,
-
+    TK_KW_RIP,
     TK_FIELD,
     TK_VAR_FILE,
     TK_VAR_MATCH,

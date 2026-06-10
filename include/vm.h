@@ -33,6 +33,7 @@ typedef enum {
     OP_STORE_LOCAL,
     OP_LOAD_GLOBAL,
     OP_STORE_GLOBAL,
+    
 
     OP_LOAD_FIELD,
     OP_STORE_FIELD,
@@ -107,7 +108,8 @@ typedef enum {
     OP_EXIT,
     OP_NOP,
     OP_HALT,
-    OP_INSPECT
+    OP_INSPECT,
+    OP_RIP_GLOBAL,
 } OpCode;
 
 typedef struct {

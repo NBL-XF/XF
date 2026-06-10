@@ -17,6 +17,7 @@ static bool compile_if_stmt(Interp *it, Chunk *c, Stmt *s);
 static bool compile_while_stmt(Interp *it, Chunk *c, Stmt *s);
 static bool compile_for_stmt(Interp *it, Chunk *c, Stmt *s);
 static bool compile_rule_pattern(Interp *it, Chunk *c, Expr *pattern);
+static bool compile_rip(Interp *it, Chunk *c, Stmt *s);
 static uint32_t compile_global_name(Interp *it, xf_Str *name);
 #define MAX_LOOP_DEPTH       64
 #define MAX_BREAK_PATCHES   512
@@ -160,6 +161,7 @@ static const char *stmt_kind_name(StmtKind k) {
         case STMT_BLOCK: return "STMT_BLOCK";
         case STMT_EXPR: return "STMT_EXPR";
         case STMT_VAR_DECL: return "STMT_VAR_DECL";
+        case STMT_RIP: return "STMT_RIP";
         case STMT_FN_DECL: return "STMT_FN_DECL";
         case STMT_IF: return "STMT_IF";
         case STMT_WHILE: return "STMT_WHILE";
@@ -471,6 +473,17 @@ bool interp_compile_program_repl(Interp *it, Program *prog) {
     g_interp_preserve_bindings = saved;
     return ok;
 }
+static bool compile_rip(Interp *it, Chunk *c, Stmt *s) {
+    if (!it || !c || !s || !s->as.rip_stmt.name) return false;
+
+    uint32_t slot = compile_global_name(it, s->as.rip_stmt.name);
+    if (slot == UINT32_MAX) return false;
+
+    chunk_write(c, OP_RIP_GLOBAL, s->loc.line);
+    chunk_write_u32(c, slot, s->loc.line);
+
+    return true;
+}
 bool interp_compile_program(Interp *it, Program *prog) {
     if (!it || !it->vm || !prog) return false;
 bool ok = false;
@@ -721,6 +734,8 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
             chunk_write(c, OP_POP, s->loc.line);
             return true;
         }
+        case STMT_RIP:
+            return compile_rip(it, c, s);
         case STMT_CHECK:{
     if (!compile_expr(it, c, s->as.check_stmt.expr)) return false;
     chunk_write(c, OP_INSPECT, s->loc.line);

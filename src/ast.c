@@ -469,7 +469,12 @@ Stmt *ast_import(xf_Str *path, Loc loc) {
     s->as.import_stmt.path = xf_str_retain(path);
     return s;
 }
-
+Stmt *ast_rip(xf_Str *name, Loc loc) {
+    Stmt *s = stmt_alloc(STMT_RIP, loc);
+    if (!s) return NULL;
+    s->as.rip_stmt.name = xf_str_retain(name);
+    return s;
+}
 Stmt *ast_delete(Expr *target, Loc loc) {
     Stmt *s = stmt_alloc(STMT_DELETE, loc);
     if (!s) return NULL;
@@ -821,6 +826,9 @@ void ast_stmt_free(Stmt *s) {
 
         case STMT_IMPORT:
             xf_str_release(s->as.import_stmt.path);
+            break;
+        case STMT_RIP:
+            xf_str_release(s->as.rip_stmt.name);
             break;
 
         case STMT_DELETE:

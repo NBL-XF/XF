@@ -142,6 +142,7 @@ void parser_sync(Parser *p) {
             case TK_KW_CHECK:
             case TK_KW_PRINT:
             case TK_KW_IMPORT:
+            case TK_KW_RIP:
                 return;
 
             default:
@@ -1845,6 +1846,21 @@ Stmt *parse_import(Parser *p) {
     xf_str_release(s);
     return out;
 }
+static Stmt *parse_rip(Parser *p) {
+    
+    Token *kw = parser_previous(p);
+
+    Token *name = parser_consume(p, TK_IDENT, "expected identifier after 'rip'");
+    if (!name) return NULL;
+
+    xf_Str *s = xf_str_new(name->lexeme, name->lexeme_len);
+    if (!s) return NULL;
+
+    Stmt *stmt = ast_rip(s, kw->loc);
+    xf_str_release(s);
+
+    return stmt;
+}
 Stmt *parse_join(Parser *p) {
     Token *kw = parser_previous(p);
     Expr *handle = NULL;
@@ -2099,7 +2115,9 @@ if (parser_check(p, TK_KW_PRINTF)) {
         return parse_printf(p);
     }
 }
-
+if (parser_match(p, TK_KW_RIP)) {
+    return parse_rip(p);
+}
     if (parser_match(p, TK_KW_IMPORT)) {
         return parse_import(p);
     }
@@ -2119,7 +2137,7 @@ Stmt *sw = try_parse_shorthand_while(p);
 if (sw) return sw;
     Expr *head = parse_stmt_head(p);
     if (!head) return NULL;
-    
+
 
     /*
      * Only treat '>' as shorthand-for if the left side is actually
@@ -2388,6 +2406,7 @@ TopLevel *parse_top_level(Parser *p) {
         case TK_KW_IMPORT:
         case TK_KW_JOIN:
         case TK_KW_BREAK:
+        case TK_KW_RIP:
         case TK_KW_NEXT:
         case TK_KW_EXIT:
         case TK_KW_DELETE:
@@ -2416,7 +2435,7 @@ TopLevel *parse_top_level(Parser *p) {
         char   save_err_msg[sizeof(p->err_msg)];
         memcpy(save_err_msg, p->err_msg, sizeof(p->err_msg));
         Loc    save_err_loc = p->err_loc;
-        
+
 if (looks_like_shorthand_for(p)) {
     Stmt *s = parse_stmt(p);
     if (!s) return NULL;

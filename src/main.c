@@ -11,6 +11,7 @@
 #include "../include/value.h"
 #include "../include/interp.h"
 #include "../include/repl.h"
+#define XF_VERSION "1.0.1"
 static int xf_run_program(Program *prog, int argc, char **argv);
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -103,15 +104,21 @@ done:
     xf_lex_free(&lex);
     return rc;
 }
-
 static void usage(const char *argv0) {
     const char *name = argv0 ? argv0 : "xf";
     fprintf(stderr,
+            "xf %s\n"
             "usage:\n"
             "  %s                 # repl\n"
             "  %s -r <file.xf>    # run file\n"
-            "  %s -e \"code\"      # execute inline source\n",
-            name, name, name);
+            "  %s -e \"code\"      # execute inline source\n"
+            "  %s -v              # print version\n"
+            "  %s --version       # print version\n",
+            XF_VERSION,
+            name, name, name, name, name);
+}
+static void print_version(void) {
+    printf("xf %s\n", XF_VERSION);
 }
 static void bind_runtime_specials(Interp *it) {
     if (!it || !it->vm) return;
@@ -276,6 +283,12 @@ cleanup:
     return rc;
 }
 int main(int argc, char **argv) {
+if (argc >= 2 &&
+        (strcmp(argv[1], "-v") == 0 ||
+         strcmp(argv[1], "--version") == 0)) {
+        print_version();
+        return 0;
+    }
     if (argc == 1) {
         return xf_run_repl();
     }

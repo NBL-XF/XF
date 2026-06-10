@@ -380,6 +380,7 @@ typedef enum {
     STMT_PRINTF,
     STMT_OUTFMT,
     STMT_IMPORT,
+    STMT_RIP,
     STMT_DELETE,
 
     STMT_SPAWN,
@@ -498,7 +499,10 @@ struct Stmt {
         struct {
             xf_Str *path; /* retained */
         } import_stmt;
-
+                /* STMT_RIP */
+        struct {
+            xf_Str *name; /* retained */
+        } rip_stmt;
         /* STMT_DELETE */
         struct {
             Expr *target; /* owned */
@@ -676,6 +680,7 @@ Stmt *ast_print(Expr **args, size_t count, Expr *redirect, uint8_t redirect_op, 
 Stmt *ast_printf_stmt(Expr **args, size_t count, Expr *redirect, uint8_t redirect_op, Loc loc);
 Stmt *ast_outfmt(uint8_t mode, Loc loc);
 Stmt *ast_import(xf_Str *path, Loc loc);
+Stmt *ast_rip(xf_Str *name, Loc loc);
 Stmt *ast_delete(Expr *target, Loc loc);
 
 Stmt *ast_spawn(Expr *call, Loc loc);

@@ -1,7 +1,7 @@
 BEGIN {
     #str path =inputPath
-    num workers = 10
-    str path ="data/data_100.csv"
+    num workers = 1000
+    str path ="data/data_500m.csv"
     #print "Input file : " .. path
     print "Workers    : " .. workers
 print "Read state : " .. core.os.read(path).state

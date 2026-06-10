@@ -5,7 +5,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-
+    /* How many globals between automatic threshold sweeps. */
+    #define XF_GC_GLOBAL_THRESHOLD 64
+ 
 /*
  * XF automatic garbage collection / runtime cleanup layer.
  *
@@ -21,6 +23,7 @@ typedef struct XfGCStats {
     size_t temp_values_released;
     size_t globals_seen;
     size_t globals_released;
+    size_t frame_locals_released;
 } XfGCStats;
 
 /*
@@ -52,4 +55,5 @@ XfGCStats xf_gc_collect_stats(VM *vm);
 void xf_gc_release_vm(VM *vm);
 void xf_gc_set_trace(bool enabled);
 bool xf_gc_get_trace(void);
+void xf_gc_check_threshold(VM *vm);
 #endif /* XF_GC_H */
