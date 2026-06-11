@@ -46,10 +46,9 @@ RUNTIME_SRCS = \
 	src/value.c \
 	src/vm.c \
  src/gc.c \
-	$(CORE_SRCS)
-# Optional later:
-# lib/driver.c
-# lib/api.c
+	$(CORE_SRCS)\
+ lib/driver.c \
+ lib/api.c 
 CLI_SRCS = \
 	src/main.c \
 	src/repl.c
