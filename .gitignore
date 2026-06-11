@@ -1,3 +1,14 @@
 bin/*
 build/*
 tests/*
+
+# Build artifacts
+*.o
+*.a
+*.dylib
+*.so
+*.dll
+XFLIB/objects/
+lib/release/static/
+build/
+dist/
