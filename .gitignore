@@ -1,3 +1,13 @@
 bin/*
 obj/*
 lib/*.a
+# Build artifacts
+*.o
+*.a
+*.dylib
+*.so
+*.dll
+lib/release/
+XFLIB/objects/
+build/
+dist/
