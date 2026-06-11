@@ -1,0 +1,11 @@
+BEGIN {
+    arr jobs = [
+        core.process.worker(core.math.sqrt, [9]),
+        core.process.worker(core.math.sqrt, [16])
+    ]
+
+    print core.process.run(jobs).type
+    print core.process.run(jobs)
+
+    exit
+}

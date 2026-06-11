@@ -56,6 +56,7 @@ static void scope_free(Scope *sc) {
         Symbol *s = &sc->entries[i];
         if (!s->name) continue;
 
+
         xf_str_release(s->name);
         xf_value_release(s->value);
         s->name = NULL;
@@ -64,7 +65,6 @@ static void scope_free(Scope *sc) {
     free(sc->entries);
     free(sc);
 }
-
 
 /* ============================================================
  * SymTable init / free
@@ -97,7 +97,6 @@ void sym_free(SymTable *st) {
     st->global  = NULL;
     st->depth   = 0;
 }
-
 
 /* ============================================================
  * Scope push / pop
@@ -312,17 +311,25 @@ Symbol *sym_define_builtin(SymTable *st, const char *name,
                            uint8_t type, xf_Value val) {
     if (!st || !st->global || !name) return NULL;
 
-    xf_Str *s = xf_str_from_cstr(name);
-    if (!s) return NULL;
+    size_t len = strlen(name);
 
-    Symbol *sym = scope_insert(st->global, s);
-    xf_str_release(s);
+    Symbol *sym = scope_find(st->global, name, len);
 
     if (!sym) {
-        st->had_error = true;
-        snprintf(st->err_msg, sizeof(st->err_msg),
-                 "failed to define builtin '%s'", name);
-        return NULL;
+        xf_Str *s = xf_str_from_cstr(name);
+        if (!s) return NULL;
+
+        sym = scope_insert(st->global, s);
+        xf_str_release(s);
+
+        if (!sym) {
+            st->had_error = true;
+            snprintf(st->err_msg, sizeof(st->err_msg),
+                     "failed to define builtin '%s'", name);
+            return NULL;
+        }
+    } else {
+        xf_value_release(sym->value);
     }
 
     sym->kind       = SYM_BUILTIN;
@@ -333,7 +340,6 @@ Symbol *sym_define_builtin(SymTable *st, const char *name,
 
     return sym;
 }
-
 
 /* ============================================================
  * Scope query helpers
@@ -624,12 +630,12 @@ static xf_value_t builtin_push(xf_value_t *args, size_t argc) {
     if (coll.state != XF_STATE_OK) return xf_val_nav(XF_TYPE_VOID);
 
     if (coll.type == XF_TYPE_ARR && coll.data.arr) {
-        xf_arr_push(coll.data.arr, xf_value_retain(val));
+    xf_arr_push(coll.data.arr, val);
         return xf_val_void(xf_val_null());
     }
 
     if (coll.type == XF_TYPE_SET && coll.data.set) {
-        if (!xf_set_add(coll.data.set, xf_value_retain(val))) {
+    if (!xf_set_add(coll.data.set, val)) {
             return xf_val_nav(XF_TYPE_VOID);
         }
         return xf_val_void(xf_val_null());
@@ -952,90 +958,62 @@ static const char *const k_builtins[] = {
 };
 
 #define BUILTIN_COUNT (sizeof(k_builtins) / sizeof(k_builtins[0]))
-
 void sym_register_builtins(SymTable *st) {
     if (!st) return;
 
-    /* real collection builtins */
-xf_value_t merge_v = xf_val_native_fn("merge", XF_TYPE_VOID, builtin_merge);
-xf_value_t split_v = xf_val_native_fn("split", XF_TYPE_ARR, builtin_split);
-        xf_value_t filter_v    = xf_val_native_fn("filter",    XF_TYPE_ARR, builtin_filter);
-xf_value_t transform_v = xf_val_native_fn("transform", XF_TYPE_ARR, builtin_transform);
-    xf_value_t push_v    = xf_val_native_fn("push",    XF_TYPE_VOID, builtin_push);
-    xf_value_t pop_v     = xf_val_native_fn("pop",     XF_TYPE_VOID, builtin_pop);
-    xf_value_t expand_v  = xf_val_native_fn("expand",  XF_TYPE_ARR, builtin_expand);
-xf_value_t flatten_v = xf_val_native_fn("flatten", XF_TYPE_ARR, builtin_flatten);
-    xf_value_t len_v = xf_val_native_fn("len", XF_TYPE_NUM, builtin_len);
+    xf_value_t merge_v     = xf_val_native_fn("merge",     XF_TYPE_VOID,  builtin_merge);
+    xf_value_t split_v     = xf_val_native_fn("split",     XF_TYPE_ARR,   builtin_split);
+    xf_value_t filter_v    = xf_val_native_fn("filter",    XF_TYPE_ARR,   builtin_filter);
+    xf_value_t transform_v = xf_val_native_fn("transform", XF_TYPE_ARR,   builtin_transform);
+    xf_value_t push_v      = xf_val_native_fn("push",      XF_TYPE_VOID,  builtin_push);
+    xf_value_t pop_v       = xf_val_native_fn("pop",       XF_TYPE_VOID,  builtin_pop);
+    xf_value_t expand_v    = xf_val_native_fn("expand",    XF_TYPE_ARR,   builtin_expand);
+    xf_value_t flatten_v   = xf_val_native_fn("flatten",   XF_TYPE_ARR,   builtin_flatten);
+    xf_value_t len_v       = xf_val_native_fn("len",       XF_TYPE_NUM,   builtin_len);
+    xf_value_t shift_v     = xf_val_native_fn("shift",     XF_TYPE_VOID,  builtin_shift);
+    xf_value_t unshift_v   = xf_val_native_fn("unshift",   XF_TYPE_VOID,  builtin_unshift);
+    xf_value_t remove_v    = xf_val_native_fn("remove",    XF_TYPE_VOID,  builtin_remove);
+    xf_value_t has_v       = xf_val_native_fn("has",       XF_TYPE_BOOL,  builtin_has);
+    xf_value_t regex_v     = xf_val_native_fn("regex",     XF_TYPE_REGEX, builtin_regex);
+    xf_value_t keys_v      = xf_val_native_fn("keys",      XF_TYPE_ARR,   builtin_keys);
+    xf_value_t values_v    = xf_val_native_fn("values",    XF_TYPE_ARR,   builtin_values);
+    xf_value_t print_v     = xf_val_native_fn("print",     XF_TYPE_VOID,  builtin_print_fn);
+    sym_define_builtin(st, "regex",     XF_TYPE_FN, regex_v);
+    sym_define_builtin(st, "len",       XF_TYPE_FN, len_v);
+    sym_define_builtin(st, "filter",    XF_TYPE_FN, filter_v);
+    sym_define_builtin(st, "transform", XF_TYPE_FN, transform_v);
+    sym_define_builtin(st, "push",      XF_TYPE_FN, push_v);
+    sym_define_builtin(st, "pop",       XF_TYPE_FN, pop_v);
+    sym_define_builtin(st, "shift",     XF_TYPE_FN, shift_v);
+    sym_define_builtin(st, "unshift",   XF_TYPE_FN, unshift_v);
+    sym_define_builtin(st, "remove",    XF_TYPE_FN, remove_v);
+    sym_define_builtin(st, "expand",    XF_TYPE_FN, expand_v);
+    sym_define_builtin(st, "flatten",   XF_TYPE_FN, flatten_v);
+    sym_define_builtin(st, "has",       XF_TYPE_FN, has_v);
+    sym_define_builtin(st, "keys",      XF_TYPE_FN, keys_v);
+    sym_define_builtin(st, "values",    XF_TYPE_FN, values_v);
+    sym_define_builtin(st, "print",     XF_TYPE_FN, print_v);
+    sym_define_builtin(st, "merge",     XF_TYPE_FN, merge_v);
+    sym_define_builtin(st, "split",     XF_TYPE_FN, split_v);
 
-    xf_value_t shift_v   = xf_val_native_fn("shift",   XF_TYPE_VOID, builtin_shift);
-    xf_value_t unshift_v = xf_val_native_fn("unshift", XF_TYPE_VOID, builtin_unshift);
-    xf_value_t remove_v  = xf_val_native_fn("remove",  XF_TYPE_VOID, builtin_remove);
-    xf_value_t has_v     = xf_val_native_fn("has",     XF_TYPE_BOOL, builtin_has);
-xf_value_t regex_v = xf_val_native_fn("regex", XF_TYPE_REGEX, builtin_regex);        
-    xf_value_t keys_v    = xf_val_native_fn("keys",    XF_TYPE_ARR,  builtin_keys);
-    xf_value_t values_v  = xf_val_native_fn("values",  XF_TYPE_ARR,  builtin_values);
-    xf_value_t print_v   = xf_val_native_fn("print", XF_TYPE_VOID, builtin_print_fn);
-sym_define_builtin(st, "regex", XF_TYPE_FN, regex_v);
-sym_define_builtin(st, "len", XF_TYPE_FN, len_v);
-xf_value_release(len_v);
-sym_define_builtin(st, "filter",    XF_TYPE_FN, filter_v);
-sym_define_builtin(st, "transform", XF_TYPE_FN, transform_v);
-    sym_define_builtin(st, "push",    XF_TYPE_FN, push_v);
-    sym_define_builtin(st, "pop",     XF_TYPE_FN, pop_v);
-    sym_define_builtin(st, "shift",   XF_TYPE_FN, shift_v);
-    sym_define_builtin(st, "regex", XF_TYPE_FN, regex_v);
-    sym_define_builtin(st, "unshift", XF_TYPE_FN, unshift_v);
-    sym_define_builtin(st, "remove",  XF_TYPE_FN, remove_v);
-    sym_define_builtin(st, "expand",  XF_TYPE_FN, expand_v);
-sym_define_builtin(st, "flatten", XF_TYPE_FN, flatten_v);
-    sym_define_builtin(st, "has",     XF_TYPE_FN, has_v);
-    sym_define_builtin(st, "keys",    XF_TYPE_FN, keys_v);
-    sym_define_builtin(st, "values",  XF_TYPE_FN, values_v);
-    sym_define_builtin(st, "print", XF_TYPE_FN, print_v);
-    sym_define_builtin(st, "merge", XF_TYPE_FN, merge_v);
-sym_define_builtin(st, "split", XF_TYPE_FN, split_v);
-xf_value_release(merge_v);
-xf_value_release(regex_v);
-xf_value_release(split_v);
+    xf_value_release(regex_v);
+    xf_value_release(len_v);
+    xf_value_release(filter_v);
+    xf_value_release(transform_v);
     xf_value_release(push_v);
     xf_value_release(pop_v);
     xf_value_release(shift_v);
     xf_value_release(unshift_v);
-    xf_value_release(filter_v);
-xf_value_release(transform_v);
-xf_value_release(expand_v);
-xf_value_release(flatten_v);
     xf_value_release(remove_v);
+    xf_value_release(expand_v);
+    xf_value_release(flatten_v);
     xf_value_release(has_v);
     xf_value_release(keys_v);
     xf_value_release(values_v);
     xf_value_release(print_v);
-    /* keep the rest as placeholders for now */
-    xf_Value fn_undef = xf_val_undef(XF_TYPE_FN);
+    xf_value_release(merge_v);
+    xf_value_release(split_v);
 
-    for (size_t i = 0; i < BUILTIN_COUNT; i++) {
-        const char *name = k_builtins[i];
-
-        if (strcmp(name, "push")    == 0 ||
-            strcmp(name, "pop")     == 0 ||
-            strcmp(name, "len") == 0 ||
-            strcmp(name, "expand") == 0 ||
-            strcmp(name, "regex") == 0 ||
-strcmp(name, "flatten") == 0 ||
-            strcmp(name, "shift")   == 0 ||
-            strcmp(name, "unshift") == 0 ||
-            strcmp(name, "remove")  == 0 ||
-            strcmp(name, "has")     == 0 ||
-            strcmp(name, "keys")    == 0 ||
-            strcmp(name, "print") == 0 ||
-            strcmp(name, "merge") == 0 ||
-strcmp(name, "split") == 0 ||
-            strcmp(name, "values")  == 0) {
-            continue;
-        }
-
-        sym_define_builtin(st, name, XF_TYPE_FN, fn_undef);
-    }
 }
 /* ============================================================
  * Debug

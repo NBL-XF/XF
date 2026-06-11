@@ -100,6 +100,10 @@ const Keyword keywords[] = {
     "break",
     TK_KW_BREAK
   },
+      {
+    "check",
+    TK_KW_CHECK
+  },
   {
     "delete",
     TK_KW_DELETE
@@ -136,7 +140,7 @@ const Keyword keywords[] = {
     "import",
     TK_KW_IMPORT
   },
-  {
+      {
     "in",
     TK_KW_IN
   },
@@ -172,6 +176,10 @@ const Keyword keywords[] = {
     "return",
     TK_KW_RETURN
   },
+  {
+  "rip",
+  TK_KW_RIP
+},
   {
     "set",
     TK_KW_SET
@@ -1409,6 +1417,8 @@ const char * xf_token_kind_name(TokenKind kind) {
     return "kw:in";
   case TK_KW_RETURN:
     return "kw:return";
+  case TK_KW_CHECK:
+    return "kw:check";
   case TK_KW_PRINT:
     return "kw:print";
   case TK_KW_PRINTF:
@@ -1429,6 +1439,8 @@ const char * xf_token_kind_name(TokenKind kind) {
     return "kw:delete";
   case TK_KW_IMPORT:
     return "kw:import";
+  case TK_KW_RIP:
+    return "kw:rip";
   case TK_FIELD:
     return "FIELD";
   case TK_VAR_FILE:

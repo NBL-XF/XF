@@ -16,6 +16,9 @@ static Expr *make_call1_named_expr(Expr *callee, Expr *a0, Loc loc);
 static Expr *parse_flow_postfix(Parser *p);
 static Expr *parse_sugar(Parser *p);
 static Expr *parse_pipe(Parser *p);
+static Stmt *parse_shorthand_while(Parser *p, Expr *cond);
+static Stmt *try_parse_shorthand_while(Parser *p);
+Stmt *parse_check(Parser *p);
 void parser_init(Parser *p, Lexer *lex, SymTable *syms) {
     p->lex        = lex;
     p->pos        = 0;
@@ -136,8 +139,10 @@ void parser_sync(Parser *p) {
             case TK_KW_FOR:
             case TK_KW_WHILE:
             case TK_KW_RETURN:
+            case TK_KW_CHECK:
             case TK_KW_PRINT:
             case TK_KW_IMPORT:
+            case TK_KW_RIP:
                 return;
 
             default:
@@ -151,7 +156,79 @@ void parser_sync(Parser *p) {
 /* ============================================================
  * Primary expressions
  * ============================================================ */
- 
+static bool looks_like_shorthand_while(Parser *p) {
+    size_t i = 0;
+
+    for (;;) {
+        TokenKind k = parser_peek(p, i)->kind;
+
+        if (k == TK_DIAMOND) return true;
+
+        if (k == TK_EOF ||
+            k == TK_NEWLINE ||
+            k == TK_SEMICOLON ||
+            k == TK_LBRACE ||
+            k == TK_RBRACE) {
+            return false;
+        }
+
+        i++;
+    }
+}
+Stmt *parse_check(Parser *p) {
+    Token *kw = parser_previous(p);
+
+    Expr *expr = parse_expr(p);
+    if (!expr) return NULL;
+
+    return ast_check(expr, kw->loc);
+}
+static Stmt *parse_shorthand_while(Parser *p, Expr *cond) {
+    if (!cond) return NULL;
+
+    Token *op = parser_previous(p); /* TK_DIAMOND */
+
+    Stmt *body = parse_stmt(p);
+    if (!body) {
+        ast_expr_free(cond);
+        return NULL;
+    }
+
+    return ast_while_short(cond, body, op->loc);
+}
+
+static Stmt *try_parse_shorthand_while(Parser *p) {
+    size_t save_pos = p->pos;
+    bool save_had_error = p->had_error;
+    bool save_panic = p->panic_mode;
+    char save_err_msg[sizeof(p->err_msg)];
+    memcpy(save_err_msg, p->err_msg, sizeof(p->err_msg));
+    Loc save_err_loc = p->err_loc;
+
+    Expr *cond = parse_expr(p);
+
+    if (cond && parser_match(p, TK_DIAMOND)) {
+        return parse_shorthand_while(p, cond);
+    }
+
+    ast_expr_free(cond);
+
+    p->pos = save_pos;
+    p->had_error = save_had_error;
+    p->panic_mode = save_panic;
+    memcpy(p->err_msg, save_err_msg, sizeof(p->err_msg));
+    p->err_loc = save_err_loc;
+
+    return NULL;
+}
+static bool looks_like_shorthand_for(Parser *p) {
+    return parser_peek(p, 0)->kind == TK_IDENT &&
+           parser_peek(p, 1)->kind == TK_LBRACKET &&
+           parser_peek(p, 2)->kind == TK_IDENT &&
+           parser_peek(p, 3)->kind == TK_RBRACKET &&
+           parser_peek(p, 4)->kind == TK_GT;
+}
+
  static bool token_is_type_kw(TokenKind k) {
     switch (k) {
         case TK_KW_NUM:
@@ -1769,6 +1846,21 @@ Stmt *parse_import(Parser *p) {
     xf_str_release(s);
     return out;
 }
+static Stmt *parse_rip(Parser *p) {
+    
+    Token *kw = parser_previous(p);
+
+    Token *name = parser_consume(p, TK_IDENT, "expected identifier after 'rip'");
+    if (!name) return NULL;
+
+    xf_Str *s = xf_str_new(name->lexeme, name->lexeme_len);
+    if (!s) return NULL;
+
+    Stmt *stmt = ast_rip(s, kw->loc);
+    xf_str_release(s);
+
+    return stmt;
+}
 Stmt *parse_join(Parser *p) {
     Token *kw = parser_previous(p);
     Expr *handle = NULL;
@@ -1855,19 +1947,6 @@ static Stmt *parse_stmt_body(Parser *p) {
         return parse_block(p);
     }
     return parse_stmt(p);
-}
-
-static Stmt *parse_shorthand_while(Parser *p, Expr *cond) {
-    if (!cond) return NULL;
-
-    Token *op = parser_previous(p); /* TK_DIAMOND */
-    Stmt *body = parse_stmt_body(p);
-    if (!body) {
-        ast_expr_free(cond);
-        return NULL;
-    }
-
-    return ast_while_short(cond, body, op->loc);
 }
 static TopLevel *parse_pattern_rule(Parser *p, Expr *pattern) {
     if (!pattern) return NULL;
@@ -1961,7 +2040,9 @@ Stmt *parse_stmt(Parser *p) {
     if (parser_match(p, TK_LBRACE)) {
         return parse_block(p);
     }
-
+    if (parser_match(p, TK_KW_CHECK)) {
+    return parse_check(p);
+}
     if (parser_match(p, TK_KW_BREAK)) {
         return ast_break(parser_previous(p)->loc);
     }
@@ -2034,7 +2115,9 @@ if (parser_check(p, TK_KW_PRINTF)) {
         return parse_printf(p);
     }
 }
-
+if (parser_match(p, TK_KW_RIP)) {
+    return parse_rip(p);
+}
     if (parser_match(p, TK_KW_IMPORT)) {
         return parse_import(p);
     }
@@ -2050,13 +2133,11 @@ if (parser_check(p, TK_KW_PRINTF)) {
     char save_err_msg[sizeof(p->err_msg)];
     memcpy(save_err_msg, p->err_msg, sizeof(p->err_msg));
     Loc save_err_loc = p->err_loc;
-
+Stmt *sw = try_parse_shorthand_while(p);
+if (sw) return sw;
     Expr *head = parse_stmt_head(p);
     if (!head) return NULL;
 
-    if (parser_match(p, TK_DIAMOND)) {
-        return parse_shorthand_while(p, head);
-    }
 
     /*
      * Only treat '>' as shorthand-for if the left side is actually
@@ -2325,9 +2406,11 @@ TopLevel *parse_top_level(Parser *p) {
         case TK_KW_IMPORT:
         case TK_KW_JOIN:
         case TK_KW_BREAK:
+        case TK_KW_RIP:
         case TK_KW_NEXT:
         case TK_KW_EXIT:
         case TK_KW_DELETE:
+        case TK_KW_CHECK:
         case TK_KW_OUTFMT: {
             Stmt *s = parse_stmt(p);
             if (!s) return NULL;
@@ -2336,6 +2419,11 @@ TopLevel *parse_top_level(Parser *p) {
         default:
             break;
     }
+    if (looks_like_shorthand_while(p)) {
+    Stmt *s = parse_stmt(p);
+    if (!s) return NULL;
+    return ast_top_stmt(s, s->loc);
+}
     /*
      * Try rule parsing first for expression-headed top-level forms,
      * then fall back to stmt parsing.
@@ -2348,6 +2436,11 @@ TopLevel *parse_top_level(Parser *p) {
         memcpy(save_err_msg, p->err_msg, sizeof(p->err_msg));
         Loc    save_err_loc = p->err_loc;
 
+if (looks_like_shorthand_for(p)) {
+    Stmt *s = parse_stmt(p);
+    if (!s) return NULL;
+    return ast_top_stmt(s, s->loc);
+}
         TopLevel *rule = parse_rule(p);
         if (rule) return rule;
 
@@ -2456,6 +2549,15 @@ Stmt *parse_while(Parser *p) {
 
     return ast_while(cond, body, kw->loc);
 }
+
+static void parser_free_params(Param *params, size_t count) {
+    if (!params) return;
+    for (size_t i = 0; i < count; i++) {
+        xf_str_release(params[i].name);
+        ast_expr_free(params[i].default_val);
+    }
+    free(params);
+}
 Stmt *parse_fn_decl(Parser *p, uint8_t ret_type) {
     Token *fn_tok = parser_previous(p);
 
@@ -2474,25 +2576,25 @@ Stmt *parse_fn_decl(Parser *p, uint8_t ret_type) {
     Param *params = parse_paramlist(p, &param_count);
     if (p->had_error) { /* ignore if your compiler wants p->had_error here */
         xf_str_release(name);
+        parser_free_params(params, param_count);
         return NULL;
     }
 
     if (!parser_consume(p, TK_RPAREN, "expected ')' after parameter list")) {
         xf_str_release(name);
-        free(params);
+        parser_free_params(params, param_count);
         return NULL;
     }
 
     if (!parser_consume(p, TK_LBRACE, "expected '{' before function body")) {
         xf_str_release(name);
-        free(params);
         return NULL;
     }
 
     Stmt *body = parse_block(p);
     if (!body) {
         xf_str_release(name);
-        free(params);
+         parser_free_params(params, param_count);
         return NULL;
     }
 
@@ -2544,7 +2646,7 @@ Param *parse_paramlist(Parser *p, size_t *out_count) {
             Param *tmp = realloc(params, new_cap * sizeof(Param));
             if (!tmp) {
                 xf_str_release(name);
-                free(params);
+                 parser_free_params(params, count);
                 return NULL;
             }
             params = tmp;

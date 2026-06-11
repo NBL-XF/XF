@@ -1,0 +1,6 @@
+BEGIN {
+    print core.math.sqrt(9)
+    print core.str.upper("hello")
+    print core.process.run("ls")
+    exit
+}

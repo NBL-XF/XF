@@ -1,0 +1,9 @@
+BEGIN {
+    print "before"
+    exit
+    print "after"
+}
+
+END {
+    print "end"
+}

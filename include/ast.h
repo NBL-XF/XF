@@ -380,6 +380,7 @@ typedef enum {
     STMT_PRINTF,
     STMT_OUTFMT,
     STMT_IMPORT,
+    STMT_RIP,
     STMT_DELETE,
 
     STMT_SPAWN,
@@ -387,6 +388,7 @@ typedef enum {
 
     STMT_SUBST,
     STMT_TRANS,
+    STMT_CHECK,
 } StmtKind;
 
 
@@ -420,6 +422,9 @@ struct Stmt {
         struct {
             Expr *expr; /* owned */
         } expr;
+        struct {
+    Expr *expr;
+} check_stmt;
 
         /* STMT_VAR_DECL */
         struct {
@@ -494,7 +499,10 @@ struct Stmt {
         struct {
             xf_Str *path; /* retained */
         } import_stmt;
-
+                /* STMT_RIP */
+        struct {
+            xf_Str *name; /* retained */
+        } rip_stmt;
         /* STMT_DELETE */
         struct {
             Expr *target; /* owned */
@@ -672,6 +680,7 @@ Stmt *ast_print(Expr **args, size_t count, Expr *redirect, uint8_t redirect_op, 
 Stmt *ast_printf_stmt(Expr **args, size_t count, Expr *redirect, uint8_t redirect_op, Loc loc);
 Stmt *ast_outfmt(uint8_t mode, Loc loc);
 Stmt *ast_import(xf_Str *path, Loc loc);
+Stmt *ast_rip(xf_Str *name, Loc loc);
 Stmt *ast_delete(Expr *target, Loc loc);
 
 Stmt *ast_spawn(Expr *call, Loc loc);
@@ -698,7 +707,7 @@ void     ast_program_free(Program *p);
 void ast_expr_free(Expr *e);
 void ast_stmt_free(Stmt *s);
 void ast_top_free(TopLevel *t);
-
+Stmt *ast_check(Expr *expr, Loc loc);
 /* debug print */
 void ast_expr_print(const Expr *e, int indent);
 void ast_stmt_print(const Stmt *s, int indent);

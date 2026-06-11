@@ -1,0 +1,6 @@
+for (it in items) {
+    print it
+}
+for ((k, v) in pairs) {
+    print k
+}

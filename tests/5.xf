@@ -1,0 +1,10 @@
+BEGIN {
+    print "init"
+}
+
+num x = 5
+print x
+
+END {
+    print "done"
+}

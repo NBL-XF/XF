@@ -1,0 +1,8 @@
+OFS = "|"
+
+BEGIN {
+    print OFS
+    print "a", "b"
+    print "a"..OFS.."b"
+    exit
+}

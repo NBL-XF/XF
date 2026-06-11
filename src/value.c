@@ -10,15 +10,6 @@
  * Debug / trace
  * ============================================================ */
 
-#ifndef XF_REF_TRACE
-#define XF_REF_TRACE 0
-#endif
-
-#if XF_REF_TRACE
-#define TRACE(fmt, ...) fprintf(stderr, "[REF] " fmt "\n", ##__VA_ARGS__)
-#else
-#define TRACE(fmt, ...) ((void)0)
-#endif
 
 /* ============================================================
  * Global name tables
@@ -85,7 +76,6 @@ xf_str_t *xf_str_new(const char *data, size_t len) {
     }
     s->data[len] = '\0';
 
-    TRACE("STR NEW %p rc=1 \"%s\"", (void *)s, s->data);
     return s;
 }
 
@@ -93,32 +83,23 @@ xf_str_t *xf_str_from_cstr(const char *cstr) {
     if (!cstr) return xf_str_new("", 0);
     return xf_str_new(cstr, strlen(cstr));
 }
-
 xf_str_t *xf_str_retain(xf_str_t *s) {
     if (!s) return NULL;
-
-    int old = atomic_fetch_add(&s->refcount, 1);
-    TRACE("STR RET %p rc=%d \"%s\"", (void *)s, old + 1, s->data);
+    atomic_fetch_add(&s->refcount, 1);
     return s;
 }
-
 void xf_str_release(xf_str_t *s) {
     if (!s) return;
 
-    int old = atomic_fetch_sub(&s->refcount, 1);
-    if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_str_release underflow on %p\n", (void *)s);
+    int prev = atomic_load(&s->refcount);
+
+    if (prev <= 0) {
         __builtin_trap();
     }
 
-    TRACE("STR REL %p rc=%d \"%s\"", (void *)s, old - 1, s->data);
-
-    if (old == 1) {
-        TRACE("STR FREE %p \"%s\"", (void *)s, s->data);
-        free(s);
-    }
+    int old = atomic_fetch_sub(&s->refcount, 1);
+    if (old == 1) free(s);
 }
-
 uint32_t xf_str_hash(xf_str_t *s) {
     if (!s) return 0;
     if (s->hash != 0) return s->hash;
@@ -310,7 +291,6 @@ xf_value_t xf_val_undef(uint8_t type) {
     v.type  = type;
     return v;
 }
-
 xf_value_t xf_val_native_fn(const char *name, uint8_t ret_type,
                             xf_value_t (*fn)(xf_value_t *args, size_t argc)) {
     xf_fn_t *f = calloc(1, sizeof(xf_fn_t));
@@ -323,10 +303,10 @@ xf_value_t xf_val_native_fn(const char *name, uint8_t ret_type,
     f->native_v    = fn;
 
     xf_value_t v = xf_val_ok_fn(f);
-    xf_fn_release(f);
+    xf_fn_release(f);   // ✅ KEEP THIS
+
     return v;
 }
-
 xf_value_t xf_val_str_borrow(xf_str_t *s) {
     /* safer to treat this as retained under current ownership rules */
     return xf_val_ok_str(s);
@@ -370,7 +350,6 @@ void xf_err_release(xf_err_t *e) {
 
     int old = atomic_fetch_sub(&e->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_err_release underflow on %p\n", (void *)e);
         __builtin_trap();
     }
 
@@ -483,7 +462,9 @@ void xf_value_release(xf_Value v) {
         case XF_TYPE_STR:    xf_str_release(v.data.str);     break;
         case XF_TYPE_MAP:    xf_map_release(v.data.map);     break;
         case XF_TYPE_ARR:    xf_arr_release(v.data.arr);     break;
-        case XF_TYPE_FN:     xf_fn_release(v.data.fn);       break;
+        case XF_TYPE_FN:
+    xf_fn_release(v.data.fn);
+    break;
         case XF_TYPE_SET:    xf_set_release(v.data.set);    break;
         case XF_TYPE_REGEX:  xf_regex_release(v.data.re);    break;
         case XF_TYPE_MODULE: xf_module_release(v.data.mod);  break;
@@ -506,38 +487,46 @@ xf_fn_t *xf_fn_retain(xf_fn_t *f) {
     atomic_fetch_add(&f->refcount, 1);
     return f;
 }
-
+/* file: value.c */
 void xf_fn_release(xf_fn_t *f) {
     if (!f) return;
 
     int old = atomic_fetch_sub(&f->refcount, 1);
+
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_fn_release underflow on %p\n", (void *)f);
         __builtin_trap();
     }
 
-    if (old != 1) return;
+    if (old != 1) {
+        return;
+    }
 
-    xf_str_release(f->name);
+
+    if (f->name) {
+        xf_str_release(f->name);
+        f->name = NULL;
+    }
 
     if (f->params) {
         for (size_t i = 0; i < f->param_count; i++) {
-            xf_str_release(f->params[i].name);
-            if (f->params[i].default_val) {
-                xf_value_release(*f->params[i].default_val);
-                free(f->params[i].default_val);
+            if (f->params[i].name) {
+                xf_str_release(f->params[i].name);
+                f->params[i].name = NULL;
             }
         }
+
         free(f->params);
+        f->params = NULL;
     }
-        if (!f->is_native && f->body) {
+
+    if (!f->is_native && f->body) {
         chunk_free((Chunk *)f->body);
-        free((Chunk *)f->body);
+        free(f->body);
         f->body = NULL;
     }
+
     free(f);
 }
-
 xf_regex_t *xf_regex_retain(xf_regex_t *r) {
     if (!r) return NULL;
     atomic_fetch_add(&r->refcount, 1);
@@ -549,7 +538,6 @@ void xf_regex_release(xf_regex_t *r) {
 
     int old = atomic_fetch_sub(&r->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_regex_release underflow on %p\n", (void *)r);
         __builtin_trap();
     }
 
@@ -603,7 +591,6 @@ void xf_tuple_release(xf_tuple_t *t) {
 
     int old = atomic_fetch_sub(&t->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_tuple_release underflow on %p\n", (void *)t);
         __builtin_trap();
     }
 
@@ -702,7 +689,6 @@ void xf_set_release(xf_set_t *s) {
 
     int old = atomic_fetch_sub(&s->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_set_release underflow on %p\n", (void *)s);
         __builtin_trap();
     }
 
@@ -821,7 +807,6 @@ void xf_arr_release(xf_arr_t *a) {
 
     int old = atomic_fetch_sub(&a->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_arr_release underflow on %p\n", (void *)a);
         __builtin_trap();
     }
 
@@ -1013,7 +998,6 @@ void xf_map_release(xf_map_t *m) {
 
     int old = atomic_fetch_sub(&m->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_map_release underflow on %p\n", (void *)m);
         __builtin_trap();
     }
 
@@ -1034,25 +1018,27 @@ void xf_map_release(xf_map_t *m) {
 void xf_map_set(xf_map_t *m, xf_str_t *key, xf_value_t val) {
     if (!m || !key) return;
 
-    if ((double)m->used / (double)m->cap > MAP_LOAD_FACTOR) {
-        if (!xf_map_resize(m, m->cap * 2)) return;
+    if ((double)(m->used + 1) / (double)m->cap > MAP_LOAD_FACTOR) {
+        if (!xf_map_resize(m, m->cap ? m->cap * 2 : MAP_INIT_CAP)) return;
     }
 
     size_t idx = xf_map_probe(m, key);
     xf_map_slot_t *slot = &m->slots[idx];
 
     if (slot->key) {
+        // overwrite existing key
         xf_value_release(slot->val);
         slot->val = xf_value_retain(val);
         return;
     }
 
+    // new entry: map must own both key and value
     slot->key = xf_str_retain(key);
     slot->val = xf_value_retain(val);
     m->used++;
+
     xf_map_order_append(m, slot->key);
 }
-
 xf_value_t xf_map_get(const xf_map_t *m, const xf_str_t *key) {
     if (!m || !key) return xf_val_nav(XF_TYPE_VOID);
 
@@ -1150,17 +1136,19 @@ xf_module_t *xf_module_retain(xf_module_t *m) {
     atomic_fetch_add(&m->refcount, 1);
     return m;
 }
-
 void xf_module_release(xf_module_t *m) {
     if (!m) return;
 
+    int before = atomic_load(&m->refcount);
+
+
     int old = atomic_fetch_sub(&m->refcount, 1);
     if (old <= 0) {
-        fprintf(stderr, "[BUG] xf_module_release underflow on %p\n", (void *)m);
         __builtin_trap();
     }
 
     if (old != 1) return;
+
 
     for (size_t i = 0; i < m->count; i++) {
         xf_value_release(m->entries[i].val);
@@ -1169,7 +1157,6 @@ void xf_module_release(xf_module_t *m) {
     free(m->entries);
     free(m);
 }
-
 void xf_module_set(xf_module_t *m, const char *name, xf_value_t val) {
     if (!m || !name) return;
 
@@ -1245,7 +1232,6 @@ static bool xf_state_is_boolish(uint8_t state) {
            state == XF_STATE_FALSE ||
            state == XF_STATE_UNDET;
 }
-
 xf_value_t xf_coerce_num(xf_value_t v) {
     if (v.state == XF_STATE_TRUE)  return xf_val_ok_num(1.0);
     if (v.state == XF_STATE_FALSE) return xf_val_ok_num(0.0);
@@ -1264,8 +1250,8 @@ xf_value_t xf_coerce_num(xf_value_t v) {
         return out;
     }
 
-    if (v.state != XF_STATE_OK) return v;
-    if (v.type == XF_TYPE_NUM)  return v;
+    if (v.state != XF_STATE_OK) return xf_value_retain(v);
+    if (v.type == XF_TYPE_NUM)  return xf_value_retain(v);  // ← was: return v
 
     if (v.type == XF_TYPE_STR) {
         char *end = NULL;
@@ -1459,8 +1445,7 @@ xf_value_t xf_coerce_str(xf_value_t v) {
         xf_str_release(s);
         return out;
     }
-
-    if (v.state != XF_STATE_OK) return v;
+if (v.state != XF_STATE_OK) return xf_value_retain(v);
     if (v.type == XF_TYPE_STR) return xf_value_retain(v);
 
     char buf[128];
@@ -1687,20 +1672,23 @@ static void print_value_data(xf_value_t v) {
             break;
     }
 }
+void xf_value_inspect_print(xf_value_t v) {
+    print_value_data(v);
 
+    uint8_t type = xf_state_is_boolish(v.state) ? XF_TYPE_BOOL : v.type;
+
+    printf("  [%s,%s]\n",
+           XF_TYPE_NAMES[type < XF_TYPE_COUNT ? type : 0],
+           XF_STATE_NAMES[v.state < XF_STATE_COUNT ? v.state : 0]);
+}
 void xf_value_print(xf_value_t v) {
     print_value_data(v);
 }
 
 void xf_value_repl_print(xf_value_t v) {
     printf("=> ");
-    print_value_data(v);
-    uint8_t type = xf_state_is_boolish(v.state) ? XF_TYPE_BOOL : v.type;
-    printf("  [%s, %s]\n",
-           XF_TYPE_NAMES[type < XF_TYPE_COUNT ? type : 0],
-           XF_STATE_NAMES[v.state < XF_STATE_COUNT ? v.state : 0]);
+    xf_value_inspect_print(v);
 }
-
 void xf_err_print(xf_err_t *e) {
     if (!e) return;
 

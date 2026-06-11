@@ -1,0 +1,612 @@
+# =============================================================================
+# xf torture test suite
+# Run with:  xf -r torture.xf
+# Every test calls PASS(label) or FAIL(label, got, expected).
+# Final line prints total counts; exits 1 if any failure.
+# =============================================================================
+num _pass = 0
+num _fail = 0
+
+void fn PASS(str label) {
+    print "PASS  " .. label
+    _pass = _pass + 1
+}
+void fn FAIL(str label, str got, str expected) {
+    print "FAIL  " .. label .. "  got=" .. got .. "  expected=" .. expected
+    _fail = _fail + 1
+}
+
+void fn CHECK(str label, str got, str expected) {
+    if (got == expected) { PASS(label) }
+    else { FAIL(label, got, expected) }
+}
+
+void fn CHECK_NUM(str label, num got, num expected) {
+    if (got == expected) { PASS(label) }
+    else { FAIL(label, got .. "", expected .. "") }
+}
+
+void fn CHECK_BOOL(str label, bool got, bool expected) {
+    if (got == expected) { PASS(label) }
+    else { FAIL(label, got .. "", expected .. "") }
+}
+BEGIN{
+
+
+# ── §1  Literals & basic types ─────────────────────────────────────────────
+CHECK_NUM("lit/int",     42,    42)
+CHECK_NUM("lit/float",   3.14,  3.14)
+CHECK("lit/str/dq",      "hello", "hello")
+CHECK("lit/str/sq",      'world', 'world')
+CHECK("lit/str/esc",     "a\tb",  "a\tb")
+CHECK_BOOL("lit/TRUE",   TRUE,    TRUE)
+CHECK_BOOL("lit/FALSE",  FALSE,   FALSE)
+CHECK_NUM("lit/hex",     0xFF,    255)
+
+
+# ── §2  Arithmetic ──────────────────────────────────────────────────────────
+CHECK_NUM("arith/add",    2 + 3,       5)
+CHECK_NUM("arith/sub",    10 - 4,      6)
+CHECK_NUM("arith/mul",    3 * 4,       12)
+CHECK_NUM("arith/div",    9 / 4,       2.25)
+CHECK_NUM("arith/mod",    10 % 3,      1)
+CHECK_NUM("arith/pow",    2 ^ 10,      1024)
+CHECK_NUM("arith/neg",    -7,          -7)
+CHECK_NUM("arith/prec",   2 + 3 * 4,   14)
+CHECK_NUM("arith/parens", (2 + 3) * 4, 20)
+CHECK_NUM("arith/unary",  -(3+2),      -5)
+
+
+# ── §3  String concat (..) ─────────────────────────────────────────────────
+CHECK("concat/basic",     "foo" .. "bar",    "foobar")
+CHECK("concat/num",       "val=" .. 42,      "val=42")
+CHECK("concat/chain",     "a" .. "b" .. "c", "abc")
+CHECK("concat/empty",     "" .. "x",         "x")
+
+
+# ── §4  Comparison ──────────────────────────────────────────────────────────
+CHECK_BOOL("cmp/eq_num",   3 == 3,   TRUE)
+CHECK_BOOL("cmp/eq_str",   "a"=="a", TRUE)
+CHECK_BOOL("cmp/neq",      1 != 2,   TRUE)
+CHECK_BOOL("cmp/lt",       1 < 2,    TRUE)
+CHECK_BOOL("cmp/gt",       2 > 1,    TRUE)
+CHECK_BOOL("cmp/lte_eq",   2 <= 2,   TRUE)
+CHECK_BOOL("cmp/gte_eq",   2 >= 2,   TRUE)
+CHECK_NUM("cmp/ship_lt",   1 <=> 2,  -1)
+CHECK_NUM("cmp/ship_eq",   2 <=> 2,   0)
+CHECK_NUM("cmp/ship_gt",   3 <=> 2,   1)
+CHECK_BOOL("cmp/arr_true", ([] == TRUE), FALSE)
+CHECK_BOOL("cmp/arr_false", [] == FALSE, FALSE)
+CHECK_NUM("cmp/ship_cross", [] <=> TRUE, 0)
+
+
+# ── §5  Logical ─────────────────────────────────────────────────────────────
+CHECK_BOOL("logic/and_tt",  TRUE  && TRUE,  TRUE)
+CHECK_BOOL("logic/and_tf",  TRUE  && FALSE, FALSE)
+CHECK_BOOL("logic/or_ff",   FALSE || FALSE, FALSE)
+CHECK_BOOL("logic/or_tf",   FALSE || TRUE,  TRUE)
+CHECK_BOOL("logic/not_t",   !TRUE,          FALSE)
+CHECK_BOOL("logic/not_f",   !FALSE,         TRUE)
+CHECK_BOOL("logic/short_and", FALSE && (1/0 > 0), FALSE)
+CHECK_BOOL("logic/short_or",  TRUE  || (1/0 > 0), TRUE)
+
+
+# ── §6  Coalesce (??) ───────────────────────────────────────────────────────
+num nav_val = NAV
+CHECK_NUM("coalesce/nav", nav_val ?? 99, 99)
+CHECK_NUM("coalesce/ok",  42      ?? 99, 42)
+
+
+# ── §7  Variables & assignment ──────────────────────────────────────────────
+num x = 10
+x = x + 5
+CHECK_NUM("var/assign",    x, 15)
+x += 3
+CHECK_NUM("var/plus_eq",   x, 18)
+x -= 8
+CHECK_NUM("var/minus_eq",  x, 10)
+x *= 3
+CHECK_NUM("var/star_eq",   x, 30)
+x /= 6
+CHECK_NUM("var/slash_eq",  x,  5)
+x %= 3
+CHECK_NUM("var/pct_eq",    x,  2)
+num y = 0
+y++
+CHECK_NUM("var/inc", y, 1)
+y--
+CHECK_NUM("var/dec", y, 0)
+str sv = "hello"
+CHECK("var/str", sv, "hello")
+
+
+# ── §8  Walrus (:=) ─────────────────────────────────────────────────────────
+# Walrus: bare name := expr, no type annotation on the LHS
+num wv = 0
+num wtest = (wv := 7) + 1
+CHECK_NUM("walrus/val",  wv,    7)
+CHECK_NUM("walrus/expr", wtest, 8)
+
+
+# ── §9  Ternary ─────────────────────────────────────────────────────────────
+CHECK_NUM("ternary/true",   TRUE  ? 1 : 2, 1)
+CHECK_NUM("ternary/false",  FALSE ? 1 : 2, 2)
+CHECK("ternary/nested", TRUE ? (FALSE ? "a" : "b") : "c", "b")
+
+
+# ── §10  if / elif / else ──────────────────────────────────────────────────
+num if_result = 0
+if (1 > 2) { if_result = 1 }
+elif (2 > 3) { if_result = 2 }
+elif (3 > 2) { if_result = 3 }
+else { if_result = 4 }
+CHECK_NUM("if/elif_else", if_result, 3)
+
+# if body always needs braces
+num if2 = 0
+if (TRUE) { if2 = 1 }
+else      { if2 = 2 }
+CHECK_NUM("if/braces", if2, 1)
+
+
+# ── §11  while ──────────────────────────────────────────────────────────────
+num wsum = 0
+num wi = 1
+while (wi <= 5) {
+    wsum = wsum + wi
+    wi = wi + 1
+}
+CHECK_NUM("while/sum", wsum, 15)
+
+num wb = 0
+num wbi = 0
+while (wbi < 10) {
+    wbi = wbi + 1
+    if (wbi == 5) { break }
+    wb = wb + 1
+}
+CHECK_NUM("while/break", wb, 4)
+
+
+# ── §12  for-in ─────────────────────────────────────────────────────────────
+arr fa = [10, 20, 30, 40]
+num fsum = 0
+for (v in fa) { fsum = fsum + v }
+CHECK_NUM("for/arr_sum", fsum, 100)
+
+# key-value iteration over a map: iterate keys, subscript for values
+map fm = {"a": 1, "b": 2, "c": 3}
+num fmap_sum = 0
+for (k in fm) { fmap_sum = fmap_sum + fm[k] }
+CHECK_NUM("for/map_sum", fmap_sum, 6)
+
+num fnext = 0
+for (v in [1,2,3,4,5]) {
+    if (v == 3) { next }
+    fnext = fnext + v
+}
+CHECK_NUM("for/next", fnext, 12)
+
+
+# ── §13  Functions ──────────────────────────────────────────────────────────
+num fn add(num a, num b) { return a + b }
+CHECK_NUM("fn/basic", add(3, 4), 7)
+
+num fn fib(num n) {
+    if (n <= 1) { return n }
+    return fib(n-1) + fib(n-2)
+}
+CHECK_NUM("fn/fib", fib(10), 55)
+
+str fn greet(str name) { return "Hello, " .. name .. "!" }
+CHECK("fn/str_return", greet("world"), "Hello, world!")
+
+str fn polarity(num n) {
+    if (n > 0) { return "pos" }
+    if (n < 0) { return "neg" }
+    return "zero"
+}
+CHECK("fn/multi_return/pos",  polarity(5),  "pos")
+CHECK("fn/multi_return/neg",  polarity(-1), "neg")
+CHECK("fn/multi_return/zero", polarity(0),  "zero")
+
+# higher-order
+num fn apply(fn f, num v) { return f(v) }
+CHECK_NUM("fn/higher_order", apply(fn(num n) { return n * n }, 6), 36)
+
+# outer variable capture
+num outer = 100
+num fn add_outer(num n) { return n + outer }
+CHECK_NUM("fn/captures_outer", add_outer(5), 105)
+
+
+# ── §14  Arrays ─────────────────────────────────────────────────────────────
+arr a = [1, 2, 3]
+CHECK_NUM("arr/index",      a[0],  1)
+CHECK_NUM("arr/index_last", a[2],  3)
+CHECK_NUM("arr/len",        a.len, 3)
+push(a, 4)
+CHECK_NUM("arr/push_len",   a.len,   4)
+CHECK_NUM("arr/push_val",   a[3],    4)
+num popped = pop(a)
+CHECK_NUM("arr/pop_val",    popped,  4)
+CHECK_NUM("arr/pop_len",    a.len,   3)
+num shifted = shift(a)
+CHECK_NUM("arr/shift_val",  shifted, 1)
+CHECK_NUM("arr/shift_len",  a.len,   2)
+unshift(a, 99)
+CHECK_NUM("arr/unshift_val", a[0],   99)
+CHECK_NUM("arr/unshift_len", a.len,   3)
+arr nested = [[1,2],[3,4]]
+CHECK_NUM("arr/nested",     nested[1][0], 3)
+arr aempty = []
+CHECK_NUM("arr/empty_len",  aempty.len,   0)
+
+
+# ── §15  Maps ───────────────────────────────────────────────────────────────
+map m = {"x": 10, "y": 20}
+CHECK_NUM("map/get",       m["x"],  10)
+CHECK_NUM("map/get2",      m["y"],  20)
+m["z"] = 30
+CHECK_NUM("map/set_new",   m["z"],  30)
+m["x"] = 99
+CHECK_NUM("map/overwrite", m["x"],  99)
+CHECK_NUM("map/len",       m.len,    3)
+CHECK_BOOL("map/has_t",    has(m,"y"),     TRUE)
+CHECK_BOOL("map/has_f",    has(m,"nope"),  FALSE)
+remove(m, "z")
+CHECK_NUM("map/remove_len",  m.len, 2)
+CHECK_BOOL("map/remove_gone",has(m,"2"), FALSE)
+map m2 = {"1": "hi", "2": "world"}
+CHECK("map/strkey_1", m2["1"], "hi")
+CHECK("map/strkey_2", m2["2"], "world")
+arr mk = keys(m)
+CHECK_NUM("map/keys_len", mk.len, 2)
+
+
+# ── §16  Sets ───────────────────────────────────────────────────────────────
+set st = set{"alpha", "beta", "gamma"}
+CHECK_BOOL("set/has_t", has(st, "alpha"), TRUE)
+CHECK_BOOL("set/has_f", has(st, "delta"), FALSE)
+CHECK_NUM("set/len",    st.len,           3)
+
+
+# ── §17  Tuples ─────────────────────────────────────────────────────────────
+tuple t2 = (42, "hello")
+CHECK_NUM("tuple/idx0", t2[0], 42)
+CHECK("tuple/idx1",     t2[1], "hello")
+CHECK_NUM("tuple/len",  t2.len, 2)
+
+
+# ── §18  String builtins ────────────────────────────────────────────────────
+CHECK("str/upper",      core.str.upper("hello"),          "HELLO")
+CHECK("str/lower",      core.str.lower("WORLD"),          "world")
+CHECK("str/trim",        core.str.trim("  hi  "),            "hi")
+CHECK("str/substr",      core.str.substr("abcdef", 2, 3),    "cde")
+CHECK_NUM("str/index",   core.str.index("abcdef", "cd"),     2)
+CHECK_NUM("str/len",     len("hello"),              5)
+CHECK("str/sprintf",     core.str.sprintf("%05d", 42),       "00042")
+CHECK("str/repeat",      core.str.repeat("ab", 3),  "ababab")
+CHECK("str/reverse",     core.str.reverse("abc"),    "cba")
+CHECK("str/replace",     core.str.replace("aXbXc","X","-"),     "a-bXc")
+CHECK("str/replace_all", core.str.replace_all("aXbXc","X","-"), "a-b-c")
+CHECK_BOOL("str/starts_t", core.str.starts_with("foobar","foo"), TRUE)
+CHECK_BOOL("str/starts_f", core.str.starts_with("foobar","bar"), FALSE)
+CHECK_BOOL("str/ends_t",   core.str.ends_with("foobar","bar"),   TRUE)
+CHECK_BOOL("str/ends_f",   core.str.ends_with("foobar","foo"),   FALSE)
+CHECK_BOOL("str/cont_t",   core.str.contains("foobar","oob"),    TRUE)
+CHECK_BOOL("str/cont_f",   core.str.contains("foobar","xyz"),    FALSE)
+
+
+# ── §19  Math builtins ──────────────────────────────────────────────────────
+CHECK_NUM("math/abs_neg", core.math.abs(-5),              5)
+CHECK_NUM("math/abs_pos",  core.math.abs(5),               5)
+CHECK_NUM("math/sqrt",     core.math.sqrt(16),             4)
+CHECK_NUM("math/int",      core.math.int(3.9),             3)
+CHECK_NUM("math/floor",    core.math.floor(3.9), 3)
+CHECK_NUM("math/ceil",     core.math.ceil(3.1),  4)
+CHECK_NUM("math/round",    core.math.round(3.5), 4)
+CHECK_NUM("math/pow",      core.math.pow(2,8),   256)
+CHECK_NUM("math/min",      core.math.min(3,7),   3)
+CHECK_NUM("math/max",      core.math.max(3,7),   7)
+CHECK_NUM("math/clamp_lo", core.math.clamp(1,5,10),  5)
+CHECK_NUM("math/clamp_hi", core.math.clamp(20,5,10), 10)
+CHECK_NUM("math/clamp_mid",core.math.clamp(7,5,10),  7)
+
+
+# ── §20  split / join ───────────────────────────────────────────────────────
+arr sp = core.generics.split("a,b,c", ",")
+CHECK_NUM("split/count", sp.len, 3)
+CHECK("split/first",     sp[0],  "a")
+CHECK("split/last",      sp[2],  "c")
+CHECK("join/basic",     core.generics.join(sp, "-"), "a-b-c")
+CHECK("join/empty_sep",  core.generics.join(["x","y","z"], ""), "xyz")
+
+
+# ── §21  Regex ──────────────────────────────────────────────────────────────
+CHECK_BOOL("regex/match_t",  "hello123" ~  /[0-9]+/, TRUE)
+CHECK_BOOL("regex/match_f",  "helloabc" ~  /[0-9]+/, FALSE)
+CHECK_BOOL("regex/nmatch_t", "helloabc" !~ /[0-9]+/, TRUE)
+map rm = core.regex.match("foo123bar", /([0-9]+)/)
+CHECK("regex/match_val",   rm["match"],  "123")
+CHECK_NUM("regex/test_t",  core.regex.test("abc123", /\d+/), 1)
+CHECK_NUM("regex/test_f",  core.regex.test("abcdef", /\d+/), 0)
+CHECK("regex/replace",     core.regex.replace("aabbcc", /b+/, "X"),           "aaXcc")
+CHECK("regex/replace_all", core.regex.replace_all("a1b2c3", /[0-9]/, "N"),    "aNbNcN")
+arr rs = core.regex.split("one1two2three", /[0-9]/)
+print rs
+print rs[0]
+print rs[1]
+print rs[2]
+print rs.len
+rs[x]>print x
+CHECK_NUM("regex/split_n", rs.len, 3)
+CHECK("regex/split_0",     rs[0],  "one")
+CHECK_BOOL("regex/icase_t", "Hello" ~ /hello/i, TRUE)
+CHECK_BOOL("regex/icase_f", "Hello" ~ /hello/,  FALSE)
+CHECK("regex/icase_repl",  core.regex.replace_all("aAbBcC", /[a-z]/i, "X"), "XXXXXX")
+
+
+# ── §22  Pipe (|>) ──────────────────────────────────────────────────────────
+num fn pipe_double(num n) { return n * 2 }
+num fn pipe_inc(num n)    { return n + 1 }
+CHECK_NUM("pipe/basic",  5 |> pipe_double,         10)
+CHECK_NUM("pipe/inc",    9 |> pipe_inc,             10)
+CHECK("pipe/str",        "hello" |> core.str.upper,        "HELLO")
+# chain: pipe the result via a temp variable
+num pipe_mid = 5 |> pipe_double
+CHECK_NUM("pipe/chain",  pipe_mid |> pipe_inc,      11)
+
+
+
+
+# ── §24  State & type introspection ─────────────────────────────────────────
+num stv = 42
+CHECK("state/ok",    stv.state, "OK")
+num nav_s = NAV
+CHECK("state/nav",   nav_s.state, "NAV")
+CHECK("type/num",    stv.type,  "num")
+CHECK("type/str",    "hi".type, "str")
+CHECK("type/arr",    [].type,   "arr")
+CHECK("type/map",    {}.type,   "map")
+
+
+# ── §25  NAV propagation ────────────────────────────────────────────────────
+num nprop = NAV + 5
+CHECK("nav/propagates", nprop.state, "NAV")
+num ncoal = NAV ?? 7
+CHECK_NUM("nav/coalesce", ncoal, 7)
+
+
+# ── §26  NULL ───────────────────────────────────────────────────────────────
+num nl = NULL
+CHECK("null/state",   nl.state,     "NULL")
+CHECK_BOOL("null/eq", NULL == NULL, TRUE)
+CHECK_BOOL("null/neq",NULL == NAV,  FALSE)
+
+
+# ── §27  void as expression (regression) ───────────────────────────────────
+num vd = void
+CHECK("void/state", vd.state, "VOID")
+
+
+# ── §28  format module ──────────────────────────────────────────────────────
+CHECK("fmt/fixed",     core.format.fixed(3.14159, 2),   "3.14")
+CHECK("fmt/comma",     core.format.comma(1234567),       "1,234,567")
+CHECK("fmt/hex",       core.format.hex(255),             "ff")
+CHECK("fmt/bin",       core.format.bin(10),              "1010")
+CHECK("fmt/percent",   core.format.percent(0.755, 1),    "75.5%")
+CHECK("fmt/pad_left",  core.format.pad_left("hi", 5),   "   hi")
+CHECK("fmt/pad_right", core.format.pad_right("hi", 5),  "hi   ")
+CHECK("fmt/sci",       core.format.sci(12345.0, 2),      "1.23e+04")
+str jout = core.format.json({"k": "v"})
+CHECK_BOOL("fmt/json_k", core.generics.contains(jout, "\"k\""), TRUE)
+map jparsed = core.format.from_json('{"a":1,"b":"two"}')
+CHECK_NUM("fmt/from_json_num", jparsed["a"], 1)
+CHECK("fmt/from_json_str",     jparsed["b"], "two")
+
+# ── §29  Higher-order functions ─────────────────────────────────────────────
+num fn apply_twice(fn f, num v) { return f(f(v)) }
+CHECK_NUM("hof/apply_twice_add1", apply_twice(fn(num n) { return n + 1 }, 5), 7)
+CHECK_NUM("hof/apply_twice_dbl",  apply_twice(fn(num n) { return n * 2 }, 3), 12)
+# ── §30  Recursive data structures ─────────────────────────────────────────
+map tree = {
+    "val":   1,
+    "left":  {"val": 2, "left": NULL, "right": NULL},
+    "right": {"val": 3, "left": NULL, "right": NULL}
+}
+CHECK_NUM("tree/root",  tree["val"],          1)
+CHECK_NUM("tree/left",  tree["left"]["val"],  2)
+CHECK_NUM("tree/right", tree["right"]["val"], 3)
+
+
+# ── §31  core.generics ─────────────────────────────────────────────────────
+CHECK_NUM("gen/length_arr",   core.generics.size([1,2,3,4,5]),     5)
+CHECK_NUM("gen/length_str",   core.generics.size("hello"),         5)
+CHECK_BOOL("gen/cont_arr_t",  core.generics.contains([1,2,3], 2),   TRUE)
+CHECK_BOOL("gen/cont_arr_f",  core.generics.contains([1,2,3], 9),   FALSE)
+CHECK_BOOL("gen/cont_str_t",  core.generics.contains("foobar","foo"),TRUE)
+arr stripped = core.generics.strip([1, NAV, 2, NULL, 3])
+CHECK_NUM("gen/strip", stripped.len, 3)
+
+
+# ── §32  ds module ──────────────────────────────────────────────────────────
+arr ds = [
+    {"name": "alice", "score": 90, "dept": "eng"},
+    {"name": "bob",   "score": 70, "dept": "eng"},
+    {"name": "carol", "score": 85, "dept": "hr"},
+    {"name": "dave",  "score": 95, "dept": "hr"},
+    {"name": "eve",   "score": 60, "dept": "eng"}
+]
+map r0 = core.ds.row(ds, 0)
+CHECK("ds/row0_name",    r0["name"],  "alice")
+CHECK_NUM("ds/row0_score", r0["score"], 90)
+arr scores = core.ds.column(ds, "score")
+CHECK_NUM("ds/column_len", scores.len, 5)
+arr sasc  = core.ds.sort(ds, "score")
+CHECK("ds/sort_asc",  core.ds.row(sasc,  0)["name"], "eve")
+arr sdesc = core.ds.sort(ds, "score", "desc")
+CHECK("ds/sort_desc", core.ds.row(sdesc, 0)["name"], "dave")
+arr eng = core.ds.filter(ds, fn(map row) { return row["dept"] == "eng" })
+CHECK_NUM("ds/filter", eng.len, 3)
+map agg = core.ds.agg(ds, "dept", "score")
+CHECK_BOOL("ds/agg_eng", has(agg, "eng"), TRUE)
+CHECK_BOOL("ds/agg_hr",  has(agg, "hr"),  TRUE)
+
+
+# ── §33  process.assign (regression: was inverted-index) ───────────────────
+arr stamped = core.process.assign(ds, fn(map row) {
+    row["_tag"] = "tested"
+    return row
+})
+CHECK_NUM("assign/len",  stamped.len, 5)
+map st0 = core.ds.row(stamped, 0)
+CHECK("assign/tag",  st0["_tag"],  "tested")
+CHECK("assign/name", st0["name"],  "alice")
+
+
+# ── §34  ds.flatten (regression: was null after wrong assign shape) ─────────
+arr flat = core.ds.flatten(stamped)
+CHECK_NUM("flatten/len",  flat.len, 5)
+map fl0 = core.ds.row(flat, 0)
+CHECK("flatten/name", fl0["name"], "alice")
+CHECK("flatten/tag",  fl0["_tag"], "tested")
+
+
+# ── §35  process.run with XF fn (regression: was returning NAV) ─────────────
+arr chunks = core.process.split(ds, 3)
+CHECK_NUM("process/chunks", chunks.len, 3)
+
+arr fn tag_chunk(arr chunk) {
+    return core.process.assign(chunk, fn(map row) {
+        row["_parallel"] = TRUE
+        return row
+    })
+}
+arr workers = []
+chunks[chunk] > { push(workers, core.process.worker(tag_chunk, chunk)) }
+print core.process.run(workers)
+arr results = core.process.run(workers)
+arr combined = core.ds.flatten(results)
+print combined
+CHECK_NUM("process/run_len", combined.len, 5)
+map cr0 = core.ds.row(combined, 0)
+CHECK_BOOL("process/run_tag", cr0["_parallel"], TRUE)
+
+
+# ── §36  Nested map mutation ────────────────────────────────────────────────
+map nmut = {"a": {"b": {"c": 42}}}
+nmut["a"]["b"]["c"] = 99
+CHECK_NUM("nested_mut/deep",    nmut["a"]["b"]["c"], 99)
+nmut["a"]["b"]["d"] = 100
+CHECK_NUM("nested_mut/new_key", nmut["a"]["b"]["d"], 100)
+
+
+# ── §37  delete ─────────────────────────────────────────────────────────────
+arr del_a = [1,2,3,4,5]
+delete del_a[2]
+CHECK_NUM("delete/arr_len", del_a.len, 4)
+CHECK_NUM("delete/arr_val", del_a[2],  4)
+map del_m = {"a":1,"b":2,"c":3}
+delete del_m["b"]
+CHECK_NUM("delete/map_len",   del_m.len,     2)
+CHECK_BOOL("delete/map_gone", has(del_m,"b"),FALSE)
+
+
+# ── §38  Chained member access ──────────────────────────────────────────────
+arr chain = [1,2,3,4,5]
+CHECK_NUM("chain/len",   chain.len,   5)
+CHECK("chain/type",      chain.type,  "arr")
+CHECK("chain/state",     chain.state, "OK")
+CHECK_NUM("chain/str_len", "xf".len,  2)
+
+
+# ── §39  Higher-order / anonymous fn ────────────────────────────────────────
+arr fn map_arr(arr inp, fn f) {
+    arr out = []
+    for (v in inp) { push(out, f(v)) }
+    return out
+}
+arr doubled = map_arr([1,2,3,4], fn(num n) { return n * 2 })
+CHECK_NUM("anon_fn/0", doubled[0], 2)
+CHECK_NUM("anon_fn/3", doubled[3], 8)
+
+
+# ── §40  Walrus in condition ────────────────────────────────────────────────
+num walrus_check = 0
+num wc = 0
+if ((wc := 42) > 10) { walrus_check = wc }
+CHECK_NUM("walrus/cond", walrus_check, 42)
+
+
+# ── §41  JSON roundtrip ─────────────────────────────────────────────────────
+map orig = {"flag": TRUE, "nested": {"x": 99}}
+str js = core.format.json(orig)
+CHECK_BOOL("json/has_nested", core.generics.contains(js, "\"nested\""), TRUE)
+map parsed = core.format.from_json(js)
+CHECK_NUM("json/nested_x", parsed["nested"]["x"], 99)
+
+
+# ── §42  Stress: 10k loop ───────────────────────────────────────────────────
+num big_sum = 0
+num bi = 1
+while (bi <= 10000) {
+    big_sum = big_sum + bi
+    bi = bi + 1
+}
+CHECK_NUM("stress/10k_sum", big_sum, 50005000)
+
+
+# ── §43  Stress: recursion ──────────────────────────────────────────────────
+num fn fact(num n) {
+    if (n <= 1) { return 1 }
+    return n * fact(n-1)
+}
+CHECK_NUM("stress/fact_10", fact(10), 3628800)
+
+num fn rdepth(num n) {
+    if (n == 0) { return 0 }
+    return 1 + rdepth(n-1)
+}
+CHECK_NUM("stress/depth_20", rdepth(20), 20)
+
+
+# ── §44  Stress: string build ───────────────────────────────────────────────
+str big_s = ""
+num si = 0
+while (si < 100) { big_s = big_s .. "x"; si = si + 1 }
+CHECK_NUM("stress/str_len", big_s.len, 100)
+
+
+# ── §45  Stress: large map ──────────────────────────────────────────────────
+map big_map = {}
+num mi = 0
+while (mi < 200) { big_map[mi .. ""] = mi * 2; mi = mi + 1 }
+CHECK_NUM("stress/map_len",   big_map.len,   200)
+CHECK_NUM("stress/map_key0",  big_map["0"],    0)
+CHECK_NUM("stress/map_key99", big_map["99"], 198)
+
+
+# ── §46  Multiple chained assignment ────────────────────────────────────────
+num ma1 = 0
+num ma2 = 0
+num ma3 = 0
+ma1 = ma2 = ma3 = 7
+CHECK_NUM("multi_assign/1", ma1, 7)
+CHECK_NUM("multi_assign/2", ma2, 7)
+CHECK_NUM("multi_assign/3", ma3, 7)
+# ── Final tally ─────────────────────────────────────────────────────────────
+print ""
+print "══════════════════════════════════════"
+print "  PASS: " .. _pass
+print "  FAIL: " .. _fail
+print "══════════════════════════════════════"
+
+if (_fail > 0) {
+    print "RESULT: FAILED"
+    exit(1)
+} else {
+    print "RESULT: ALL PASSED"
+    exit(0)
+}
+}

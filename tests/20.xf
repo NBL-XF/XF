@@ -1,0 +1,7 @@
+num fn add(num a, num b) {
+    return a + b
+}
+
+BEGIN {
+    print add(2, 3)
+}

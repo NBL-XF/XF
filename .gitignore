@@ -1,14 +1,13 @@
 bin/*
-build/*
-tests/*
-
+obj/*
+lib/*.a
 # Build artifacts
 *.o
 *.a
 *.dylib
 *.so
 *.dll
+lib/release/
 XFLIB/objects/
-lib/release/static/
 build/
 dist/

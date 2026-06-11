@@ -1,0 +1,8 @@
+BEGIN {
+    arr xs = [1, 2, 3, 4, 5, 6]
+
+    print core.process.split(xs, 2).type
+    print core.process.worker(core.math.sqrt, [9]).type
+
+    exit
+}

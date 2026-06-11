@@ -51,9 +51,10 @@ typedef enum {
     TK_KW_NEXT,
     TK_KW_EXIT,
     TK_KW_BREAK,
+    TK_KW_CHECK,
     TK_KW_DELETE,
     TK_KW_IMPORT,
-
+    TK_KW_RIP,
     TK_FIELD,
     TK_VAR_FILE,
     TK_VAR_MATCH,
@@ -200,7 +201,7 @@ typedef enum {
     XF_SRC_REPL,
 } SrcMode;
 
-#define XF_TOKENS_INIT_CAP 64
+#define XF_TOKENS_INIT_CAP 65
 
 typedef struct {
 

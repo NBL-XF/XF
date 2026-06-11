@@ -1,3 +1,4 @@
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +11,7 @@
 #include "../include/value.h"
 #include "../include/interp.h"
 #include "../include/repl.h"
+#define XF_VERSION "1.0.1"
 static int xf_run_program(Program *prog, int argc, char **argv);
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -102,15 +104,21 @@ done:
     xf_lex_free(&lex);
     return rc;
 }
-
 static void usage(const char *argv0) {
     const char *name = argv0 ? argv0 : "xf";
     fprintf(stderr,
+            "xf %s\n"
             "usage:\n"
             "  %s                 # repl\n"
             "  %s -r <file.xf>    # run file\n"
-            "  %s -e \"code\"      # execute inline source\n",
-            name, name, name);
+            "  %s -e \"code\"      # execute inline source\n"
+            "  %s -v              # print version\n"
+            "  %s --version       # print version\n",
+            XF_VERSION,
+            name, name, name, name, name);
+}
+static void print_version(void) {
+    printf("xf %s\n", XF_VERSION);
 }
 static void bind_runtime_specials(Interp *it) {
     if (!it || !it->vm) return;
@@ -120,9 +128,10 @@ static void bind_runtime_specials(Interp *it) {
         xf_Value value;
     } specs[5];
 
-    specs[0].name = "file";
-    specs[0].value = xf_val_ok_str(xf_str_from_cstr(""));
-
+specs[0].name = "file";
+xf_Str *file_s = xf_str_from_cstr("");
+specs[0].value = file_s ? xf_val_ok_str(file_s) : xf_val_null();
+xf_str_release(file_s);
     specs[1].name = "match";
     specs[1].value = xf_val_null();
 
@@ -175,14 +184,25 @@ vm_set_global(it->vm, slot, arrv);
 xf_value_release(arrv);
 xf_arr_release(arr);
 }
+
+/* Drain any leftover values the VM left on the stack. */
+static void xf_drain_stack(VM *vm) {
+    while (vm->stack_top > 0) {
+        xf_value_release(vm_pop(vm));
+    }
+}
 static int xf_run_program(Program *prog, int argc, char **argv) {
+    int rc = 1;
+
     VM vm;
     vm_init(&vm, 1);
-        SymTable syms;
+
+    SymTable syms;
     sym_init(&syms);
     if (syms.had_error) {
         fprintf(stderr, "xf: symtable init error: %s\n", syms.err_msg);
         vm_free(&vm);
+        sym_free(&syms);
         return 1;
     }
 
@@ -192,73 +212,99 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
     Interp it = {0};
     it.vm   = &vm;
     it.syms = &syms;
-core_set_fn_caller(&vm, &syms, interp_exec_xf_fn_bridge);
+
+    core_set_fn_caller(&vm, &syms, interp_exec_xf_fn_bridge);
     bind_runtime_specials(&it);
+
     if (!interp_compile_program(&it, prog)) {
         fprintf(stderr, "xf: compile failed\n");
+
         if (it.vm && it.vm->had_error) {
             fprintf(stderr, "xf: vm error: %s\n", it.vm->err_msg);
         }
+
         if (it.syms && it.syms->had_error) {
             fprintf(stderr, "xf: sym error: %s\n", it.syms->err_msg);
         }
-        sym_free(&syms);
-        vm_free(&vm);
-        return 1;
+
+        goto cleanup;
     }
+
     inject_args(&it, argc, argv);
 
     VMResult begin_rc = vm_run_begin(&vm);
+    xf_drain_stack(&vm);
+
     if (begin_rc != VM_OK && !vm.should_exit) {
         fprintf(stderr, "BEGIN failed\n");
-        sym_free(&syms);
-        vm_free(&vm);
-        return 1;
+        goto cleanup;
     }
-    char buf[4096];
+
+    if (!vm.should_exit && !isatty(fileno(stdin))) {
+        char buf[4096];
+
         while (!vm.should_exit && fgets(buf, sizeof(buf), stdin)) {
-        size_t len = strlen(buf);
-        if (vm_feed_record(&vm, buf, len) != VM_OK) {
-            fprintf(stderr, "runtime error\n");
-            sym_free(&syms);
-            vm_free(&vm);
-            return 1;
+            size_t len = strlen(buf);
+
+            if (vm_feed_record(&vm, buf, len) != VM_OK) {
+                fprintf(stderr, "runtime error\n");
+                xf_drain_stack(&vm);
+                goto cleanup;
+            }
+
+            xf_drain_stack(&vm);
         }
     }
 
     if (!vm.should_exit) {
         VMResult end_rc = vm_run_end(&vm);
+        xf_drain_stack(&vm);
+
         if (end_rc != VM_OK && !vm.should_exit) {
             fprintf(stderr, "END failed\n");
-            sym_free(&syms);
-            vm_free(&vm);
-            return 1;
+            goto cleanup;
         }
     }
-    sym_free(&syms);
+
+    rc = 0;
+
+cleanup:
+    xf_drain_stack(&vm);
+
+    /*
+     * Release VM values/chunks first.
+     * Then clear compiler-global name bindings.
+     * Then release symbol-table values.
+     */
     vm_free(&vm);
-    return 0;
+    interp_reset_global_bindings(&it);
+    sym_free(&syms);
+
+    return rc;
 }
 int main(int argc, char **argv) {
+if (argc >= 2 &&
+        (strcmp(argv[1], "-v") == 0 ||
+         strcmp(argv[1], "--version") == 0)) {
+        print_version();
+        return 0;
+    }
     if (argc == 1) {
         return xf_run_repl();
     }
-
-    if (argc == 3 && strcmp(argv[1], "-r") == 0) {
-        char *source = read_file(argv[2]);
-        if (!source) {
-            return 1;
-        }
-
-        int rc = xf_run_source(argv[2], source, XF_SRC_FILE, 1, &argv[2]);
-        free(source);
-        return rc;
+if (argc >= 3 && strcmp(argv[1], "-r") == 0) {
+    char *source = read_file(argv[2]);
+    if (!source) {
+        return 1;
     }
 
-    if (argc == 3 && strcmp(argv[1], "-e") == 0) {
-        return xf_run_source("<inline>", argv[2], XF_SRC_INLINE, 1, &argv[2]);
-    }
-
+    int rc = xf_run_source(argv[2], source, XF_SRC_FILE, argc - 2, &argv[2]);
+    free(source);
+    return rc;
+}
+if (argc >= 3 && strcmp(argv[1], "-e") == 0) {
+    return xf_run_source("<inline>", argv[2], XF_SRC_INLINE, argc - 2, &argv[2]);
+}
     usage(argv[0]);
     return 1;
 }

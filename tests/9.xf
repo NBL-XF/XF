@@ -1,0 +1,5 @@
+1 <> print "loop"
+
+items[it] > print it
+
+pairs[(k, v)] > print k

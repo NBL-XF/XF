@@ -1,0 +1,12 @@
+BEGIN {
+    map m = {"a": 1, "b": 2}
+    delete m["a"]
+    print m["a"]
+    print m["b"]
+
+    set s = {"x", "y", "z"}
+    delete s["y"]
+    print s["y"]
+
+    exit
+}

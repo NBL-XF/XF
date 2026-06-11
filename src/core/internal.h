@@ -21,9 +21,12 @@
 #define NEED(n) \
     do { if (argc < (n)) return xf_val_nav(XF_TYPE_VOID); } while(0)
 
-#define FN(name, ret, impl) \
-    xf_module_set(m, name, xf_val_native_fn(name, ret, impl))
-
+#define FN(name, ret, impl)                     \
+    do {                                        \
+        xf_Value _v = xf_val_native_fn(name, ret, impl); \
+        xf_module_set(m, name, _v);             \
+        xf_value_release(_v);                   \
+    } while (0)
 #define MATH1(fn) do {                     \
     xf_Value v = xf_coerce_num(args[0]);  \
     if (v.state != XF_STATE_OK) return v; \

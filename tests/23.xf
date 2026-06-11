@@ -1,0 +1,25 @@
+FS = ","
+OFS = "|"
+ORS = "!\n"
+
+BEGIN {
+    print "begin", FNR
+}
+
+{
+    print "row", FNR, NR, $0, $1
+
+    if (FNR == 1) {
+        next
+    }
+
+    print "after-next", $1
+
+    if ($1 == "z") {
+        exit
+    }
+}
+
+END {
+    print "end", FNR, NR
+}

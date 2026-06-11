@@ -12,7 +12,7 @@
 #include "../include/vm.h"
 #include "../include/value.h"
 #include "../include/interp.h"
-#define VERSION "1.0.0"
+#define VERSION "1.0.1"
 
 static void bind_runtime_specials(Interp *it) {
     if (!it || !it->vm) return;
@@ -104,9 +104,12 @@ static void xf_repl_clear_eval_artifacts(VM *vm) {
 static int xf_repl_eval_line(VM *vm, SymTable *syms, const char *line) {
     if (!vm || !syms || !line) return 1;
 
+if (vm->global_count > 5) {
+        xf_Value g5 = vm->globals[5];
+    }
+
     Lexer lex = {0};
     Program *prog = NULL;
-
     xf_repl_clear_eval_artifacts(vm);
 
     xf_lex_init_cstr(&lex, line, XF_SRC_REPL, "<repl>");
@@ -137,15 +140,14 @@ static int xf_repl_eval_line(VM *vm, SymTable *syms, const char *line) {
     Interp it = {0};
     it.vm   = vm;
     it.syms = syms;
-
-    core_set_fn_caller(vm, syms, interp_exec_xf_fn_bridge);
-    bind_runtime_specials(&it);
-
+core_set_fn_caller(vm, syms, interp_exec_xf_fn_bridge);
 if (prog->count == 1 &&
     prog->items[0] &&
     prog->items[0]->kind == TOP_STMT &&
     prog->items[0]->as.stmt.stmt &&
     prog->items[0]->as.stmt.stmt->kind == STMT_EXPR) {
+
+    Stmt *expr_stmt = prog->items[0]->as.stmt.stmt;
 
     vm->begin_chunk = calloc(1, sizeof(Chunk));
     if (!vm->begin_chunk) {
@@ -160,7 +162,7 @@ if (prog->count == 1 &&
 
     if (!interp_compile_expr_repl(&it,
                                   vm->begin_chunk,
-                                  prog->items[0]->as.stmt.stmt->as.expr.expr)) {
+                                  expr_stmt->as.expr.expr)) {
         fprintf(stderr, "repl compile failed\n");
         ast_program_free(prog);
         xf_lex_free(&lex);
@@ -168,8 +170,10 @@ if (prog->count == 1 &&
         return 1;
     }
 
+    chunk_write(vm->begin_chunk, OP_POP, expr_stmt->loc.line);
     chunk_write(vm->begin_chunk, OP_HALT, 0);
-} else {
+}
+ else {
     if (!interp_compile_program_repl(&it, prog)) {
         fprintf(stderr, "repl compile failed\n");
         ast_program_free(prog);
@@ -203,6 +207,7 @@ int xf_run_repl(void) {
 
     if (syms.had_error) {
         fprintf(stderr, "xf: symtable init error: %s\n", syms.err_msg);
+        sym_free(&syms);
         vm_free(&vm);
         return 1;
     }

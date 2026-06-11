@@ -12,7 +12,6 @@ static xf_Value cf_pad_left(xf_Value *args, size_t argc) {
     if (argc >= 3 && args[2].state == XF_STATE_OK && args[2].type == XF_TYPE_STR
         && args[2].data.str && args[2].data.str->len > 0)
         pad_ch = args[2].data.str->data[0];
-    xf_value_release(*args);
     if (slen >= width) return make_str_val(s, slen);
     size_t pad = width - slen;
     char *buf = malloc(width + 1);
@@ -30,7 +29,6 @@ static xf_Value cf_pad_right(xf_Value *args, size_t argc) {
     if (argc >= 3 && args[2].state == XF_STATE_OK && args[2].type == XF_TYPE_STR
         && args[2].data.str && args[2].data.str->len > 0)
         pad_ch = args[2].data.str->data[0];
-    xf_value_release(*args);
     if (slen >= width) return make_str_val(s, slen);
     size_t pad = width - slen;
     char *buf = malloc(width + 1);
@@ -48,7 +46,6 @@ static xf_Value cf_pad_center(xf_Value *args, size_t argc) {
     if (argc >= 3 && args[2].state == XF_STATE_OK && args[2].type == XF_TYPE_STR
         && args[2].data.str && args[2].data.str->len > 0)
         pad_ch = args[2].data.str->data[0];
-    xf_value_release(*args);
     if (slen >= width) return make_str_val(s, slen);
     size_t total_pad = width - slen, left_pad = total_pad/2, right_pad = total_pad - left_pad;
     char *buf = malloc(width + 1);

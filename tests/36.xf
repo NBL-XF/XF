@@ -1,0 +1,10 @@
+
+num fn is_even(num x) { return x % 2 == 0 }
+num fn add1(num x) { return x + 1 }
+[1,2,3,4] [*]is_even |>print
+print ([1,2,3] [/] add1)
+10 |> print
+print <| 10
+
+
+4|>is_even|>print

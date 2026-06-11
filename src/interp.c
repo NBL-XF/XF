@@ -17,6 +17,7 @@ static bool compile_if_stmt(Interp *it, Chunk *c, Stmt *s);
 static bool compile_while_stmt(Interp *it, Chunk *c, Stmt *s);
 static bool compile_for_stmt(Interp *it, Chunk *c, Stmt *s);
 static bool compile_rule_pattern(Interp *it, Chunk *c, Expr *pattern);
+static bool compile_rip(Interp *it, Chunk *c, Stmt *s);
 static uint32_t compile_global_name(Interp *it, xf_Str *name);
 #define MAX_LOOP_DEPTH       64
 #define MAX_BREAK_PATCHES   512
@@ -118,7 +119,13 @@ static xf_fn_t *build_compiled_fn(xf_Str *name,
                                   size_t param_count,
                                   Chunk *body_chunk) {
     xf_fn_t *f = calloc(1, sizeof(xf_fn_t));
-    if (!f) return NULL;
+    if (!f) {
+        if (body_chunk) {
+            chunk_free(body_chunk);
+            free(body_chunk);
+        }
+        return NULL;
+    }
 
     atomic_store(&f->refcount, 1);
     f->name        = xf_str_retain(name);
@@ -131,6 +138,10 @@ static xf_fn_t *build_compiled_fn(xf_Str *name,
         f->params = calloc(param_count, sizeof(xf_param_t));
         if (!f->params) {
             xf_str_release(f->name);
+            if (body_chunk) {
+                chunk_free(body_chunk);
+                free(body_chunk);
+            }
             free(f);
             return NULL;
         }
@@ -150,6 +161,7 @@ static const char *stmt_kind_name(StmtKind k) {
         case STMT_BLOCK: return "STMT_BLOCK";
         case STMT_EXPR: return "STMT_EXPR";
         case STMT_VAR_DECL: return "STMT_VAR_DECL";
+        case STMT_RIP: return "STMT_RIP";
         case STMT_FN_DECL: return "STMT_FN_DECL";
         case STMT_IF: return "STMT_IF";
         case STMT_WHILE: return "STMT_WHILE";
@@ -158,6 +170,7 @@ static const char *stmt_kind_name(StmtKind k) {
         case STMT_FOR_SHORT: return "STMT_FOR_SHORT";
         case STMT_RETURN: return "STMT_RETURN";
         case STMT_NEXT: return "STMT_NEXT";
+        case STMT_CHECK: return "STMT_CHECK";
         case STMT_EXIT: return "STMT_EXIT";
         case STMT_BREAK: return "STMT_BREAK";
         case STMT_PRINT: return "STMT_PRINT";
@@ -217,8 +230,10 @@ static xf_fn_t *compile_named_function(Interp *it,
                                        Loc loc) {
     (void)loc;
 
+    xf_fn_t *out = NULL;
     Chunk *fn_chunk = calloc(1, sizeof(Chunk));
     if (!fn_chunk) return NULL;
+
     chunk_init(fn_chunk, name ? name->data : "<fn>");
 
     FnCompileCtx fnctx = {0};
@@ -229,29 +244,34 @@ static xf_fn_t *compile_named_function(Interp *it,
 
     for (size_t i = 0; i < param_count; i++) {
         if (fn_local_add(params[i].name, params[i].type) < 0) {
-            g_fn_ctx = saved_ctx;
-            fn_ctx_cleanup(&fnctx);
-            chunk_free(fn_chunk);
-            free(fn_chunk);
-            return NULL;
+            goto cleanup;
         }
     }
 
-    bool ok = compile_stmt(it, fn_chunk, body);
-    if (!ok) {
-        g_fn_ctx = saved_ctx;
-        fn_ctx_cleanup(&fnctx);
-        chunk_free(fn_chunk);
-        free(fn_chunk);
-        return NULL;
+    if (!compile_stmt(it, fn_chunk, body)) {
+        goto cleanup;
     }
 
     chunk_write(fn_chunk, OP_RETURN_NULL, 0);
 
+    out = build_compiled_fn(name, return_type, params, param_count, fn_chunk);
+
+    /*
+     * If build_compiled_fn succeeds, fn_chunk ownership moved into out->body.
+     * If it fails, build_compiled_fn already frees fn_chunk.
+     */
+    fn_chunk = NULL;
+
+cleanup:
     g_fn_ctx = saved_ctx;
     fn_ctx_cleanup(&fnctx);
 
-    return build_compiled_fn(name, return_type, params, param_count, fn_chunk);
+    if (!out && fn_chunk) {
+        chunk_free(fn_chunk);
+        free(fn_chunk);
+    }
+
+    return out;
 }
 static int compiler_global_find_str(xf_Str *name) {
     if (!name) return -1;
@@ -453,13 +473,24 @@ bool interp_compile_program_repl(Interp *it, Program *prog) {
     g_interp_preserve_bindings = saved;
     return ok;
 }
+static bool compile_rip(Interp *it, Chunk *c, Stmt *s) {
+    if (!it || !c || !s || !s->as.rip_stmt.name) return false;
+
+    uint32_t slot = compile_global_name(it, s->as.rip_stmt.name);
+    if (slot == UINT32_MAX) return false;
+
+    chunk_write(c, OP_RIP_GLOBAL, s->loc.line);
+    chunk_write_u32(c, slot, s->loc.line);
+
+    return true;
+}
 bool interp_compile_program(Interp *it, Program *prog) {
     if (!it || !it->vm || !prog) return false;
 bool ok = false;
 bool top_level_compile = (g_compile_depth == 0);
-if (top_level_compile && !g_interp_preserve_bindings) {
+/*if (top_level_compile && !g_interp_preserve_bindings) {
     interp_reset_global_bindings(it);
-}
+}*/
     g_compile_depth++;
 
     VM *vm = it->vm;
@@ -703,7 +734,13 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
             chunk_write(c, OP_POP, s->loc.line);
             return true;
         }
-
+        case STMT_RIP:
+            return compile_rip(it, c, s);
+        case STMT_CHECK:{
+    if (!compile_expr(it, c, s->as.check_stmt.expr)) return false;
+    chunk_write(c, OP_INSPECT, s->loc.line);
+    return true;
+}
         case STMT_JOIN: {
             if (!s->as.join.handle) {
                 fprintf(stderr, "compile_stmt: join expects handle expression at %u:%u\n",
@@ -719,21 +756,15 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
             chunk_write(c, OP_POP, s->loc.line);
             return true;
         }
-        case STMT_EXPR:
-            if (!compile_expr(it, c, s->as.expr.expr)) return false;
-            chunk_write(c, OP_POP, s->loc.line);
-            return true;
-                    case STMT_PRINT: {
-            size_t argc = s->as.io.count;
-
-            for (size_t i = 0; i < argc; i++) {
-                if (!compile_expr(it, c, s->as.io.args[i])) return false;
+                case STMT_EXPR: {
+            if (!compile_expr(it, c, s->as.expr.expr)) {
+                return false;
             }
 
-            chunk_write(c, OP_PRINT, s->loc.line);
-            chunk_write(c, (uint8_t)argc, s->loc.line);
+            chunk_write(c, OP_POP, s->loc.line);
             return true;
         }
+
                 case STMT_OUTFMT: {
             const char *sep = " ";
 
@@ -772,6 +803,8 @@ static bool compile_stmt(Interp *it, Chunk *c, Stmt *s) {
 
             return true;
         }
+        case STMT_PRINT:
+    return compile_print_stmt(it, c, s);
                 case STMT_PRINTF: {
             size_t argc = s->as.io.count;
 
@@ -1017,16 +1050,20 @@ static bool compile_expr(Interp *it, Chunk *c, Expr *e) {
             chunk_write(c, OP_PUSH_NUM, e->loc.line);
             chunk_write_f64(c, e->as.num, e->loc.line);
             return true;
+         case EXPR_STR: {
+    if (!e->as.str.value) return false;
 
-        case EXPR_STR: {
-            xf_Value sv = xf_val_ok_str(e->as.str.value);
-            uint32_t idx = chunk_add_const(c, sv);
-            xf_value_release(sv);
+    uint32_t idx = chunk_add_str_const(
+        c,
+        e->as.str.value->data,
+        e->as.str.value->len
+    );
 
-            chunk_write(c, OP_PUSH_STR, e->loc.line);
-            chunk_write_u32(c, idx, e->loc.line);
-            return true;
-        }
+    chunk_write(c, OP_PUSH_STR, e->loc.line);
+    chunk_write_u32(c, idx, e->loc.line);
+    return true;
+}
+
         case EXPR_REGEX: {
     if (!e->as.regex.pattern || !e->as.regex.pattern->data) {
         return false;
@@ -1639,37 +1676,31 @@ case EXPR_PIPE_FN: {
 
 case EXPR_BINARY: {
     switch (e->as.binary.op) {
-        case BINOP_AND: {
-            if (!compile_expr(it, c, e->as.binary.left)) return false;
+    case BINOP_AND: {
+    if (!compile_expr(it, c, e->as.binary.left)) {
+        return false;
+    }
 
-            size_t eval_rhs = emit_jump(c, OP_JUMP_IF, e->loc.line);
-            chunk_write(c, OP_PUSH_FALSE, e->loc.line);
-            size_t done = emit_jump(c, OP_JUMP, e->loc.line);
+    if (!compile_expr(it, c, e->as.binary.right)) {
+        return false;
+    }
 
-            patch_jump_here(c, eval_rhs);
-            if (!compile_expr(it, c, e->as.binary.right)) return false;
-            chunk_write(c, OP_NOT, e->loc.line);
-            chunk_write(c, OP_NOT, e->loc.line);
+    chunk_write(c, OP_AND, e->loc.line);
+    return true;
+}
 
-            patch_jump_here(c, done);
-            return true;
-        }
+case BINOP_OR: {
+    if (!compile_expr(it, c, e->as.binary.left)) {
+        return false;
+    }
 
-        case BINOP_OR: {
-            if (!compile_expr(it, c, e->as.binary.left)) return false;
+    if (!compile_expr(it, c, e->as.binary.right)) {
+        return false;
+    }
 
-            size_t eval_rhs = emit_jump(c, OP_JUMP_NOT, e->loc.line);
-            chunk_write(c, OP_PUSH_TRUE, e->loc.line);
-            size_t done = emit_jump(c, OP_JUMP, e->loc.line);
-
-            patch_jump_here(c, eval_rhs);
-            if (!compile_expr(it, c, e->as.binary.right)) return false;
-            chunk_write(c, OP_NOT, e->loc.line);
-            chunk_write(c, OP_NOT, e->loc.line);
-
-            patch_jump_here(c, done);
-            return true;
-        }
+    chunk_write(c, OP_OR, e->loc.line);
+    return true;
+}
 
         default:
             if (!compile_expr(it, c, e->as.binary.left)) return false;

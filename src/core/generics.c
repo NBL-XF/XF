@@ -207,6 +207,7 @@ static xf_Value cg_split(xf_Value *args, size_t argc) {
             xf_Value cv = xf_val_ok_arr(chunk);
             xf_arr_release(chunk);
             xf_arr_push(out, cv);
+            xf_value_release(cv);
 
             if (to >= sz) break;
         }
@@ -242,13 +243,14 @@ static xf_Value cg_split(xf_Value *args, size_t argc) {
             for (size_t j = from; j < to; j++) {
                 xf_Str *key = in->order[j];
                 xf_Value tmp = xf_map_get(in, key);
-xf_map_set(chunk, key, tmp);
-xf_value_release(tmp);
+                xf_map_set(chunk, key, tmp);
+                xf_value_release(tmp);
             }
 
             xf_Value cv = xf_val_ok_map(chunk);
             xf_map_release(chunk);
             xf_arr_push(out, cv);
+            xf_value_release(cv);
 
             if (to >= sz) break;
         }
@@ -274,15 +276,25 @@ xf_value_release(tmp);
 
     if (!is_regex) {
         size_t seplen2 = strlen(pat);
+
         if (seplen2 == 0) {
-            for (size_t i = 0; i < slen; i++)
-                xf_arr_push(out, make_str_val(s + i, 1));
+            for (size_t i = 0; i < slen; i++) {
+                xf_Value tmp = make_str_val(s + i, 1);
+                xf_arr_push(out, tmp);
+                xf_value_release(tmp);
+            }
         } else {
-            const char *p = s, *end = s + slen;
+            const char *p = s;
+            const char *end = s + slen;
+
             while (p <= end) {
                 const char *found = (p < end) ? strstr(p, pat) : NULL;
                 const char *seg_end = found ? found : end;
-                xf_arr_push(out, make_str_val(p, (size_t)(seg_end - p)));
+
+                xf_Value tmp = make_str_val(p, (size_t)(seg_end - p));
+                xf_arr_push(out, tmp);
+                xf_value_release(tmp);
+
                 if (!found) break;
                 p = found + seplen2;
             }
@@ -290,22 +302,33 @@ xf_value_release(tmp);
     } else {
         regex_t re;
         char errbuf[128];
+
         if (!cr_compile(pat, cflags, &re, errbuf, sizeof(errbuf))) {
             xf_arr_release(out);
             return xf_val_nav(XF_TYPE_ARR);
         }
 
-        const char *cur = s, *end = s + slen;
+        const char *cur = s;
+        const char *end = s + slen;
+
         while (cur <= end) {
             regmatch_t pm[1];
             int rc = regexec(&re, cur, 1, pm, cur > s ? REG_NOTBOL : 0);
+
             if (rc != 0 || pm[0].rm_so == pm[0].rm_eo) {
-                xf_arr_push(out, make_str_val(cur, (size_t)(end - cur)));
+                xf_Value tmp = make_str_val(cur, (size_t)(end - cur));
+                xf_arr_push(out, tmp);
+                xf_value_release(tmp);
                 break;
             }
-            xf_arr_push(out, make_str_val(cur, (size_t)pm[0].rm_so));
+
+            xf_Value tmp = make_str_val(cur, (size_t)pm[0].rm_so);
+            xf_arr_push(out, tmp);
+            xf_value_release(tmp);
+
             cur += pm[0].rm_eo;
         }
+
         regfree(&re);
     }
 
