@@ -16,6 +16,9 @@
 #define XF_OUTFMT_CSV   1
 #define XF_OUTFMT_TSV   2
 #define XF_OUTFMT_JSON  3
+
+
+struct xf_pool_t;  
 typedef enum {
     OP_PUSH_NUM,
     OP_PUSH_CONST,
@@ -33,7 +36,7 @@ typedef enum {
     OP_STORE_LOCAL,
     OP_LOAD_GLOBAL,
     OP_STORE_GLOBAL,
-    
+
 
     OP_LOAD_FIELD,
     OP_STORE_FIELD,
@@ -182,7 +185,6 @@ typedef enum {
     VM_ERR,
     VM_EXIT
 } VMResult;
-
 typedef struct VM {
     xf_Value   stack[VM_STACK_MAX];
     size_t     stack_top;
@@ -211,8 +213,8 @@ typedef struct VM {
     xf_Value  *patterns;
     size_t     rule_count;
     bool should_exit;
+    struct xf_pool_t *pool;
 } VM;
-
 /* chunk */
 void     chunk_init(Chunk *c, const char *source);
 void     chunk_free(Chunk *c);

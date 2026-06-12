@@ -11,8 +11,9 @@
 #include "../include/value.h"
 #include "../include/interp.h"
 #include "../include/repl.h"
+#include "../include/mt.h"
 #define XF_VERSION "1.0.1"
-static int xf_run_program(Program *prog, int argc, char **argv);
+static int xf_run_program(Program *prog, int argc, char **argv, int nworkers);
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -58,7 +59,8 @@ static int xf_run_source(const char *source_name,
                          const char *source,
                          SrcMode mode,
                          int argc,
-                         char **argv) {
+                         char **argv,
+                         int nworkers) {
     int rc = 1;
 
     Lexer lex = {0};
@@ -96,7 +98,7 @@ static int xf_run_source(const char *source_name,
         goto done;
     }
 
-    rc = xf_run_program(prog, argc, argv);
+    rc = xf_run_program(prog, argc, argv, nworkers);
 
 done:
     ast_program_free(prog);
@@ -109,13 +111,15 @@ static void usage(const char *argv0) {
     fprintf(stderr,
             "xf %s\n"
             "usage:\n"
-            "  %s                 # repl\n"
-            "  %s -r <file.xf>    # run file\n"
-            "  %s -e \"code\"      # execute inline source\n"
-            "  %s -v              # print version\n"
-            "  %s --version       # print version\n",
+            "  %s                         # repl\n"
+            "  %s -r <file.xf>            # run file\n"
+            "  %s -e \"code\"              # execute inline source\n"
+            "  %s -j <N> -r <file.xf>     # run with N worker threads\n"
+            "  %s -j <N> -e \"code\"       # inline with N worker threads\n"
+            "  %s -v                      # print version\n"
+            "  %s --version               # print version\n",
             XF_VERSION,
-            name, name, name, name, name);
+            name, name, name, name, name, name, name);
 }
 static void print_version(void) {
     printf("xf %s\n", XF_VERSION);
@@ -191,11 +195,11 @@ static void xf_drain_stack(VM *vm) {
         xf_value_release(vm_pop(vm));
     }
 }
-static int xf_run_program(Program *prog, int argc, char **argv) {
+static int xf_run_program(Program *prog, int argc, char **argv, int nworkers) {
     int rc = 1;
 
     VM vm;
-    vm_init(&vm, 1);
+    vm_init(&vm, nworkers);
 
     SymTable syms;
     sym_init(&syms);
@@ -232,6 +236,16 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
 
     inject_args(&it, argc, argv);
 
+    /* ---- Create thread pool after compile so rules/chunks are frozen ---- */
+    xf_pool_t *pool = NULL;
+    if (nworkers > 1) {
+        pool = xf_pool_create(&vm, nworkers);
+        if (!pool) {
+            fprintf(stderr, "xf: failed to create thread pool\n");
+            goto cleanup;
+        }
+    }
+
     VMResult begin_rc = vm_run_begin(&vm);
     xf_drain_stack(&vm);
 
@@ -241,20 +255,13 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
     }
 
     if (!vm.should_exit && !isatty(fileno(stdin))) {
-        char buf[4096];
-
-        while (!vm.should_exit && fgets(buf, sizeof(buf), stdin)) {
-            size_t len = strlen(buf);
-
-            if (vm_feed_record(&vm, buf, len) != VM_OK) {
-                fprintf(stderr, "runtime error\n");
-                xf_drain_stack(&vm);
-                goto cleanup;
-            }
-
-            xf_drain_stack(&vm);
+        if (xf_run_records_mt(&vm, pool, stdin) != 0) {
+            goto cleanup;
         }
     }
+
+    /* Drain pool before END so all record results are settled. */
+    if (pool) xf_pool_drain(pool);
 
     if (!vm.should_exit) {
         VMResult end_rc = vm_run_end(&vm);
@@ -271,6 +278,9 @@ static int xf_run_program(Program *prog, int argc, char **argv) {
 cleanup:
     xf_drain_stack(&vm);
 
+    /* Tear down pool before vm_free — workers hold clone pointers into vm. */
+    if (pool) xf_pool_destroy(pool);
+
     /*
      * Release VM values/chunks first.
      * Then clear compiler-global name bindings.
@@ -283,28 +293,55 @@ cleanup:
     return rc;
 }
 int main(int argc, char **argv) {
-if (argc >= 2 &&
-        (strcmp(argv[1], "-v") == 0 ||
-         strcmp(argv[1], "--version") == 0)) {
+    if (argc >= 2 &&
+            (strcmp(argv[1], "-v") == 0 ||
+             strcmp(argv[1], "--version") == 0)) {
         print_version();
         return 0;
     }
+
     if (argc == 1) {
         return xf_run_repl();
     }
-if (argc >= 3 && strcmp(argv[1], "-r") == 0) {
-    char *source = read_file(argv[2]);
-    if (!source) {
-        return 1;
+
+    /* Parse optional -j <N> worker-count flag anywhere before the mode flag. */
+    int nworkers = 1;
+    int argi = 1;
+
+    if (argc >= 3 && strcmp(argv[argi], "-j") == 0) {
+        nworkers = atoi(argv[argi + 1]);
+        if (nworkers < 1) {
+            fprintf(stderr, "xf: -j requires a positive integer\n");
+            return 1;
+        }
+        /* Cap at hardware concurrency if detectable. */
+#ifdef _SC_NPROCESSORS_ONLN
+        long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+        if (ncpus > 0 && nworkers > (int)ncpus) {
+            fprintf(stderr, "xf: -j %d capped to %ld (hardware threads)\n",
+                    nworkers, ncpus);
+            nworkers = (int)ncpus;
+        }
+#endif
+        argi += 2;
     }
 
-    int rc = xf_run_source(argv[2], source, XF_SRC_FILE, argc - 2, &argv[2]);
-    free(source);
-    return rc;
-}
-if (argc >= 3 && strcmp(argv[1], "-e") == 0) {
-    return xf_run_source("<inline>", argv[2], XF_SRC_INLINE, argc - 2, &argv[2]);
-}
+    if (argi + 1 < argc && strcmp(argv[argi], "-r") == 0) {
+        char *source = read_file(argv[argi + 1]);
+        if (!source) return 1;
+        int rc = xf_run_source(argv[argi + 1], source, XF_SRC_FILE,
+                               argc - (argi + 1), &argv[argi + 1],
+                               nworkers);
+        free(source);
+        return rc;
+    }
+
+    if (argi + 1 < argc && strcmp(argv[argi], "-e") == 0) {
+        return xf_run_source("<inline>", argv[argi + 1], XF_SRC_INLINE,
+                             argc - (argi + 1), &argv[argi + 1],
+                             nworkers);
+    }
+
     usage(argv[0]);
     return 1;
 }

@@ -208,12 +208,11 @@ static void work_execute(xf_worker_t *worker, xf_work_t *w) {
     }
 
     case XF_WORK_SPAWN: {
-        extern xf_Value vm_call_function_chunk(VM *, void *, xf_Value *, size_t);
-        /* fn->body is a Chunk *; cast is the same as in vm.c OP_CALL. */
+        /* vm_call_function_chunk declared in vm.h, included via mt.h → value.h chain */
         xf_Value ret = xf_val_null();
         if (w->fn && !w->fn->is_native && w->fn->body) {
             ret = vm_call_function_chunk(vm,
-                                         (void *)w->fn->body,
+                                         (Chunk *)w->fn->body,
                                          w->args,
                                          w->argc);
         } else if (w->fn && w->fn->is_native && w->fn->native_v) {

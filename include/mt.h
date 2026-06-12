@@ -38,14 +38,20 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <pthread.h>
 
+/*
+ * Pull in value.h for the canonical type definitions.
+ * mt.h must be included AFTER value.h and vm.h in translation units,
+ * or just let this include handle it.
+ */
+#include "value.h"
+
 /* ============================================================
- * Forward declarations (avoid pulling in vm.h / value.h here)
+ * Forward declaration for VM (defined in vm.h)
  * ============================================================ */
-typedef struct VM        VM;
-typedef struct xf_arr_t  xf_arr_t;
-typedef struct xf_map_t  xf_map_t;
+typedef struct VM VM;
 
 /* ============================================================
  * Tunables
@@ -140,10 +146,6 @@ typedef enum {
 #define XF_WORK_REC_INLINE  512
 
 typedef struct xf_work_t xf_work_t;
-
-/* value.h types referenced by pointer only to avoid circular includes. */
-typedef struct xf_Value  xf_Value;
-typedef struct xf_fn_t   xf_fn_t;
 
 struct xf_work_t {
     xf_work_kind_t  kind;

@@ -4,6 +4,7 @@
 
 #include "../include/vm.h"
 #include "../include/gc.h"
+#include "../include/mt.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -485,26 +486,15 @@ xf_Value vm_peek(const VM *vm, int dist) {
 }
 
     uint32_t vm_alloc_global(VM *vm, xf_Value init) {
-        if (vm->global_count >= vm->global_cap) {
-            vm->global_cap *= 2;
-            vm->globals = realloc(vm->globals, sizeof(xf_Value) * vm->global_cap);
-        }
-        vm->globals[vm->global_count] = xf_value_retain(init);
-        uint32_t slot = (uint32_t)vm->global_count++;
-        xf_gc_check_threshold(vm);   /* fire GC every N globals */
-        return slot;
+        return vm_global_alloc(vm, init);   /* mt.c: write-locked, GC-aware */
     }
  
 xf_Value vm_get_global(VM *vm, uint32_t idx) {
-    if (!vm || idx >= vm->global_count) return xf_val_undef(XF_TYPE_VOID);
-    return xf_value_retain(vm->globals[idx]);
+    return vm_global_read(vm, idx);   /* mt.c: read-locked, retained */
 }
 
 bool vm_set_global(VM *vm, uint32_t idx, xf_Value v) {
-    if (!vm || idx >= vm->global_count) return false;
-    xf_value_release(vm->globals[idx]);
-    vm->globals[idx] = xf_value_retain(v);
-    return true;
+    return vm_global_write(vm, idx, v);   /* mt.c: write-locked */
 }
 
 /* ============================================================
@@ -861,6 +851,23 @@ static bool val_eq(xf_Value a, xf_Value b) {
     ((uint32_t)frame->chunk->code[frame->ip-3] << 16) | \
     ((uint32_t)frame->chunk->code[frame->ip-2] <<  8) | \
      (uint32_t)frame->chunk->code[frame->ip-1])
+/* --------------------------------------------------------
+ * Task slot allocator — scans vm->tasks[0..255] for a free slot.
+ * Slots are freed when OP_JOIN retrieves the result.
+ * -------------------------------------------------------- */
+static int vm_task_alloc(VM *vm) {
+    for (int i = 0; i < 256; i++) {
+        if (!vm->tasks[i].used) {
+            vm->tasks[i].used = true;
+            vm->tasks[i].done = false;
+            xf_value_release(vm->tasks[i].result);
+            vm->tasks[i].result = xf_val_null();
+            return i;
+        }
+    }
+    return -1;   /* all 256 slots in use */
+}
+
 static VMResult vm_run_chunk_internal(VM *vm, Chunk *chunk, xf_Value *args, size_t argc) {
     if (!vm || !chunk) return VM_ERR;
 
@@ -1265,13 +1272,11 @@ case OP_INSPECT: {
 */
 case OP_LOAD_GLOBAL: {
     uint32_t idx = READ_U32();
-
-    xf_Value gv = (idx < vm->global_count)
-        ? vm->globals[idx]
-        : xf_val_undef(XF_TYPE_VOID);
-
-
+    /* vm_global_read takes the pool read-lock when multithreaded,
+     * returns a retained value.  Single-threaded: no lock, same cost. */
+    xf_Value gv = vm_global_read(vm, idx);
     vm_push(vm, gv);
+    xf_value_release(gv);   /* push retained its own ref */
     break;
 }
 case OP_RIP_GLOBAL: {
@@ -1299,23 +1304,8 @@ case OP_RIP_GLOBAL: {
     uint32_t idx = READ_U32();
     xf_Value v = vm_pop(vm);
 
-    if (idx < vm->global_count) {
-/*        fprintf(stderr,
-                "[STORE_GLOBAL before] idx=%u old=%s/%s\n",
-                idx,
-                vm->globals[idx].state < XF_STATE_COUNT ? XF_STATE_NAMES[vm->globals[idx].state] : "?",
-                vm->globals[idx].type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[vm->globals[idx].type]   : "?");
-*/
-        xf_value_release(vm->globals[idx]);
-        vm->globals[idx] = xf_value_retain(v);
-
-/*        fprintf(stderr,
-                "[STORE_GLOBAL after ] idx=%u new=%s/%s\n",
-                idx,
-                vm->globals[idx].state < XF_STATE_COUNT ? XF_STATE_NAMES[vm->globals[idx].state] : "?",
-                vm->globals[idx].type  < XF_TYPE_COUNT  ? XF_TYPE_NAMES[vm->globals[idx].type]   : "?");
-*/
-        } else {
+    /* vm_global_write takes the pool write-lock, retains v, releases old. */
+    if (!vm_global_write(vm, idx, v)) {
         xf_value_release(v);
         vm_error(vm, "bad global slot");
         goto err;
@@ -1916,8 +1906,103 @@ if (fn->is_native && fn->native_v) {
     break;
 }
 
+        case OP_SPAWN: {
+    uint8_t argc2 = READ_U8();
+
+    if (argc2 > 64) {
+        vm_error(vm, "spawn: too many arguments");
+        goto err;
+    }
+
+    xf_Value callee = vm_pop(vm);
+
+    if (callee.state != XF_STATE_OK || callee.type != XF_TYPE_FN || !callee.data.fn) {
+        xf_value_release(callee);
+        vm_error(vm, "spawn: not a function");
+        goto err;
+    }
+
+    xf_Value spawn_args[64];
+    for (int i = (int)argc2 - 1; i >= 0; i--)
+        spawn_args[i] = vm_pop(vm);
+
+    int slot = vm_task_alloc(vm);
+    if (slot < 0) {
+        xf_value_release(callee);
+        for (size_t i = 0; i < argc2; i++) xf_value_release(spawn_args[i]);
+        vm_error(vm, "spawn: no free task slots");
+        goto err;
+    }
+
+    bool spawned = false;
+    if (vm->pool) {
+        spawned = xf_pool_submit_spawn(vm->pool,
+                                       callee.data.fn,
+                                       spawn_args, argc2,
+                                       slot);
+    }
+
+    if (!spawned) {
+        /* Fallback: run synchronously so the slot is always filled. */
+        xf_Value ret = xf_val_null();
+        if (callee.data.fn->is_native && callee.data.fn->native_v) {
+            ret = callee.data.fn->native_v(spawn_args, argc2);
+        } else if (!callee.data.fn->is_native && callee.data.fn->body) {
+            ret = vm_call_function_chunk(vm,
+                                         (Chunk *)callee.data.fn->body,
+                                         spawn_args, argc2);
+        }
+        xf_value_release(vm->tasks[slot].result);
+        vm->tasks[slot].result = xf_value_retain(ret);
+        vm->tasks[slot].done   = true;
+        xf_value_release(ret);
+    }
+
+    for (size_t i = 0; i < argc2; i++) xf_value_release(spawn_args[i]);
+    xf_value_release(callee);
+
+    /* Push an integer task handle so OP_JOIN can identify the slot. */
+    vm_push(vm, xf_val_ok_num((double)slot));
+    break;
 }
-        if (vm->had_error) goto err;
+
+        case OP_JOIN: {
+    xf_Value handle = vm_pop(vm);
+
+    if (handle.state != XF_STATE_OK || handle.type != XF_TYPE_NUM) {
+        xf_value_release(handle);
+        vm_error(vm, "join: invalid task handle");
+        goto err;
+    }
+
+    int slot = (int)handle.data.num;
+    xf_value_release(handle);
+
+    if (slot < 0 || slot >= 256 || !vm->tasks[slot].used) {
+        vm_error(vm, "join: invalid or already-joined task slot");
+        goto err;
+    }
+
+    xf_Value result;
+    if (vm->pool) {
+        result = xf_pool_await(vm->pool, slot);   /* blocks until done */
+    } else {
+        /* Synchronous fallback: task was already completed inline. */
+        result = xf_value_retain(vm->tasks[slot].result);
+    }
+
+    /* Free the slot for reuse. */
+    xf_value_release(vm->tasks[slot].result);
+    vm->tasks[slot].result = xf_val_null();
+    vm->tasks[slot].used   = false;
+    vm->tasks[slot].done   = false;
+
+    vm_push(vm, result);
+    xf_value_release(result);
+    break;
+}
+
+}
     }
 
 done:
