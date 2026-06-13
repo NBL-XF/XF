@@ -1,5 +1,6 @@
 #include "../include/value.h"
 #include "../include/vm.h"
+#include "../include/simd.h"
 #include <assert.h>
 #include <regex.h>
 #include <stdio.h>
@@ -103,14 +104,7 @@ void xf_str_release(xf_str_t *s) {
 uint32_t xf_str_hash(xf_str_t *s) {
     if (!s) return 0;
     if (s->hash != 0) return s->hash;
-
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < s->len; i++) {
-        h ^= (unsigned char)s->data[i];
-        h *= 16777619u;
-    }
-
-    s->hash = (h == 0) ? 1 : h;
+    s->hash = xf_simd_str_hash(s->data, s->len);
     return s->hash;
 }
 
@@ -120,7 +114,7 @@ int xf_str_cmp(const xf_str_t *a, const xf_str_t *b) {
     if (!b) return 1;
 
     size_t min_len = (a->len < b->len) ? a->len : b->len;
-    int cmp = memcmp(a->data, b->data, min_len);
+    int cmp = xf_simd_memcmp(a->data, b->data, min_len);
     if (cmp != 0) return cmp;
 
     if (a->len < b->len) return -1;

@@ -5,6 +5,7 @@
 #include "../include/vm.h"
 #include "../include/gc.h"
 #include "../include/mt.h"
+#include "../include/simd.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -534,10 +535,8 @@ void vm_redir_flush(VM *vm) {
 static void split_record(VM *vm, const char *rec, size_t len) {
     pthread_mutex_lock(&vm->rec_mu);
 
-    /* trim trailing newline / carriage return from input record */
-    while (len > 0 && (rec[len - 1] == '\n' || rec[len - 1] == '\r')) {
-        len--;
-    }
+    /* trim trailing newline / carriage return */
+    len = xf_simd_trim_newline(rec, len);
 
     /* preserve full raw record for $0 */
     free(vm->rec.buf);
@@ -554,27 +553,13 @@ static void split_record(VM *vm, const char *rec, size_t len) {
     vm->rec.split_buf_len = len;
 
     size_t fc = 0;
-    char *p = vm->rec.split_buf;
     if (vm->rec.fs[0] == ' ' && vm->rec.fs[1] == '\0') {
-        while (*p) {
-            while (*p == ' ' || *p == '\t') p++;
-            if (!*p) break;
-            vm->rec.fields[fc++] = p;
-            while (*p && *p != ' ' && *p != '\t') p++;
-            if (*p) *p++ = '\0';
-            if (fc >= FIELD_MAX - 1) break;
-        }
+        fc = xf_simd_split_ws(vm->rec.split_buf, len,
+                               vm->rec.fields, FIELD_MAX - 1);
     } else {
         char sep = vm->rec.fs[0] ? vm->rec.fs[0] : ' ';
-        vm->rec.fields[fc++] = p;
-        while (*p && fc < FIELD_MAX - 1) {
-            if (*p == sep) {
-                *p++ = '\0';
-                vm->rec.fields[fc++] = p;
-            } else {
-                p++;
-            }
-        }
+        fc = xf_simd_split_sep(vm->rec.split_buf, len, sep,
+                                vm->rec.fields, FIELD_MAX - 1);
     }
 
     vm->rec.field_count = fc;

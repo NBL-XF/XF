@@ -6,6 +6,7 @@
 #include "../include/vm.h"
 #include "../include/value.h"
 #include "../include/gc.h"
+#include "../include/simd.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -539,7 +540,7 @@ bool xf_pool_submit_record(xf_pool_t *pool, const char *rec, size_t len) {
     } else {
         w->rec_heap = malloc(len + 1);
         if (!w->rec_heap) { work_free(w); return false; }
-        memcpy(w->rec_heap, rec, len);
+        xf_simd_memcpy_nt(w->rec_heap, rec, len);
         w->rec_heap[len] = '\0';
     }
 

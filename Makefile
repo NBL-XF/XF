@@ -52,7 +52,8 @@ RUNTIME_SRCS = \
  lib/api.c 
 CLI_SRCS = \
 	src/main.c \
-	src/repl.c
+	src/repl.c \
+	src/simd.c
 RUNTIME_OBJS = $(patsubst %.c,$(OBJDIR)/%.o,$(RUNTIME_SRCS))
 CLI_OBJS     = $(patsubst %.c,$(OBJDIR)/%.o,$(CLI_SRCS))
 all: $(LIBXF) $(BIN)
