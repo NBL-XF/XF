@@ -1,3 +1,3 @@
 bin/*
 obj/*
-lib/*.a
+lib/*.alib/release/static/libxf.a
