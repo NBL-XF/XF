@@ -12,7 +12,7 @@
 #include "../include/interp.h"
 #include "../include/repl.h"
 #include "../include/mt.h"
-#define XF_VERSION "1.0.1"
+#define XF_VERSION "1.0.2"
 static int xf_run_program(Program *prog, int argc, char **argv, int nworkers);
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "rb");
