@@ -197,6 +197,7 @@ struct xf_value {
 
 struct xf_arr {
   atomic_int refcount;
+  atomic_flag lock;        /* spinlock: guards items/len/cap mutations */
   xf_value_t * items;
   size_t len;
   size_t cap;
@@ -210,6 +211,7 @@ xf_map_slot_t;
 
 struct xf_map {
   atomic_int refcount;
+  atomic_flag lock;        /* spinlock: guards slots/order mutations */
   xf_map_slot_t * slots;
   size_t used;
   size_t cap;
@@ -361,4 +363,21 @@ void xf_value_print(xf_value_t v);
 void xf_value_repl_print(xf_value_t v);
 void xf_err_print(xf_err_t * e);
 void xf_value_inspect_print(xf_value_t v);
+/* --------------------------------------------------------
+ * Embedded spinlock helpers (used by xf_arr / xf_map internals).
+ * Based on atomic_flag — zero-overhead when uncontended.
+ * -------------------------------------------------------- */
+static inline void xf_val_spin_lock(atomic_flag *f) {
+    while (atomic_flag_test_and_set_explicit(f, memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+        __asm__ volatile("pause" ::: "memory");
+#else
+        atomic_thread_fence(memory_order_relaxed);
+#endif
+    }
+}
+static inline void xf_val_spin_unlock(atomic_flag *f) {
+    atomic_flag_clear_explicit(f, memory_order_release);
+}
+
 #endif

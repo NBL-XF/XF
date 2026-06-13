@@ -1,5 +1,6 @@
 #include "../include/value.h"
 #include "../include/vm.h"
+#include "../include/simd.h"
 #include <assert.h>
 #include <regex.h>
 #include <stdio.h>
@@ -103,14 +104,7 @@ void xf_str_release(xf_str_t *s) {
 uint32_t xf_str_hash(xf_str_t *s) {
     if (!s) return 0;
     if (s->hash != 0) return s->hash;
-
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < s->len; i++) {
-        h ^= (unsigned char)s->data[i];
-        h *= 16777619u;
-    }
-
-    s->hash = (h == 0) ? 1 : h;
+    s->hash = xf_simd_str_hash(s->data, s->len);
     return s->hash;
 }
 
@@ -120,7 +114,7 @@ int xf_str_cmp(const xf_str_t *a, const xf_str_t *b) {
     if (!b) return 1;
 
     size_t min_len = (a->len < b->len) ? a->len : b->len;
-    int cmp = memcmp(a->data, b->data, min_len);
+    int cmp = xf_simd_memcmp(a->data, b->data, min_len);
     if (cmp != 0) return cmp;
 
     if (a->len < b->len) return -1;
@@ -784,6 +778,7 @@ xf_arr_t *xf_arr_new(void) {
     if (!a) return NULL;
 
     atomic_store(&a->refcount, 1);
+    atomic_flag_clear(&a->lock);
     a->len = 0;
     a->cap = ARR_INIT_CAP;
     a->items = calloc(a->cap, sizeof(xf_value_t));
@@ -822,60 +817,67 @@ void xf_arr_release(xf_arr_t *a) {
 
 void xf_arr_push(xf_arr_t *a, xf_value_t v) {
     if (!a) return;
-    if (!xf_arr_grow(a, a->len + 1)) return;
+    xf_val_spin_lock(&a->lock);
+    if (!xf_arr_grow(a, a->len + 1)) { xf_val_spin_unlock(&a->lock); return; }
     a->items[a->len++] = xf_value_retain(v);
+    xf_val_spin_unlock(&a->lock);
 }
 
 xf_value_t xf_arr_pop(xf_arr_t *a) {
     if (!a || a->len == 0) return xf_val_nav(XF_TYPE_VOID);
 
+    xf_val_spin_lock(&a->lock);
+    if (a->len == 0) { xf_val_spin_unlock(&a->lock); return xf_val_nav(XF_TYPE_VOID); }
     size_t idx = a->len - 1;
     xf_value_t out = xf_value_retain(a->items[idx]);
     xf_value_release(a->items[idx]);
     memset(&a->items[idx], 0, sizeof(xf_value_t));
     a->len--;
+    xf_val_spin_unlock(&a->lock);
     return out;
 }
 
 void xf_arr_unshift(xf_arr_t *a, xf_value_t v) {
     if (!a) return;
-    if (!xf_arr_grow(a, a->len + 1)) return;
-
+    xf_val_spin_lock(&a->lock);
+    if (!xf_arr_grow(a, a->len + 1)) { xf_val_spin_unlock(&a->lock); return; }
     if (a->len > 0) {
         memmove(a->items + 1, a->items, a->len * sizeof(xf_value_t));
     }
-
     a->items[0] = xf_value_retain(v);
     a->len++;
+    xf_val_spin_unlock(&a->lock);
 }
 
 xf_value_t xf_arr_shift(xf_arr_t *a) {
     if (!a || a->len == 0) return xf_val_nav(XF_TYPE_VOID);
 
+    xf_val_spin_lock(&a->lock);
+    if (a->len == 0) { xf_val_spin_unlock(&a->lock); return xf_val_nav(XF_TYPE_VOID); }
     xf_value_t out = xf_value_retain(a->items[0]);
     xf_value_release(a->items[0]);
-
     if (a->len > 1) {
         memmove(a->items, a->items + 1, (a->len - 1) * sizeof(xf_value_t));
     }
-
     a->len--;
     memset(&a->items[a->len], 0, sizeof(xf_value_t));
+    xf_val_spin_unlock(&a->lock);
     return out;
 }
 
 void xf_arr_delete(xf_arr_t *a, size_t idx) {
     if (!a || idx >= a->len) return;
 
+    xf_val_spin_lock(&a->lock);
+    if (idx >= a->len) { xf_val_spin_unlock(&a->lock); return; }
     xf_value_release(a->items[idx]);
-
     if (idx + 1 < a->len) {
         memmove(a->items + idx, a->items + idx + 1,
                 (a->len - idx - 1) * sizeof(xf_value_t));
     }
-
     a->len--;
     memset(&a->items[a->len], 0, sizeof(xf_value_t));
+    xf_val_spin_unlock(&a->lock);
 }
 
 xf_value_t xf_arr_get(const xf_arr_t *a, size_t idx) {
@@ -885,12 +887,11 @@ xf_value_t xf_arr_get(const xf_arr_t *a, size_t idx) {
 
 void xf_arr_set(xf_arr_t *a, size_t idx, xf_value_t v) {
     if (!a) return;
-    if (!xf_arr_grow(a, idx + 1)) return;
-
+    xf_val_spin_lock(&a->lock);
+    if (!xf_arr_grow(a, idx + 1)) { xf_val_spin_unlock(&a->lock); return; }
     while (a->len < idx) {
         a->items[a->len++] = xf_val_undef(XF_TYPE_VOID);
     }
-
     if (idx < a->len) {
         xf_value_release(a->items[idx]);
         a->items[idx] = xf_value_retain(v);
@@ -898,6 +899,7 @@ void xf_arr_set(xf_arr_t *a, size_t idx, xf_value_t v) {
         a->items[idx] = xf_value_retain(v);
         a->len = idx + 1;
     }
+    xf_val_spin_unlock(&a->lock);
 }
 
 /* ============================================================
@@ -976,6 +978,7 @@ xf_map_t *xf_map_new(void) {
     if (!m) return NULL;
 
     atomic_store(&m->refcount, 1);
+    atomic_flag_clear(&m->lock);
     m->cap = MAP_INIT_CAP;
     m->slots = calloc(m->cap, sizeof(xf_map_slot_t));
 
@@ -1018,26 +1021,30 @@ void xf_map_release(xf_map_t *m) {
 void xf_map_set(xf_map_t *m, xf_str_t *key, xf_value_t val) {
     if (!m || !key) return;
 
+    xf_val_spin_lock(&m->lock);
+
     if ((double)(m->used + 1) / (double)m->cap > MAP_LOAD_FACTOR) {
-        if (!xf_map_resize(m, m->cap ? m->cap * 2 : MAP_INIT_CAP)) return;
+        if (!xf_map_resize(m, m->cap ? m->cap * 2 : MAP_INIT_CAP)) {
+            xf_val_spin_unlock(&m->lock);
+            return;
+        }
     }
 
     size_t idx = xf_map_probe(m, key);
     xf_map_slot_t *slot = &m->slots[idx];
 
     if (slot->key) {
-        // overwrite existing key
         xf_value_release(slot->val);
         slot->val = xf_value_retain(val);
+        xf_val_spin_unlock(&m->lock);
         return;
     }
 
-    // new entry: map must own both key and value
     slot->key = xf_str_retain(key);
     slot->val = xf_value_retain(val);
     m->used++;
-
     xf_map_order_append(m, slot->key);
+    xf_val_spin_unlock(&m->lock);
 }
 xf_value_t xf_map_get(const xf_map_t *m, const xf_str_t *key) {
     if (!m || !key) return xf_val_nav(XF_TYPE_VOID);
@@ -1055,13 +1062,15 @@ xf_value_t xf_map_get(const xf_map_t *m, const xf_str_t *key) {
 bool xf_map_delete(xf_map_t *m, const xf_str_t *key) {
     if (!m || !key) return false;
 
+    xf_val_spin_lock(&m->lock);
+
     size_t mask = m->cap - 1;
     size_t idx  = xf_str_hash((xf_str_t *)key) & mask;
 
     while (1) {
         xf_map_slot_t *slot = &m->slots[idx];
 
-        if (!slot->key) return false;
+        if (!slot->key) { xf_val_spin_unlock(&m->lock); return false; }
 
         if (xf_str_cmp(slot->key, key) == 0) {
             xf_str_t *dead_key = slot->key;
@@ -1097,6 +1106,7 @@ bool xf_map_delete(xf_map_t *m, const xf_str_t *key) {
                 scan = (scan + 1) & mask;
             }
 
+            xf_val_spin_unlock(&m->lock);
             return true;
         }
 
