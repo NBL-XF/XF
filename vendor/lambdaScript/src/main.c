@@ -22,7 +22,7 @@ static int parse_step_limit(const char *text, size_t *out) {
 }
 
 static void usage(const char *argv0) {
-	fprintf(stderr, "usage: %s [-q] [-t] [-n STEPS] [-e EXPR] [FILE]\n", argv0);
+	fprintf(stderr, "usage: %s [-q] [-t] [-n STEPS] [-e EXPR] [FILE] [-- ARGS...]\n", argv0);
 	fprintf(stderr, "\n");
 	fprintf(stderr, "options:\n");
 	fprintf(stderr, "  -e EXPR        evaluate an expression/program string\n");
@@ -30,21 +30,27 @@ static void usage(const char *argv0) {
 	fprintf(stderr, "  -q             quiet; suppress [steps=...]\n");
 	fprintf(stderr, "  -t             trace reductions to stderr\n");
 	fprintf(stderr, "  --no-prelude   disable built-in I/K/S/TRUE/FALSE\n");
+	fprintf(stderr, "  --             stop option parsing; remaining values become ARGS\n");
 	fprintf(stderr, "  -h, --help     show help\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "program format:\n");
 	fprintf(stderr, "  one definition per line: NAME = EXPR\n");
 	fprintf(stderr, "  final non-definition line is the program expression\n");
+	fprintf(stderr, "  script args are exposed as ARG1, ARG2, ..., ARGC, and ARGS\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "examples:\n");
 	fprintf(stderr, "  %s -e 'I z'\n", argv0);
 	fprintf(stderr, "  %s -e 'ID = \\\\x.x\nID z'\n", argv0);
-	fprintf(stderr, "  %s file.ls\n", argv0);
-	}
+	fprintf(stderr, "  %s file.ls alpha beta\n", argv0);
+	fprintf(stderr, "  %s -e 'ARG1' -- alpha\n", argv0);
+}
+
 
 int main(int argc, char **argv) {
 	const char *expr = NULL;
 	const char *file_path = NULL;
+	const char *const *script_argv = NULL;
+	size_t script_argc = 0;
 	char *stdin_source = NULL;
 	ls_State *L = NULL;
 	ls_Options options;
@@ -56,6 +62,12 @@ int main(int argc, char **argv) {
 	ls_result_init(&result);
 
 	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--") == 0) {
+			script_argv = (const char *const *)&argv[i + 1];
+			script_argc = (size_t)(argc - i - 1);
+			break;
+		}
+
 		if (strcmp(argv[i], "-e") == 0) {
 			if (i + 1 >= argc) {
 				usage(argv[0]);
@@ -100,18 +112,35 @@ int main(int argc, char **argv) {
 			return 1;
 		}
 
+		if (expr != NULL) {
+			script_argv = (const char *const *)&argv[i];
+			script_argc = (size_t)(argc - i);
+			break;
+		}
+
 		if (file_path == NULL) {
 			file_path = argv[i];
 			continue;
 		}
 
-		fprintf(stderr, "error: too many positional arguments\n");
-		return 1;
+		script_argv = (const char *const *)&argv[i];
+		script_argc = (size_t)(argc - i);
+		break;
 	}
 
 	if (expr != NULL && file_path != NULL) {
 		fprintf(stderr, "error: use either -e EXPR or FILE, not both\n");
 		return 1;
+	}
+
+	options.argc = script_argc;
+	options.argv = script_argv;
+	if (expr != NULL) {
+		options.source_name = "<eval>";
+	} else if (file_path != NULL) {
+		options.source_name = file_path;
+	} else {
+		options.source_name = "<stdin>";
 	}
 
 	L = ls_newstate();

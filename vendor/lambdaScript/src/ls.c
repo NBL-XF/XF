@@ -5,6 +5,7 @@
 #include "../include/parser.h"
 #include "../include/value.h"
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -156,23 +157,190 @@ static char *read_file_text(const char *path) {
 	return source;
 }
 
-static char *merge_source_with_prelude(const char *source, int use_prelude) {
-	size_t prelude_len = use_prelude ? strlen(LS_PRELUDE) : 0;
-	size_t source_len = strlen(source);
-	char *merged = (char *)malloc(prelude_len + source_len + 2);
+static int ls_is_ident_text(const char *s) {
+	const unsigned char *p;
 
-	if (merged == NULL) {
+	if (s == NULL || s[0] == '\0') {
+		return 0;
+	}
+
+	if (!(isalpha((unsigned char)s[0]) || s[0] == '_')) {
+		return 0;
+	}
+
+	for (p = (const unsigned char *)s + 1; *p != '\0'; p++) {
+		if (!(isalnum(*p) || *p == '_')) {
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+static char *ls_symbol_from_text(const char *text) {
+	static const char hex[] = "0123456789ABCDEF";
+	size_t len;
+	char *out;
+	size_t i;
+	const unsigned char *bytes;
+
+	if (text == NULL) {
+		text = "";
+	}
+
+	if (ls_is_ident_text(text)) {
+		return ls_strdup(text);
+	}
+
+	len = strlen(text);
+	if (len == 0) {
+		return ls_strdup("ARGVAL_EMPTY");
+	}
+
+	out = (char *)malloc(strlen("ARGVAL_") + len * 2 + 1);
+	if (out == NULL) {
 		return NULL;
 	}
 
-	merged[0] = '\0';
-	if (use_prelude) {
-		memcpy(merged, LS_PRELUDE, prelude_len);
-		merged[prelude_len] = '\0';
+	memcpy(out, "ARGVAL_", strlen("ARGVAL_"));
+	bytes = (const unsigned char *)text;
+	for (i = 0; i < len; i++) {
+		out[strlen("ARGVAL_") + i * 2] = hex[(bytes[i] >> 4) & 0xF];
+		out[strlen("ARGVAL_") + i * 2 + 1] = hex[bytes[i] & 0xF];
 	}
-	memcpy(merged + prelude_len, source, source_len + 1);
+	out[strlen("ARGVAL_") + len * 2] = '\0';
+	return out;
+}
 
-	return merged;
+static int buf_append_church_numeral(LsBuf *buf, size_t n) {
+	size_t i;
+
+	if (!buf_append(buf, "\\f.\\x.")) {
+		return 0;
+	}
+
+	for (i = 0; i < n; i++) {
+		if (!buf_append(buf, "f (")) {
+			return 0;
+		}
+	}
+
+	if (!buf_append(buf, "x")) {
+		return 0;
+	}
+
+	for (i = 0; i < n; i++) {
+		if (!buf_append(buf, ")")) {
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+static int buf_append_symbol_def(LsBuf *buf, const char *name, const char *value) {
+	char *sym;
+	int ok;
+
+	sym = ls_symbol_from_text(value);
+	if (sym == NULL) {
+		return 0;
+	}
+
+	ok = buf_append(buf, name) &&
+	     buf_append(buf, " = ") &&
+	     buf_append(buf, sym) &&
+	     buf_append(buf, "\n");
+
+	free(sym);
+	return ok;
+}
+
+static int buf_append_arg_builtins(LsBuf *buf, const ls_Options *options) {
+	size_t argc = options != NULL ? options->argc : 0;
+	const char *const *argv = options != NULL ? options->argv : NULL;
+	const char *source_name = options != NULL ? options->source_name : NULL;
+	size_t i;
+
+	if (source_name == NULL) {
+		source_name = "<eval>";
+	}
+if (!buf_append(buf,
+                "\n"
+                "; LambdaScript argument builtins\n"
+                "NIL = \\c.\\n.n\n"
+                "CONS = \\h.\\t.\\c.\\n.c h t\n")) {
+    return 0;
+}
+	if (!buf_append_symbol_def(buf, "ARG0", source_name)) {
+		return 0;
+	}
+
+	if (!buf_append(buf, "ARGC = ") || !buf_append_church_numeral(buf, argc) || !buf_append(buf, "\n")) {
+		return 0;
+	}
+
+	for (i = 0; i < argc; i++) {
+		char name[64];
+		snprintf(name, sizeof(name), "ARG%zu", i + 1);
+		if (!buf_append_symbol_def(buf, name, argv != NULL ? argv[i] : NULL)) {
+			return 0;
+		}
+	}
+
+	if (!buf_append(buf, "ARGS = ")) {
+		return 0;
+	}
+
+	if (argc == 0) {
+		if (!buf_append(buf, "NIL")) {
+			return 0;
+		}
+	} else {
+		for (i = 0; i < argc; i++) {
+			char name[64];
+			snprintf(name, sizeof(name), "ARG%zu", i + 1);
+			if (!buf_append(buf, "CONS ") || !buf_append(buf, name) || !buf_append(buf, " (")) {
+				return 0;
+			}
+		}
+		if (!buf_append(buf, "NIL")) {
+			return 0;
+		}
+		for (i = 0; i < argc; i++) {
+			if (!buf_append(buf, ")")) {
+				return 0;
+			}
+		}
+	}
+
+	return buf_append(buf, "\n\n");
+}
+
+static char *merge_source_with_builtins(const char *source, const ls_Options *options) {
+	LsBuf buf = {0};
+	int use_prelude = options == NULL || options->use_prelude;
+
+	if (use_prelude && !buf_append(&buf, LS_PRELUDE)) {
+		free(buf.data);
+		return NULL;
+	}
+
+	if (!buf_append_arg_builtins(&buf, options)) {
+		free(buf.data);
+		return NULL;
+	}
+
+	if (!buf_append(&buf, source)) {
+		free(buf.data);
+		return NULL;
+	}
+
+	if (buf.data == NULL) {
+		return ls_strdup("");
+	}
+
+	return buf.data;
 }
 
 static Value *reduce_with_trace(const Value *term, size_t max_steps, size_t *steps_taken, int *reached_limit, char **trace_out) {
@@ -284,6 +452,9 @@ void ls_options_init(ls_Options *options) {
 	options->trace = 0;
 	options->quiet = 0;
 	options->use_prelude = 1;
+	options->source_name = NULL;
+	options->argc = 0;
+	options->argv = NULL;
 }
 
 void ls_result_init(ls_Result *result) {
@@ -308,6 +479,7 @@ void ls_result_free(ls_Result *result) {
 
 int ls_eval_string(ls_State *L, const char *source, const ls_Options *options, ls_Result *result) {
 	ls_Options local_options;
+	ls_Options effective_options;
 	char *merged = NULL;
 	Program *program = NULL;
 	Value *term = NULL;
@@ -327,9 +499,15 @@ int ls_eval_string(ls_State *L, const char *source, const ls_Options *options, l
 		options = &local_options;
 	}
 
+	effective_options = *options;
+	if (effective_options.source_name == NULL) {
+		effective_options.source_name = "<eval>";
+	}
+	options = &effective_options;
+
 	ls_result_free(result);
 
-	merged = merge_source_with_prelude(source, options->use_prelude);
+	merged = merge_source_with_builtins(source, options);
 	if (merged == NULL) {
 		err_set("out of memory");
 		goto fail;
@@ -382,8 +560,20 @@ fail:
 }
 
 int ls_eval_file(ls_State *L, const char *path, const ls_Options *options, ls_Result *result) {
+	ls_Options local_options;
+	ls_Options effective_options;
 	char *source;
 	int ok;
+
+	if (options == NULL) {
+		ls_options_init(&local_options);
+		options = &local_options;
+	}
+
+	effective_options = *options;
+	if (effective_options.source_name == NULL) {
+		effective_options.source_name = path;
+	}
 
 	source = read_file_text(path);
 	if (source == NULL) {
@@ -391,7 +581,7 @@ int ls_eval_file(ls_State *L, const char *path, const ls_Options *options, ls_Re
 		return 0;
 	}
 
-	ok = ls_eval_string(L, source, options, result);
+	ok = ls_eval_string(L, source, &effective_options, result);
 	free(source);
 	return ok;
 }
