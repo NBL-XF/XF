@@ -97,3 +97,4 @@ xf_module_t *build_format(void);
 xf_module_t *build_ds(void);
 xf_module_t *build_edit(void);
 xf_module_t *build_process(void);
+xf_module_t *build_lambda(void);
