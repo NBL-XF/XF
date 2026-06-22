@@ -11,6 +11,7 @@ void core_register(SymTable *st) {
     xf_module_t *format_m   = build_format();
     xf_module_t *regex_m    = build_regex();
     xf_module_t *process_m  = build_process();
+    xf_module_t *lambda_m   = build_lambda();
     xf_module_t *img_m      = build_img();
 
     xf_module_t *core_m = xf_module_new("core");
@@ -24,6 +25,7 @@ void core_register(SymTable *st) {
         xf_module_release(format_m);
         xf_module_release(regex_m);
         xf_module_release(process_m);
+        xf_module_release(lambda_m);
         xf_module_release(img_m);
         return;
     }
@@ -62,6 +64,10 @@ void core_register(SymTable *st) {
     xf_module_set(core_m, "process", tmp);
     xf_value_release(tmp);
 
+    tmp = xf_val_ok_module(lambda_m);
+    xf_module_set(core_m, "lambda", tmp);
+    xf_value_release(tmp);
+
     tmp = xf_val_ok_module(img_m);
     xf_module_set(core_m, "img", tmp);
     xf_value_release(tmp);
@@ -78,6 +84,7 @@ void core_register(SymTable *st) {
     xf_module_release(edit_m);
     xf_module_release(format_m);
     xf_module_release(process_m);
+    xf_module_release(lambda_m);
     xf_module_release(img_m);
 
     xf_Value core_val = xf_val_ok_module(core_m);

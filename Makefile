@@ -58,11 +58,12 @@ RUNTIME_SRCS = \
 	src/symTable.c \
 	src/value.c \
 	src/vm.c \
- src/gc.c \
- src/mt.c \
+	src/gc.c \
+	src/mt.c \
 	$(CORE_SRCS) \
- lib/driver.c \
- lib/api.c 
+	lib/driver.c \
+	lib/api.c
+
 CLI_SRCS = \
 	src/main.c \
 	src/repl.c \
@@ -123,5 +124,8 @@ uninstall:
 
 clean:
 	rm -rf obj/* bin/*
+	rm -rf lib/debug lib/release lib/thread
+
 export ASAN_SYMBOLIZER_PATH=/opt/homebrew/opt/llvm/bin/llvm-symbolizer
+
 .PHONY: all run install uninstall clean

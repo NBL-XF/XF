@@ -1,0 +1,271 @@
+#include "../include/interp.h"
+
+#include "../include/err.h"
+
+#include <limits.h>
+#include <stdbool.h>
+#include <stdlib.h>
+
+static Value *shift_walk(const Value *term, int delta, size_t cutoff) {
+	long long shifted;
+	Value *body;
+	Value *fn;
+	Value *arg;
+	Value *app;
+
+	switch (term->kind) {
+	case VALUE_BOUND_VAR:
+		if (term->as.bound_var.index >= cutoff) {
+			shifted = (long long)term->as.bound_var.index + delta;
+			if (shifted < 0 || shifted > LLONG_MAX) {
+				err_set("invalid de Bruijn shift");
+				return NULL;
+			}
+			return value_bound_var_new((size_t)shifted);
+		}
+		return value_bound_var_new(term->as.bound_var.index);
+
+	case VALUE_FREE_VAR:
+		return value_free_var_new(term->as.free_var.name);
+
+	case VALUE_LAM:
+		body = shift_walk(term->as.lam.body, delta, cutoff + 1);
+		if (body == NULL) {
+			return NULL;
+		}
+		return value_lam_new(body);
+
+	case VALUE_APP:
+		fn = shift_walk(term->as.app.fn, delta, cutoff);
+		if (fn == NULL) {
+			return NULL;
+		}
+
+		arg = shift_walk(term->as.app.arg, delta, cutoff);
+		if (arg == NULL) {
+			value_free(fn);
+			return NULL;
+		}
+
+		app = value_app_new(fn, arg);
+		if (app == NULL) {
+			value_free(fn);
+			value_free(arg);
+			err_set("out of memory");
+			return NULL;
+		}
+		return app;
+	}
+
+	err_set("unknown value node");
+	return NULL;
+}
+
+static Value *value_shift(const Value *term, int delta) {
+	return shift_walk(term, delta, 0);
+}
+
+static Value *subst_walk(const Value *term, size_t depth, size_t target, const Value *replacement) {
+	Value *body;
+	Value *fn;
+	Value *arg;
+	Value *app;
+
+	switch (term->kind) {
+	case VALUE_BOUND_VAR:
+		if (term->as.bound_var.index == target + depth) {
+			return shift_walk(replacement, (int)depth, 0);
+		}
+		return value_bound_var_new(term->as.bound_var.index);
+
+	case VALUE_FREE_VAR:
+		return value_free_var_new(term->as.free_var.name);
+
+	case VALUE_LAM:
+		body = subst_walk(term->as.lam.body, depth + 1, target, replacement);
+		if (body == NULL) {
+			return NULL;
+		}
+		return value_lam_new(body);
+
+	case VALUE_APP:
+		fn = subst_walk(term->as.app.fn, depth, target, replacement);
+		if (fn == NULL) {
+			return NULL;
+		}
+
+		arg = subst_walk(term->as.app.arg, depth, target, replacement);
+		if (arg == NULL) {
+			value_free(fn);
+			return NULL;
+		}
+
+		app = value_app_new(fn, arg);
+		if (app == NULL) {
+			value_free(fn);
+			value_free(arg);
+			err_set("out of memory");
+			return NULL;
+		}
+		return app;
+	}
+
+	err_set("unknown value node");
+	return NULL;
+}
+
+static Value *value_subst(const Value *term, size_t target, const Value *replacement) {
+	return subst_walk(term, 0, target, replacement);
+}
+
+static Value *beta_reduce(const Value *body, const Value *arg) {
+	Value *arg_up;
+	Value *substituted;
+	Value *result;
+
+	arg_up = value_shift(arg, 1);
+	if (arg_up == NULL) {
+		return NULL;
+	}
+
+	substituted = value_subst(body, 0, arg_up);
+	value_free(arg_up);
+	if (substituted == NULL) {
+		return NULL;
+	}
+
+	result = value_shift(substituted, -1);
+	value_free(substituted);
+	return result;
+}
+
+Value *interp_step_normal(const Value *term) {
+	Value *body_step;
+	Value *fn_step;
+	Value *arg_step;
+	Value *fn_clone;
+	Value *app;
+
+	switch (term->kind) {
+	case VALUE_BOUND_VAR:
+	case VALUE_FREE_VAR:
+		return NULL;
+
+	case VALUE_LAM:
+		body_step = interp_step_normal(term->as.lam.body);
+		if (body_step == NULL) {
+			return NULL;
+		}
+		return value_lam_new(body_step);
+
+	case VALUE_APP:
+		if (term->as.app.fn->kind == VALUE_LAM) {
+			return beta_reduce(term->as.app.fn->as.lam.body, term->as.app.arg);
+		}
+
+		err_clear();
+		fn_step = interp_step_normal(term->as.app.fn);
+		if (fn_step != NULL) {
+			app = value_app_new(fn_step, value_clone(term->as.app.arg));
+			if (app == NULL) {
+				value_free(fn_step);
+				err_set("out of memory");
+				return NULL;
+			}
+			return app;
+		}
+		if (err_has()) {
+			return NULL;
+		}
+
+		err_clear();
+		arg_step = interp_step_normal(term->as.app.arg);
+		if (arg_step != NULL) {
+			fn_clone = value_clone(term->as.app.fn);
+			if (fn_clone == NULL) {
+				value_free(arg_step);
+				err_set("out of memory");
+				return NULL;
+			}
+
+			app = value_app_new(fn_clone, arg_step);
+			if (app == NULL) {
+				value_free(fn_clone);
+				value_free(arg_step);
+				err_set("out of memory");
+				return NULL;
+			}
+			return app;
+		}
+		return NULL;
+	}
+
+	err_set("unknown value node");
+	return NULL;
+}
+
+Value *interp_reduce_normal(const Value *term, size_t max_steps, size_t *steps_taken, int *reached_limit) {
+	Value *current;
+	size_t steps = 0;
+	bool hit_limit = false;
+
+	if (steps_taken != NULL) {
+		*steps_taken = 0;
+	}
+	if (reached_limit != NULL) {
+		*reached_limit = 0;
+	}
+
+	err_clear();
+
+	current = value_clone(term);
+	if (current == NULL) {
+		err_set("out of memory");
+		return NULL;
+	}
+
+	while (steps < max_steps) {
+		Value *next;
+
+		err_clear();
+		next = interp_step_normal(current);
+
+		if (next == NULL) {
+			if (err_has()) {
+				value_free(current);
+				return NULL;
+			}
+			break;
+		}
+
+		value_free(current);
+		current = next;
+		steps++;
+	}
+
+	if (steps == max_steps) {
+		Value *probe;
+
+		err_clear();
+		probe = interp_step_normal(current);
+		if (probe == NULL) {
+			if (err_has()) {
+				value_free(current);
+				return NULL;
+			}
+		} else {
+			hit_limit = true;
+			value_free(probe);
+		}
+	}
+
+	if (reached_limit != NULL) {
+		*reached_limit = hit_limit ? 1 : 0;
+	}
+
+	if (steps_taken != NULL) {
+		*steps_taken = steps;
+	}
+
+	return current;
+}
