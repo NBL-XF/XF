@@ -1,7 +1,19 @@
+# Makefile
+
 .DEFAULT_GOAL := all
 
-CC = /opt/homebrew/opt/llvm/bin/clang
-AR = /opt/homebrew/opt/llvm/bin/llvm-ar
+UNAME_S := $(shell uname -s)
+
+LLVM_PREFIX ?= /opt/homebrew/opt/llvm/bin
+CC ?= $(LLVM_PREFIX)/clang
+
+ifeq ($(UNAME_S),Darwin)
+	AR := /usr/bin/ar
+	RANLIB := /usr/bin/ranlib
+else
+	AR ?= $(LLVM_PREFIX)/llvm-ar
+	RANLIB ?= ranlib
+endif
 
 WARNFLAGS    = -Wall -Wextra -Wpedantic -std=c11
 DEBUGFLAGS   = -O0 -g -fsanitize=address,leak,undefined -fno-omit-frame-pointer
@@ -40,6 +52,10 @@ LS_INC    ?= -I$(LS_ROOT)/include
 LS_OBJDIR ?= $(OBJDIR)/lambdaScript
 LS_LIB    ?= $(LS_OBJDIR)/libls.a
 
+BYTE_ROOT ?= $(VENDOR_DIR)/byteLang
+BYTE_INC  ?= -I$(BYTE_ROOT)
+BYTE_LIB  ?= $(BYTE_ROOT)/build/bin/libbl.a
+
 CORE_SRCS = \
 	src/core.c \
 	src/core/helpers.c \
@@ -53,7 +69,8 @@ CORE_SRCS = \
 	src/core/edit.c \
 	src/core/process.c \
 	src/core/img.c \
-	src/core/lambda.c
+	src/core/lambda.c \
+	src/core/byte.c
 
 RUNTIME_SRCS = \
 	src/ast.c \
@@ -94,7 +111,7 @@ $(patsubst %.c,$(OBJDIR)/%.o,$(CORE_SRCS)): src/core/internal.h
 
 run: $(BIN)
 ifeq ($(MODE),debug)
-	ASAN_SYMBOLIZER_PATH=/opt/homebrew/opt/llvm/bin/llvm-symbolizer \
+	ASAN_SYMBOLIZER_PATH=$(LLVM_PREFIX)/llvm-symbolizer \
 	ASAN_OPTIONS=symbolize=1:detect_leaks=1:halt_on_error=1:abort_on_error=1 \
 	LSAN_OPTIONS=verbosity=1:report_objects=1 \
 	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
@@ -106,14 +123,19 @@ endif
 $(LIBXF): $(RUNTIME_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
+	$(RANLIB) $@
 
-$(BIN): $(CLI_OBJS) $(LIBXF) $(LS_LIB)
+$(BIN): $(CLI_OBJS) $(LIBXF) $(LS_LIB) $(BYTE_LIB)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -o $@ $(CLI_OBJS) $(LIBXF) $(LS_LIB) $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $(CLI_OBJS) $(LIBXF) $(LS_LIB) $(BYTE_LIB) $(LDFLAGS) $(LDLIBS)
+
+$(BYTE_LIB):
+	$(MAKE) -C $(BYTE_ROOT)
 
 $(LS_LIB): $(LS_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
+	$(RANLIB) $@
 
 $(LS_OBJDIR)/%.o: $(LS_ROOT)/src/%.c
 	@mkdir -p $(dir $@)
@@ -121,15 +143,15 @@ $(LS_OBJDIR)/%.o: $(LS_ROOT)/src/%.c
 
 $(OBJDIR)/src/%.o: src/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LS_INC) -c $< -o $@
+	$(CC) $(CFLAGS) $(LS_INC) $(BYTE_INC) -c $< -o $@
 
 $(OBJDIR)/src/core/%.o: src/core/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LS_INC) -c $< -o $@
+	$(CC) $(CFLAGS) $(LS_INC) $(BYTE_INC) -c $< -o $@
 
 $(OBJDIR)/lib/%.o: lib/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LS_INC) -c $< -o $@
+	$(CC) $(CFLAGS) $(LS_INC) $(BYTE_INC) -c $< -o $@
 
 install: $(LIBXF) $(BIN)
 	install -d $(DESTDIR)$(PREFIX)/bin
@@ -149,7 +171,8 @@ uninstall:
 clean:
 	rm -rf obj/* bin/*
 	rm -rf lib/debug lib/release lib/thread
+	-$(MAKE) -C $(BYTE_ROOT) clean
 
-export ASAN_SYMBOLIZER_PATH=/opt/homebrew/opt/llvm/bin/llvm-symbolizer
+export ASAN_SYMBOLIZER_PATH=$(LLVM_PREFIX)/llvm-symbolizer
 
 .PHONY: all run install uninstall clean
