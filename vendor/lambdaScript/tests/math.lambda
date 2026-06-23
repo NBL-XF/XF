@@ -1,0 +1,24 @@
+; manual symbolic math forms for LambdaScript
+; these are hand-rolled encodings, not native syntax/features
+
+; build a readable symbolic list:
+CONS = \h t.cons h t
+NIL = nil
+LIST3 = \a b c.CONS a (CONS b (CONS c NIL))
+
+; manual symbolic constructors:
+SIGMA = \lo hi body.sigma lo hi body
+INTEGRAL = \lo hi body.integral lo hi body
+LIMIT = \at body.limit at body
+
+; examples:
+; Σ i = 0 to N . i*i
+SIGMA_EX = SIGMA ZERO N (\i.mul i i)
+
+; ∫ from 0 to 1 of x*x dx
+INTEGRAL_EX = INTEGRAL ZERO ONE (\x.mul x x)
+
+; lim x -> 0 of sin(x)/x
+LIMIT_EX = LIMIT ZERO (\x.div (sin x) x)
+
+LIST3 SIGMA_EX INTEGRAL_EX LIMIT_EX

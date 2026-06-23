@@ -1,0 +1,8 @@
+A = Σ i = 0 to 3 . i + 1
+B = Integral x = 0 to 1 . x ** 2
+C = lim x -> 0 . sin x / x
+D = a ∈ SET
+E = SET ∋ a
+F = a in SET
+G = SET contains a
+cons A (cons B (cons C (cons D (cons E (cons F (cons G nil))))))

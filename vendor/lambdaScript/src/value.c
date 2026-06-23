@@ -3,6 +3,7 @@
 #include "../include/err.h"
 #include "../include/symTable.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,6 +81,26 @@ static int sb_appendf(StrBuf *buf, const char *fmt, int n) {
 	char tmp[64];
 	int written = snprintf(tmp, sizeof(tmp), fmt, n);
 
+	if (written < 0) {
+		return 0;
+	}
+
+	return sb_append_n(buf, tmp, (size_t)written);
+}
+
+static int sb_append_double(StrBuf *buf, double value) {
+	char tmp[128];
+	int written;
+
+	if (isinf(value)) {
+		return sb_append(buf, value < 0.0 ? "-∞" : "∞");
+	}
+
+	if (isnan(value)) {
+		return sb_append(buf, "nan");
+	}
+
+	written = snprintf(tmp, sizeof(tmp), "%.15g", value);
 	if (written < 0) {
 		return 0;
 	}
@@ -176,74 +197,13 @@ static int def_values_add(DefValue **defs, const char *name, Value *value) {
 	return 1;
 }
 
-static int program_has_def_name(const Program *program, const char *name) {
-	const AstDef *def;
-
-	for (def = program->defs; def != NULL; def = def->next) {
-		if (strcmp(def->name, name) == 0) {
-			return 1;
-		}
-	}
-
-	return 0;
-}
-
-static const char *find_unresolved_def_ref(const Value *value, const Program *program) {
-	const char *name;
-
-	if (value == NULL) {
-		return NULL;
-	}
-
-	switch (value->kind) {
-	case VALUE_BOUND_VAR:
-		return NULL;
-
-	case VALUE_FREE_VAR:
-		return program_has_def_name(program, value->as.free_var.name) ? value->as.free_var.name : NULL;
-
-	case VALUE_LAM:
-		return find_unresolved_def_ref(value->as.lam.body, program);
-
-	case VALUE_APP:
-		name = find_unresolved_def_ref(value->as.app.fn, program);
-		if (name != NULL) {
-			return name;
-		}
-		return find_unresolved_def_ref(value->as.app.arg, program);
-	}
-
-	return NULL;
-}
-
 static char *name_for_depth(size_t depth) {
-	char reversed[64];
-	size_t length = 0;
-	size_t value = depth;
-	char *name;
-	size_t i;
-
-	do {
-		if (length + 1 >= sizeof(reversed)) {
-			return NULL;
-		}
-		reversed[length++] = (char)('a' + (value % 26));
-		if (value < 26) {
-			break;
-		}
-		value = (value / 26) - 1;
-	} while (1);
-
-	name = (char *)malloc(length + 1);
-	if (name == NULL) {
+	char tmp[64];
+	int written = snprintf(tmp, sizeof(tmp), "x%zu", depth);
+	if (written < 0 || (size_t)written >= sizeof(tmp)) {
 		return NULL;
 	}
-
-	for (i = 0; i < length; i++) {
-		name[i] = reversed[length - 1 - i];
-	}
-	name[length] = '\0';
-	return name;
+	return value_strdup(tmp);
 }
 
 Value *value_bound_var_new(size_t index) {
@@ -308,11 +268,21 @@ Value *value_app_new(Value *fn, Value *arg) {
 	return value;
 }
 
+Value *value_number_new(double number) {
+	Value *value = (Value *)calloc(1, sizeof(*value));
+	if (value == NULL) {
+		return NULL;
+	}
+
+	value->kind = VALUE_NUMBER;
+	value->as.number.value = number;
+	return value;
+}
+
 Value *value_clone(const Value *value) {
 	Value *body;
 	Value *fn;
 	Value *arg;
-	Value *app;
 
 	if (value == NULL) {
 		return NULL;
@@ -344,13 +314,10 @@ Value *value_clone(const Value *value) {
 			return NULL;
 		}
 
-		app = value_app_new(fn, arg);
-		if (app == NULL) {
-			value_free(fn);
-			value_free(arg);
-			return NULL;
-		}
-		return app;
+		return value_app_new(fn, arg);
+
+	case VALUE_NUMBER:
+		return value_number_new(value->as.number.value);
 	}
 
 	err_set("unknown value node");
@@ -364,6 +331,7 @@ void value_free(Value *value) {
 
 	switch (value->kind) {
 	case VALUE_BOUND_VAR:
+	case VALUE_NUMBER:
 		break;
 	case VALUE_FREE_VAR:
 		free(value->as.free_var.name);
@@ -380,13 +348,53 @@ void value_free(Value *value) {
 	free(value);
 }
 
+static int program_has_def_name(const Program *program, const char *name) {
+	const AstDef *def;
+
+	for (def = program->defs; def != NULL; def = def->next) {
+		if (strcmp(def->name, name) == 0) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static const char *find_unresolved_def_ref(const Value *value, const Program *program) {
+	const char *name;
+
+	if (value == NULL) {
+		return NULL;
+	}
+
+	switch (value->kind) {
+	case VALUE_BOUND_VAR:
+	case VALUE_NUMBER:
+		return NULL;
+
+	case VALUE_FREE_VAR:
+		return program_has_def_name(program, value->as.free_var.name) ? value->as.free_var.name : NULL;
+
+	case VALUE_LAM:
+		return find_unresolved_def_ref(value->as.lam.body, program);
+
+	case VALUE_APP:
+		name = find_unresolved_def_ref(value->as.app.fn, program);
+		if (name != NULL) {
+			return name;
+		}
+		return find_unresolved_def_ref(value->as.app.arg, program);
+	}
+
+	return NULL;
+}
+
 static Value *lower_ast_with_defs(const Ast *ast, SymTable *env, const DefValue *defs) {
 	size_t index;
 	Value *resolved;
 	Value *body;
 	Value *fn;
 	Value *arg;
-	Value *app;
 
 	switch (ast->kind) {
 	case AST_VAR:
@@ -428,14 +436,10 @@ static Value *lower_ast_with_defs(const Ast *ast, SymTable *env, const DefValue 
 			return NULL;
 		}
 
-		app = value_app_new(fn, arg);
-		if (app == NULL) {
-			value_free(fn);
-			value_free(arg);
-			err_set("out of memory");
-			return NULL;
-		}
-		return app;
+		return value_app_new(fn, arg);
+
+	case AST_NUMBER:
+		return value_number_new(ast->as.number.value);
 	}
 
 	err_set("unknown AST node");
@@ -458,61 +462,10 @@ Value *value_from_ast(const Ast *ast) {
 	return result;
 }
 
-/* value.c */
-
-static int program_has_definition_named(const Program *program, const char *name) {
-	AstDef *def;
-
-	if (program == NULL || name == NULL) {
-		return 0;
-	}
-
-	for (def = program->defs; def != NULL; def = def->next) {
-		if (strcmp(def->name, name) == 0) {
-			return 1;
-		}
-	}
-
-	return 0;
-}
-
-static const char *find_unresolved_definition_reference(const Value *value, const Program *program) {
-	const char *name;
-
-	if (value == NULL) {
-		return NULL;
-	}
-
-	switch (value->kind) {
-	case VALUE_BOUND_VAR:
-		return NULL;
-
-	case VALUE_FREE_VAR:
-		if (program_has_definition_named(program, value->as.free_var.name)) {
-			return value->as.free_var.name;
-		}
-		return NULL;
-
-	case VALUE_LAM:
-		return find_unresolved_definition_reference(value->as.lam.body, program);
-
-	case VALUE_APP:
-		name = find_unresolved_definition_reference(value->as.app.fn, program);
-		if (name != NULL) {
-			return name;
-		}
-		return find_unresolved_definition_reference(value->as.app.arg, program);
-	}
-
-	return NULL;
-}
-
-/* value.c */
-
 Value *value_from_program(const Program *program) {
 	SymTable env;
 	DefValue *defs = NULL;
-	AstDef *def;
+	const AstDef *def;
 	Value *result = NULL;
 	const char *unresolved_name = NULL;
 
@@ -542,12 +495,11 @@ Value *value_from_program(const Program *program) {
 		goto done;
 	}
 
-	unresolved_name = find_unresolved_definition_reference(result, program);
+	unresolved_name = find_unresolved_def_ref(result, program);
 	if (unresolved_name != NULL) {
 		err_set("unresolved forward or mutual definition reference '%s'", unresolved_name);
 		value_free(result);
 		result = NULL;
-		goto done;
 	}
 
 done:
@@ -557,15 +509,8 @@ done:
 	if (result == NULL && !err_has()) {
 		err_set("failed to lower program");
 	}
+
 	return result;
-}
-static char *render_name_for_depth(size_t depth) {
-	char tmp[64];
-	int written = snprintf(tmp, sizeof(tmp), "x%zu", depth);
-	if (written < 0 || (size_t)written >= sizeof(tmp)) {
-		return NULL;
-	}
-	return value_strdup(tmp);
 }
 
 static int render_value(StrBuf *buf, NameStack *env, const Value *value, int parent_prec) {
@@ -584,6 +529,9 @@ static int render_value(StrBuf *buf, NameStack *env, const Value *value, int par
 	case VALUE_FREE_VAR:
 		return sb_append(buf, value->as.free_var.name);
 
+	case VALUE_NUMBER:
+		return sb_append_double(buf, value->as.number.value);
+
 	case VALUE_LAM: {
 		const Value *current = value;
 		size_t pushed = 0;
@@ -598,7 +546,7 @@ static int render_value(StrBuf *buf, NameStack *env, const Value *value, int par
 		}
 
 		while (current->kind == VALUE_LAM) {
-			char *name = render_name_for_depth(env->count);
+			char *name = name_for_depth(env->count);
 
 			if (name == NULL) {
 				while (pushed > 0) {

@@ -38,6 +38,9 @@ static void usage(const char *argv0) {
 	fprintf(stderr, "  final non-definition line is the program expression\n");
 	fprintf(stderr, "  script args are exposed as ARG1, ARG2, ..., ARGC, and ARGS\n");
 	fprintf(stderr, "  logic aliases: ~ or ⌐ or ¬, -> or →, <-> or <=> or ↔ or ≣\n");
+	fprintf(stderr, "  math aliases: sqrt or √, ln or ㏑, inf or infinity or ∞, euler or ℯ\n");
+	fprintf(stderr, "  symbolic forms: Sigma/Σ x = a to b . expr, Integral/∫ x = a to b . expr\n");
+	fprintf(stderr, "                  lim x -> a . expr, x ∈ S, S ∋ x, contains, in\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "examples:\n");
 	fprintf(stderr, "  %s -e 'I z'\n", argv0);

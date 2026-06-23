@@ -1,60 +1,34 @@
-; npdf_complete_impl.ls
-; Complete LambdaScript implementation of normalized propagation and target-state update.
+; validation.lambda
+; Symbolic validation version of normalized propagation and target-state update.
 ;
-; This is intentionally algebra-parametric. LambdaScript currently has no native
-; numeric tower, no real-valued exp, no numeric integral, and no graph iterator.
-; So the model is complete at the LambdaScript layer and delegates math/runtime
-; behavior to an algebra record. A symbolic algebra is provided at the bottom.
+; This version uses LambdaScript's newer math surface forms where they help:
+;   - numeric literals: 0, 1
+;   - integral binder: ∫ t = 0 to T . expr
 ;
-; Run:
-;   ./lambdascript -q npdf_complete_impl.ls
-;
-; Expected: a symbolic expression rooted in Phi.
-;
-; To make it numeric later, replace SYMBOLIC_ALG with a native/runtime algebra
-; whose add, sub, mul, div, exp, integral, and sum_neighbors names are bound by
-; the host implementation.
+; It remains intentionally symbolic. The names add, sub, mul, div, exp, neg,
+; integral, sum_neighbors, and Phi are left as free symbols so the reduced
+; result stays readable and host/runtime backends can still interpret it later.
 
-ALG = \add sub mul div exp neg integral sum phi f.f add sub mul div exp neg integral sum phi
-AADD = \alg.alg (\add sub mul div exp neg integral sum phi.add)
-ASUB = \alg.alg (\add sub mul div exp neg integral sum phi.sub)
-AMUL = \alg.alg (\add sub mul div exp neg integral sum phi.mul)
-ADIV = \alg.alg (\add sub mul div exp neg integral sum phi.div)
-AEXP = \alg.alg (\add sub mul div exp neg integral sum phi.exp)
-ANEG = \alg.alg (\add sub mul div exp neg integral sum phi.neg)
-AINTEGRAL = \alg.alg (\add sub mul div exp neg integral sum phi.integral)
-ASUM_NEIGHBORS = \alg.alg (\add sub mul div exp neg integral sum phi.sum)
-APHI = \alg.alg (\add sub mul div exp neg integral sum phi.phi)
+ONE_MINUS = \x.sub 1 x
 
-ADD = \alg x y.(AADD alg) x y
-SUB = \alg x y.(ASUB alg) x y
-MUL = \alg x y.(AMUL alg) x y
-DIV = \alg x y.(ADIV alg) x y
-EXP = \alg x.(AEXP alg) x
-NEG = \alg x.(ANEG alg) x
-INTEGRAL = \alg lo hi body.(AINTEGRAL alg) lo hi body
-SUM_NEIGHBORS = \alg beta body.(ASUM_NEIGHBORS alg) beta body
-PHI = \alg beta S A I K V.(APHI alg) beta S A I K V
+G = \alpha beta.mul (mul (mul (V_EDGE alpha beta) (C_EDGE alpha beta)) (A_EDGE alpha beta)) (U_EDGE alpha beta)
+DECAY = \alpha.exp (neg (mul (LAMBDA_RATE alpha) (ONE_MINUS (TAU_STAR alpha))))
+FAST_MEMORY = \alpha beta.mul (mul (H_MEM alpha) (RHO alpha beta)) (DECAY alpha)
+SLOW_DIFFUSION = \alpha beta.mul (mul (L_MEM alpha) (KAPPA alpha beta)) (ONE_MINUS (DECAY alpha))
+DIFFUSED_MEMORY = \alpha beta.add (FAST_MEMORY alpha beta) (SLOW_DIFFUSION alpha beta)
+PROPAGATION_KERNEL = \alpha beta.mul (G alpha beta) (DIFFUSED_MEMORY alpha beta)
 
-ONE_MINUS = \alg x.SUB alg ONE x
-
-G = \alg alpha beta.MUL alg (MUL alg (MUL alg (V_EDGE alpha beta) (C_EDGE alpha beta)) (A_EDGE alpha beta)) (U_EDGE alpha beta)
-DECAY = \alg alpha.EXP alg (NEG alg (MUL alg (LAMBDA_RATE alpha) (ONE_MINUS alg (TAU_STAR alpha))))
-FAST_MEMORY = \alg alpha beta.MUL alg (MUL alg (H_MEM alpha) (RHO alpha beta)) (DECAY alg alpha)
-SLOW_DIFFUSION = \alg alpha beta.MUL alg (MUL alg (L_MEM alpha) (KAPPA alpha beta)) (ONE_MINUS alg (DECAY alg alpha))
-DIFFUSED_MEMORY = \alg alpha beta.ADD alg (FAST_MEMORY alg alpha beta) (SLOW_DIFFUSION alg alpha beta)
-PROPAGATION_KERNEL = \alg alpha beta.MUL alg (G alg alpha beta) (DIFFUSED_MEMORY alg alpha beta)
 ACTIVATION_DERIVATIVE = \alpha r t.D_SIGMA alpha r t
-NUMERATOR_TERM = \alg alpha beta r t.MUL alg (PROPAGATION_KERNEL alg alpha beta) (ACTIVATION_DERIVATIVE alpha r t)
-NUMERATOR_INTEGRAND = \alg beta r t.SUM_NEIGHBORS alg beta (\alpha.NUMERATOR_TERM alg alpha beta r t)
-NUMERATOR = \alg beta r T.INTEGRAL alg ZERO T (\t.NUMERATOR_INTEGRAND alg beta r t)
-NORMALIZATION_COMPONENT = \alg alpha beta.ADD alg (MUL alg (H_MEM alpha) (RHO alpha beta)) (MUL alg (L_MEM alpha) (KAPPA alpha beta))
-NORMALIZATION_TERM = \alg alpha beta.MUL alg (G alg alpha beta) (NORMALIZATION_COMPONENT alg alpha beta)
-DENOMINATOR_INTEGRAND = \alg beta t.SUM_NEIGHBORS alg beta (\alpha.NORMALIZATION_TERM alg alpha beta)
-DENOMINATOR = \alg beta T epsilon.ADD alg epsilon (INTEGRAL alg ZERO T (\t.DENOMINATOR_INTEGRAND alg beta t))
-I_HAT_BETA_NEXT = \alg beta r T epsilon.DIV alg (NUMERATOR alg beta r T) (DENOMINATOR alg beta T epsilon)
-TARGET_STATE_NEXT = \alg beta r T epsilon.PHI alg beta (S_STATE beta r) (A_STATE beta r) (I_HAT_BETA_NEXT alg beta r T epsilon) (K_CONTEXT beta) (V_CONTEXT beta)
+NUMERATOR_TERM = \alpha beta r t.mul (PROPAGATION_KERNEL alpha beta) (ACTIVATION_DERIVATIVE alpha r t)
+NUMERATOR_INTEGRAND = \beta r t.sum_neighbors beta (\alpha.NUMERATOR_TERM alpha beta r t)
+NUMERATOR = \beta r T.∫ t = 0 to T . NUMERATOR_INTEGRAND beta r t
 
-SYMBOLIC_ALG = ALG add sub mul div exp neg integral sum_neighbors Phi
+NORMALIZATION_COMPONENT = \alpha beta.add (mul (H_MEM alpha) (RHO alpha beta)) (mul (L_MEM alpha) (KAPPA alpha beta))
+NORMALIZATION_TERM = \alpha beta.mul (G alpha beta) (NORMALIZATION_COMPONENT alpha beta)
+DENOMINATOR_INTEGRAND = \beta t.sum_neighbors beta (\alpha.NORMALIZATION_TERM alpha beta)
+DENOMINATOR = \beta T epsilon.add epsilon (∫ t = 0 to T . DENOMINATOR_INTEGRAND beta t)
 
-TARGET_STATE_NEXT SYMBOLIC_ALG BETA R T EPSILON
+I_HAT_BETA_NEXT = \beta r T epsilon.div (NUMERATOR beta r T) (DENOMINATOR beta T epsilon)
+TARGET_STATE_NEXT = \beta r T epsilon.Phi beta (S_STATE beta r) (A_STATE beta r) (I_HAT_BETA_NEXT beta r T epsilon) (K_CONTEXT beta) (V_CONTEXT beta)
+
+TARGET_STATE_NEXT BETA R T EPSILON

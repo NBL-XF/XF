@@ -317,9 +317,26 @@ if (!buf_append(buf,
 	return buf_append(buf, "\n\n");
 }
 
-static char *merge_source_with_builtins(const char *source, const ls_Options *options) {
+static size_t count_newlines_n(const char *text, size_t length) {
+	size_t i;
+	size_t count = 0;
+
+	for (i = 0; i < length; i++) {
+		if (text[i] == '\n') {
+			count++;
+		}
+	}
+
+	return count;
+}
+
+static char *merge_source_with_builtins(const char *source, const ls_Options *options, size_t *injected_lines) {
 	LsBuf buf = {0};
 	int use_prelude = options == NULL || options->use_prelude;
+
+	if (injected_lines != NULL) {
+		*injected_lines = 0;
+	}
 
 	if (use_prelude && !buf_append(&buf, LS_PRELUDE)) {
 		free(buf.data);
@@ -329,6 +346,10 @@ static char *merge_source_with_builtins(const char *source, const ls_Options *op
 	if (!buf_append_arg_builtins(&buf, options)) {
 		free(buf.data);
 		return NULL;
+	}
+
+	if (injected_lines != NULL) {
+		*injected_lines = count_newlines_n(buf.data, buf.length);
 	}
 
 	if (!buf_append(&buf, source)) {
@@ -341,6 +362,21 @@ static char *merge_source_with_builtins(const char *source, const ls_Options *op
 	}
 
 	return buf.data;
+}
+
+static void rebase_parse_error_lines(size_t injected_lines) {
+	const char *msg;
+	size_t line_no;
+	char detail[512];
+
+	if (injected_lines == 0) {
+		return;
+	}
+
+	msg = err_get();
+	if (sscanf(msg, "line %zu: %511[^\n]", &line_no, detail) == 2 && line_no > injected_lines) {
+		err_set("line %zu: %s", line_no - injected_lines, detail);
+	}
 }
 
 static Value *reduce_with_trace(const Value *term, size_t max_steps, size_t *steps_taken, int *reached_limit, char **trace_out) {
@@ -480,6 +516,7 @@ void ls_result_free(ls_Result *result) {
 int ls_eval_string(ls_State *L, const char *source, const ls_Options *options, ls_Result *result) {
 	ls_Options local_options;
 	ls_Options effective_options;
+	size_t injected_lines = 0;
 	char *merged = NULL;
 	Program *program = NULL;
 	Value *term = NULL;
@@ -507,7 +544,7 @@ int ls_eval_string(ls_State *L, const char *source, const ls_Options *options, l
 
 	ls_result_free(result);
 
-	merged = merge_source_with_builtins(source, options);
+	merged = merge_source_with_builtins(source, options, &injected_lines);
 	if (merged == NULL) {
 		err_set("out of memory");
 		goto fail;
@@ -515,6 +552,7 @@ int ls_eval_string(ls_State *L, const char *source, const ls_Options *options, l
 
 	program = parser_parse_program(merged);
 	if (program == NULL) {
+		rebase_parse_error_lines(injected_lines);
 		goto fail;
 	}
 

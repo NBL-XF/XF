@@ -9,7 +9,8 @@ typedef enum {
 	VALUE_BOUND_VAR,
 	VALUE_FREE_VAR,
 	VALUE_LAM,
-	VALUE_APP
+	VALUE_APP,
+	VALUE_NUMBER
 } ValueKind;
 
 typedef struct Value Value;
@@ -30,6 +31,9 @@ struct Value {
 			Value *fn;
 			Value *arg;
 		} app;
+		struct {
+			double value;
+		} number;
 	} as;
 };
 
@@ -37,6 +41,7 @@ Value *value_bound_var_new(size_t index);
 Value *value_free_var_new(const char *name);
 Value *value_lam_new(Value *body);
 Value *value_app_new(Value *fn, Value *arg);
+Value *value_number_new(double value);
 Value *value_clone(const Value *value);
 void value_free(Value *value);
 

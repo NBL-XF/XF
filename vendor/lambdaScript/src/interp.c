@@ -3,15 +3,16 @@
 #include "../include/err.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 
 static Value *shift_walk(const Value *term, int delta, size_t cutoff) {
 	long long shifted;
 	Value *body;
 	Value *fn;
 	Value *arg;
-	Value *app;
 
 	switch (term->kind) {
 	case VALUE_BOUND_VAR:
@@ -47,14 +48,10 @@ static Value *shift_walk(const Value *term, int delta, size_t cutoff) {
 			return NULL;
 		}
 
-		app = value_app_new(fn, arg);
-		if (app == NULL) {
-			value_free(fn);
-			value_free(arg);
-			err_set("out of memory");
-			return NULL;
-		}
-		return app;
+		return value_app_new(fn, arg);
+
+	case VALUE_NUMBER:
+		return value_number_new(term->as.number.value);
 	}
 
 	err_set("unknown value node");
@@ -69,7 +66,6 @@ static Value *subst_walk(const Value *term, size_t depth, size_t target, const V
 	Value *body;
 	Value *fn;
 	Value *arg;
-	Value *app;
 
 	switch (term->kind) {
 	case VALUE_BOUND_VAR:
@@ -100,14 +96,10 @@ static Value *subst_walk(const Value *term, size_t depth, size_t target, const V
 			return NULL;
 		}
 
-		app = value_app_new(fn, arg);
-		if (app == NULL) {
-			value_free(fn);
-			value_free(arg);
-			err_set("out of memory");
-			return NULL;
-		}
-		return app;
+		return value_app_new(fn, arg);
+
+	case VALUE_NUMBER:
+		return value_number_new(term->as.number.value);
 	}
 
 	err_set("unknown value node");
@@ -139,16 +131,87 @@ static Value *beta_reduce(const Value *body, const Value *arg) {
 	return result;
 }
 
+static Value *apply_binary_primitive(const char *name, double left, double right) {
+	if (strcmp(name, "ADD") == 0) {
+		return value_number_new(left + right);
+	}
+	if (strcmp(name, "SUB") == 0) {
+		return value_number_new(left - right);
+	}
+	if (strcmp(name, "MUL") == 0) {
+		return value_number_new(left * right);
+	}
+	if (strcmp(name, "DIV") == 0) {
+		return value_number_new(left / right);
+	}
+	if (strcmp(name, "MOD") == 0) {
+		return value_number_new(fmod(left, right));
+	}
+	if (strcmp(name, "POW") == 0) {
+		return value_number_new(pow(left, right));
+	}
+	return NULL;
+}
+
+static Value *apply_unary_primitive(const char *name, double value) {
+	if (strcmp(name, "NEG") == 0) {
+		return value_number_new(-value);
+	}
+	if (strcmp(name, "SQRT") == 0) {
+		return value_number_new(sqrt(value));
+	}
+	if (strcmp(name, "LN") == 0) {
+		return value_number_new(log(value));
+	}
+	return NULL;
+}
+
+static Value *try_reduce_primitive(const Value *term) {
+	const Value *head;
+	const Value *left;
+	const Value *right;
+
+	if (term->kind != VALUE_APP) {
+		return NULL;
+	}
+
+	head = term->as.app.fn;
+	right = term->as.app.arg;
+
+	if (head->kind == VALUE_APP &&
+	    head->as.app.fn->kind == VALUE_FREE_VAR &&
+	    head->as.app.arg->kind == VALUE_NUMBER &&
+	    right->kind == VALUE_NUMBER) {
+		return apply_binary_primitive(
+			head->as.app.fn->as.free_var.name,
+			head->as.app.arg->as.number.value,
+			right->as.number.value
+		);
+	}
+
+	if (head->kind == VALUE_FREE_VAR && right->kind == VALUE_NUMBER) {
+		return apply_unary_primitive(head->as.free_var.name, right->as.number.value);
+	}
+
+	left = head;
+	if (left->kind == VALUE_FREE_VAR && strcmp(left->as.free_var.name, "INF") == 0) {
+		return value_number_new(INFINITY);
+	}
+
+	return NULL;
+}
+
 Value *interp_step_normal(const Value *term) {
+	Value *primitive_step;
 	Value *body_step;
 	Value *fn_step;
 	Value *arg_step;
 	Value *fn_clone;
-	Value *app;
 
 	switch (term->kind) {
 	case VALUE_BOUND_VAR:
 	case VALUE_FREE_VAR:
+	case VALUE_NUMBER:
 		return NULL;
 
 	case VALUE_LAM:
@@ -163,10 +226,15 @@ Value *interp_step_normal(const Value *term) {
 			return beta_reduce(term->as.app.fn->as.lam.body, term->as.app.arg);
 		}
 
+		primitive_step = try_reduce_primitive(term);
+		if (primitive_step != NULL) {
+			return primitive_step;
+		}
+
 		err_clear();
 		fn_step = interp_step_normal(term->as.app.fn);
 		if (fn_step != NULL) {
-			app = value_app_new(fn_step, value_clone(term->as.app.arg));
+			Value *app = value_app_new(fn_step, value_clone(term->as.app.arg));
 			if (app == NULL) {
 				value_free(fn_step);
 				err_set("out of memory");
@@ -181,6 +249,7 @@ Value *interp_step_normal(const Value *term) {
 		err_clear();
 		arg_step = interp_step_normal(term->as.app.arg);
 		if (arg_step != NULL) {
+			Value *app;
 			fn_clone = value_clone(term->as.app.fn);
 			if (fn_clone == NULL) {
 				value_free(arg_step);
@@ -262,7 +331,6 @@ Value *interp_reduce_normal(const Value *term, size_t max_steps, size_t *steps_t
 	if (reached_limit != NULL) {
 		*reached_limit = hit_limit ? 1 : 0;
 	}
-
 	if (steps_taken != NULL) {
 		*steps_taken = steps;
 	}
