@@ -37,6 +37,13 @@ static int is_utf8_not(const char *src, size_t pos, size_t len) {
 	       (unsigned char)src[pos + 1] == 0xAC;
 }
 
+static int is_utf8_not_alt(const char *src, size_t pos, size_t len) {
+	return pos + 2 < len &&
+	       (unsigned char)src[pos] == 0xE2 &&
+	       (unsigned char)src[pos + 1] == 0x8C &&
+	       (unsigned char)src[pos + 2] == 0x90;
+}
+
 static int is_utf8_implies(const char *src, size_t pos, size_t len) {
 	return pos + 2 < len &&
 	       (unsigned char)src[pos] == 0xE2 &&
@@ -49,6 +56,13 @@ static int is_utf8_iff(const char *src, size_t pos, size_t len) {
 	       (unsigned char)src[pos] == 0xE2 &&
 	       (unsigned char)src[pos + 1] == 0x86 &&
 	       (unsigned char)src[pos + 2] == 0x94;
+}
+
+static int is_utf8_equiv(const char *src, size_t pos, size_t len) {
+	return pos + 2 < len &&
+	       (unsigned char)src[pos] == 0xE2 &&
+	       (unsigned char)src[pos + 1] == 0x89 &&
+	       (unsigned char)src[pos + 2] == 0xA3;
 }
 
 void lexer_init(Lexer *lexer, const char *src) {
@@ -114,6 +128,16 @@ void lexer_next(Lexer *lexer) {
 		return;
 	}
 
+	if (lexer->pos + 2 < lexer->len &&
+	    src[lexer->pos] == '<' &&
+	    src[lexer->pos + 1] == '=' &&
+	    src[lexer->pos + 2] == '>') {
+		lexer->current.kind = TOK_IFF;
+		lexer->current.length = 3;
+		lexer->pos += 3;
+		return;
+	}
+
 	if (lexer->pos + 1 < lexer->len &&
 	    src[lexer->pos] == '-' &&
 	    src[lexer->pos + 1] == '>') {
@@ -144,6 +168,13 @@ void lexer_next(Lexer *lexer) {
 		return;
 	}
 
+	if (is_utf8_not_alt(src, lexer->pos, lexer->len)) {
+		lexer->current.kind = TOK_NOT;
+		lexer->current.length = 3;
+		lexer->pos += 3;
+		return;
+	}
+
 	if (is_utf8_implies(src, lexer->pos, lexer->len)) {
 		lexer->current.kind = TOK_IMPLIES;
 		lexer->current.length = 3;
@@ -152,6 +183,13 @@ void lexer_next(Lexer *lexer) {
 	}
 
 	if (is_utf8_iff(src, lexer->pos, lexer->len)) {
+		lexer->current.kind = TOK_IFF;
+		lexer->current.length = 3;
+		lexer->pos += 3;
+		return;
+	}
+
+	if (is_utf8_equiv(src, lexer->pos, lexer->len)) {
 		lexer->current.kind = TOK_IFF;
 		lexer->current.length = 3;
 		lexer->pos += 3;

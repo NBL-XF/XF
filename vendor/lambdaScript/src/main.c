@@ -37,6 +37,7 @@ static void usage(const char *argv0) {
 	fprintf(stderr, "  one definition per line: NAME = EXPR\n");
 	fprintf(stderr, "  final non-definition line is the program expression\n");
 	fprintf(stderr, "  script args are exposed as ARG1, ARG2, ..., ARGC, and ARGS\n");
+	fprintf(stderr, "  logic aliases: ~ or ⌐ or ¬, -> or →, <-> or <=> or ↔ or ≣\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "examples:\n");
 	fprintf(stderr, "  %s -e 'I z'\n", argv0);
