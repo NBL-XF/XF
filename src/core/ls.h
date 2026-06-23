@@ -10,6 +10,24 @@ typedef struct {
 	int trace;
 	int quiet;
 	int use_prelude;
+
+	/*
+	 * Script arguments exposed to LambdaScript as builtins:
+	 *
+	 *   ARG0  = source_name, or <eval>/<stdin> when appropriate
+	 *   ARG1  = first script argument
+	 *   ARG2  = second script argument
+	 *   ...
+	 *   ARGC  = Church numeral count of script arguments, excluding ARG0
+	 *   ARGS  = Church list of ARG1..ARGN
+	 *
+	 * Because LambdaScript does not have string literals yet, each argument is
+	 * currently injected as a symbolic free variable. Valid identifiers are used
+	 * directly. Other strings are encoded as ARGVAL_<hex-bytes>.
+	 */
+	const char *source_name;
+	size_t argc;
+	const char *const *argv;
 } ls_Options;
 
 typedef struct {

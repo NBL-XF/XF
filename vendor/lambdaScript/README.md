@@ -101,7 +101,7 @@ Build with your project Makefile, then run the binary.
 Typical local run:
 
 ```sh
-./lambdascript -q -e 'I z'
+./lambdaScript -q -e 'I z'
 ```
 
 Expected:
@@ -113,7 +113,7 @@ z
 Run a file:
 
 ```sh
-./lambdascript -q tests/ops.ls
+./lambdaScript -q tests/ops.ls
 ```
 
 Expected:
@@ -127,7 +127,7 @@ True
 ## CLI Usage
 
 ```text
-./lambdascript [-q] [-t] [-n STEPS] [-e EXPR] [FILE]
+./lambdaScript [-q] [-t] [-n STEPS] [-e EXPR] [FILE] [-- ARGS...]
 ```
 
 Options:
@@ -137,17 +137,35 @@ Options:
 -n STEPS       maximum reduction steps
 -q             quiet mode; suppress [steps=...] on stderr
 -t             trace reductions to stderr
---no-prelude   disable built-in prelude
+--no-prelude   disable built-in I/K/S/TRUE/FALSE
+--             stop option parsing; remaining values become ARGS
 -h, --help     show help
 ```
 
 Examples:
 
 ```sh
-./lambdascript -q -e 'I z'
-./lambdascript -t -e '(\x.x) z'
-./lambdascript -n 1000000 -q examples/hard/02_factorial_y.ls
-cat tests/ops.ls | ./lambdascript -q
+./lambdaScript -q -e 'I z'
+./lambdaScript -t -e '(\x.x) z'
+./lambdaScript -n 1000000 -q examples/hard/02_factorial_y.ls
+./lambdaScript -q -e 'ARG1' -- alpha
+cat tests/ops.ls | ./lambdaScript -q
+```
+
+### Script arguments
+
+Anything after `--` is exposed to the program as `ARG1`, `ARG2`, ..., `ARGC`, and `ARGS`. `ARG0` is the source name (`<eval>`, `<stdin>`, or the file path).
+
+Example:
+
+```sh
+./lambdaScript -q -e 'ARG1' -- alpha
+```
+
+Expected:
+
+```text
+alpha
 ```
 
 ---
@@ -162,7 +180,7 @@ ID hello
 Run:
 
 ```sh
-./lambdascript -q first.ls
+./lambdaScript -q first.ls
 ```
 
 Expected:
@@ -347,32 +365,45 @@ p ^ q
 p v q
 p -> q
 p <-> q
+p <=> q
 ```
+
+`<->` and `<=>` are equivalent spellings for biconditional / equivalence.
 
 Unicode:
 
 ```ls
 ¬p
+⌐p
 p ∧ q
 p ∨ q
 p → q
 p ↔ q
+p ≣ q
 ```
+
+`¬` and `⌐` are equivalent spellings for NOT. `↔` and `≣` are equivalent spellings for biconditional / equivalence.
 
 Precedence, highest to lowest:
 
 ```text
-~
-^
-v
-->
-<->
+~ ¬ ⌐
+^ ∧
+v ∨
+-> →
+<-> <=> ↔ ≣
 ```
 
 Example:
 
 ```ls
 SHOW (TRUE ^ ~ FALSE)
+```
+
+The same expression can be written with Unicode aliases:
+
+```ls
+SHOW (TRUE ∧ ⌐FALSE)
 ```
 
 Expected:
@@ -557,7 +588,7 @@ This enables experiments such as factorial, countdown, and recursive tree walks.
 Use recursion carefully. It can explode reduction steps fast. For hard examples, run with a larger step limit:
 
 ```sh
-./lambdascript -n 1000000 -q examples/hard/02_factorial_y.ls
+./lambdaScript -n 1000000 -q examples/hard/02_factorial_y.ls
 ```
 
 ---
@@ -605,8 +636,16 @@ F (G X)
 
 ### Boolean negation
 
+Either ASCII or Unicode NOT works:
+
 ```ls
 SHOW (~ FALSE)
+```
+
+or:
+
+```ls
+SHOW (⌐FALSE)
 ```
 
 Expected:
@@ -705,7 +744,7 @@ hello
 Run:
 
 ```sh
-./lambdascript -q examples/easy/01_identity.ls
+./lambdaScript -q examples/easy/01_identity.ls
 ```
 
 ---
@@ -838,9 +877,9 @@ IFF = \p q.AND (IMP p q) (IMP q p)
 
 TEST_AND = TRUE ^ TRUE
 TEST_OR = FALSE v TRUE
-TEST_NOT = ~ FALSE
+TEST_NOT = ⌐FALSE
 TEST_IMP = FALSE -> TRUE
-TEST_IFF = TRUE <-> TRUE
+TEST_IFF = TRUE <=> TRUE
 
 ALL = TEST_AND ^ TEST_OR ^ TEST_NOT ^ TEST_IMP ^ TEST_IFF
 
@@ -1257,7 +1296,7 @@ That represents `3! = 6`.
 Run with a high step limit:
 
 ```sh
-./lambdascript -n 1000000 -q examples/hard/02_factorial_y.ls
+./lambdaScript -n 1000000 -q examples/hard/02_factorial_y.ls
 ```
 
 ---
@@ -1309,7 +1348,7 @@ The tests are small LambdaScript programs, and the README includes their full co
 Run one test file:
 
 ```sh
-./lambdascript -q tests/ops.ls
+./lambdaScript -q tests/ops.ls
 ```
 
 Expected:
@@ -1321,13 +1360,13 @@ True
 Run the full smoke suite:
 
 ```sh
-sh scripts/run-tests.sh ./lambdascript
+sh scripts/run-tests.sh ./lambdaScript
 ```
 
 Or, if the binary is installed:
 
 ```sh
-sh scripts/run-tests.sh lambdascript
+sh scripts/run-tests.sh lambdaScript
 ```
 
 ### Test 1: `tests/identity.ls`
@@ -1369,7 +1408,7 @@ LEFT
 
 ### Test 3: `tests/ops.ls`
 
-Checks ASCII and Unicode logic operators, plus precedence.
+Checks ASCII and Unicode logic operators, including the alias spellings, plus precedence.
 
 ```ls
 ; Expected: True
@@ -1382,17 +1421,18 @@ IFF = \p q.AND (IMP p q) (IMP q p)
 
 TEST_AND = ~ (TRUE ^ FALSE)
 TEST_OR = TRUE v FALSE
-TEST_NOT = ~ FALSE
+TEST_NOT = ⌐FALSE
 TEST_IMP = FALSE -> TRUE
-TEST_IFF = ~ (TRUE <-> FALSE)
+TEST_IFF = ~ (TRUE <=> FALSE)
 TEST_U_AND = TRUE ∧ TRUE
 TEST_U_IMP = FALSE → FALSE
-TEST_U_IFF = TRUE ↔ TRUE
+TEST_U_IFF = TRUE ≣ TRUE
 TEST_U_NOT = ¬ TRUE <-> FALSE
+TEST_U_NOT_ALT = ⌐TRUE ≣ FALSE
 TEST_PREC_AND_OR = TRUE v FALSE ^ FALSE
-TEST_PREC_IFF_IMP = ~ (FALSE <-> FALSE -> TRUE)
+TEST_PREC_IFF_IMP = ~ (FALSE ↔ FALSE -> TRUE)
 
-ALL = TEST_AND ^ TEST_OR ^ TEST_NOT ^ TEST_IMP ^ TEST_IFF ^ TEST_U_AND ^ TEST_U_IMP ^ TEST_U_IFF ^ TEST_U_NOT ^ TEST_PREC_AND_OR ^ TEST_PREC_IFF_IMP
+ALL = TEST_AND ^ TEST_OR ^ TEST_NOT ^ TEST_IMP ^ TEST_IFF ^ TEST_U_AND ^ TEST_U_IMP ^ TEST_U_IFF ^ TEST_U_NOT ^ TEST_U_NOT_ALT ^ TEST_PREC_AND_OR ^ TEST_PREC_IFF_IMP
 SHOW ALL
 ```
 
@@ -1511,7 +1551,7 @@ The test runner is intentionally plain shell, so it can run anywhere without ext
 #!/usr/bin/env sh
 set -eu
 
-BIN="${1:-./lambdascript}"
+BIN="${1:-./lambdaScript}"
 
 pass=0
 fail=0
@@ -1520,9 +1560,9 @@ run_test() {
     file="$1"
     expected="$2"
 
-    out="$("$BIN" -q "$file" 2>/tmp/lambdascript_test_err.$$ || true)"
-    err="$(cat /tmp/lambdascript_test_err.$$ 2>/dev/null || true)"
-    rm -f /tmp/lambdascript_test_err.$$
+    out="$("$BIN" -q "$file" 2>/tmp/lambdaScript_test_err.$$ || true)"
+    err="$(cat /tmp/lambdaScript_test_err.$$ 2>/dev/null || true)"
+    rm -f /tmp/lambdaScript_test_err.$$
 
     if [ "$out" = "$expected" ]; then
         printf 'PASS %s\n' "$file"
@@ -1624,14 +1664,14 @@ COMP F G X
 LambdaScript can be called from XF through `core.os.run`.
 
 ```xf
-out = core.os.run("/Volumes/Experiments/lambdaScript/bin/lambdascript -q /Volumes/Experiments/lambdaScript/tests/ops.ls")
+out = core.os.run("/Volumes/Experiments/lambdaScript/bin/lambdaScript -q /Volumes/Experiments/lambdaScript/tests/ops.ls")
 print out
 ```
 
 A small assertion:
 
 ```xf
-out = core.str.trim(core.os.run("/Volumes/Experiments/lambdaScript/bin/lambdascript -q /Volumes/Experiments/lambdaScript/tests/ops.ls"))
+out = core.str.trim(core.os.run("/Volumes/Experiments/lambdaScript/bin/lambdaScript -q /Volumes/Experiments/lambdaScript/tests/ops.ls"))
 
 if out == "True" {
     print "PASS lambdaScript ops"
@@ -1709,6 +1749,7 @@ Check:
 
 * missing parentheses
 * using `v` as a variable when `v` means OR
+* mixing operator aliases without parentheses when you intended a different grouping
 * unsupported literal syntax such as numbers or strings
 
 ### `program must end with an expression`
@@ -1738,56 +1779,9 @@ Your expression may be recursive, may duplicate work, or may be using a large Ch
 Run with:
 
 ```sh
-./lambdascript -n 1000000 -q file.ls
+./lambdaScript -n 1000000 -q file.ls
 ```
 
 or reduce the input size.
 
 ---
-
-## Current Limitations
-
-LambdaScript does not yet have:
-
-* numeric literals
-* string literals
-* arrays or records
-* imports
-* native `if`, `while`, or `for`
-* CLI args exposed as `ARGS`
-* native primitive bindings
-* real integration/summation engines
-* multi-line definitions
-* direct XF native module bridge
-
-Current data is symbolic unless encoded through lambda calculus.
-
----
-
-## Roadmap
-
-Near term:
-
-* expand examples and docs
-* keep `tests/ops.ls` as a smoke test
-* add multi-line definitions
-* add import/load support
-* add `ARGS`, `ARG0`, `ARG1`, etc.
-* add numeric and string literals
-* add a source library directory
-
-Mid term:
-
-* native primitive bindings
-* structured values
-* pretty-printer improvements
-* direct XF module bridge
-* test runner integration
-
-Long term:
-
-* symbolic transformation system
-* proof/rewrite tooling
-* model specification layer
-* numeric backend
-* C embedding API
