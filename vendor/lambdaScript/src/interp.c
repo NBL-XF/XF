@@ -185,6 +185,56 @@ static Value *value_church_boolean(int truthy) {
 	return value_lam_new(inner);
 }
 
+static int church_boolean_value(const Value *value, int *out_truth) {
+	if (value == NULL || out_truth == NULL) {
+		return 0;
+	}
+
+	if (value->kind != VALUE_LAM ||
+	    value->as.lam.body == NULL ||
+	    value->as.lam.body->kind != VALUE_LAM ||
+	    value->as.lam.body->as.lam.body == NULL ||
+	    value->as.lam.body->as.lam.body->kind != VALUE_BOUND_VAR) {
+		return 0;
+	}
+
+	if (value->as.lam.body->as.lam.body->as.bound_var.index == 1) {
+		*out_truth = 1;
+		return 1;
+	}
+
+	if (value->as.lam.body->as.lam.body->as.bound_var.index == 0) {
+		*out_truth = 0;
+		return 1;
+	}
+
+	return 0;
+}
+
+static int value_has_normal_step(const Value *value, int *out_has_step) {
+	Value *next;
+
+	if (out_has_step == NULL) {
+		err_set("invalid step probe");
+		return 0;
+	}
+
+	err_clear();
+	next = interp_step_normal(value);
+	if (next != NULL) {
+		value_free(next);
+		*out_has_step = 1;
+		return 1;
+	}
+
+	if (err_has()) {
+		return 0;
+	}
+
+	*out_has_step = 0;
+	return 1;
+}
+
 static int is_equiv_name(const char *name) {
 	return strcmp(name, "EQUIV") == 0 ||
 	       strcmp(name, "equiv") == 0 ||
@@ -241,6 +291,29 @@ static Value *try_reduce_primitive(const Value *term) {
 
 	if (head->kind == VALUE_APP && head->as.app.fn->kind == VALUE_FREE_VAR) {
 		if (is_equiv_name(head->as.app.fn->as.free_var.name)) {
+			int left_truth = 0;
+			int right_truth = 0;
+			int left_has_step = 0;
+			int right_has_step = 0;
+
+			if (!value_has_normal_step(head->as.app.arg, &left_has_step)) {
+				return NULL;
+			}
+			if (left_has_step) {
+				return NULL;
+			}
+			if (!value_has_normal_step(right, &right_has_step)) {
+				return NULL;
+			}
+			if (right_has_step) {
+				return NULL;
+			}
+
+			if (church_boolean_value(head->as.app.arg, &left_truth) &&
+			    church_boolean_value(right, &right_truth)) {
+				return value_church_boolean(left_truth == right_truth);
+			}
+
 			return value_church_boolean(value_structural_equal(head->as.app.arg, right));
 		}
 

@@ -1,0 +1,3 @@
+SHOW = \b.b True False
+CONS = \h.\t.cons h t
+CONS (SHOW ((TRUE -> ⌐TRUE) <=> (⌐TRUE v ⌐TRUE))) (CONS (SHOW ((FALSE -> ⌐FALSE) ≡ (⌐FALSE v ⌐FALSE))) nil)

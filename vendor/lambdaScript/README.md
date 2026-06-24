@@ -1,6 +1,6 @@
 # LambdaScript
 
-LambdaScript is a tiny lambda-calculus language for symbolic reduction, logic, transformations, and model expressions.
+LambdaScript is a tiny lambda-calculus language for symbolic reduction, logic, transformations, model expressions, and a small layer of numeric and mathematical syntax.
 
 It keeps the core deliberately small:
 
@@ -10,9 +10,16 @@ It keeps the core deliberately small:
 * top-level definitions
 * normal-order beta reduction
 
-The practical idea is simple: keep the evaluator monk-clean, then grow power through syntax sugar, prelude definitions, source libraries, and optional native/runtime bindings.
+The practical idea is still the same: keep the evaluator monk-clean, then grow power through syntax sugar, prelude definitions, source libraries, and optional native/runtime bindings.
 
----
+Today that surface layer includes:
+
+* ASCII and Unicode lambda syntax
+* Boolean logic operators
+* numeric literals and arithmetic operators
+* symbolic math forms such as `Σ`, `∫`, and `lim`
+* actionable subscripts such as `Nₑ`, `N_e`, `N(ᵢ,ⱼ)`, and `N_(i,j)`
+* set-style membership syntax such as `x ∈ S` and `S ∋ x`
 
 ## Table of Contents
 
@@ -27,18 +34,15 @@ The practical idea is simple: keep the evaluator monk-clean, then grow power thr
 9. [Branching](#branching)
 10. [Pairs](#pairs)
 11. [Church Numerals](#church-numerals)
-12. [Loops and Iteration](#loops-and-iteration)
-13. [Common Algorithms](#common-algorithms)
-14. [Worked Examples](#worked-examples)
-15. [Testing](#testing)
-16. [XF Integration](#xf-integration)
-17. [Symbolic Models](#symbolic-models)
-18. [Tips for Writing Good LambdaScript](#tips-for-writing-good-lambdascript)
-19. [Troubleshooting](#troubleshooting)
-20. [Current Limitations](#current-limitations)
-21. [Roadmap](#roadmap)
-
----
+12. [Numeric and Symbolic Math](#numeric-and-symbolic-math)
+13. [Loops and Iteration](#loops-and-iteration)
+14. [Common Algorithms](#common-algorithms)
+15. [Worked Examples](#worked-examples)
+16. [Testing](#testing)
+17. [XF Integration](#xf-integration)
+18. [Symbolic Models](#symbolic-models)
+19. [Tips for Writing Good LambdaScript](#tips-for-writing-good-lambdascript)
+20. [Troubleshooting](#troubleshooting)
 
 ## Why LambdaScript
 
@@ -88,7 +92,7 @@ The current XF bridge shells out to the LambdaScript binary. A later bridge can 
 
 ```xf
 core.lambda.eval("TRUE ^ FALSE")
-core.lambda.file("tests/ops.ls")
+core.lambda.file("tests/ops.lambda")
 core.lambda.reduce("(\\x.x) z")
 ```
 
@@ -113,7 +117,7 @@ z
 Run a file:
 
 ```sh
-./lambdaScript -q tests/ops.ls
+./lambdaScript -q tests/ops.lambda
 ```
 
 Expected:
@@ -122,7 +126,11 @@ Expected:
 True
 ```
 
----
+Run the current smoke suite:
+
+```sh
+make test
+```
 
 ## CLI Usage
 
@@ -147,9 +155,9 @@ Examples:
 ```sh
 ./lambdaScript -q -e 'I z'
 ./lambdaScript -t -e '(\x.x) z'
-./lambdaScript -n 1000000 -q examples/hard/02_factorial_y.ls
+./lambdaScript -n 1000000 -q tests/torture.lambda
 ./lambdaScript -q -e 'ARG1' -- alpha
-cat tests/ops.ls | ./lambdaScript -q
+cat tests/ops.lambda | ./lambdaScript -q
 ```
 
 ### Script arguments
@@ -168,8 +176,6 @@ Expected:
 alpha
 ```
 
----
-
 ## A First LambdaScript Program
 
 ```ls
@@ -180,7 +186,7 @@ ID hello
 Run:
 
 ```sh
-./lambdaScript -q first.ls
+./lambdaScript -q first.lambda
 ```
 
 Expected:
@@ -265,6 +271,35 @@ f (g x)
 -- double-dash comment
 ```
 
+### Literals and identifiers
+
+LambdaScript now accepts numeric literals:
+
+```ls
+0
+1
+2.5
+-3
+```
+
+Unicode identifiers are allowed, including subscript characters:
+
+```ls
+x₀
+x₁
+Nₑ
+β
+```
+
+Plain subscripted identifiers can stay ordinary names when you define them directly:
+
+```ls
+x₀ = 8
+x₀
+```
+
+but unresolved subscripted forms can also lower into symbolic math forms such as `sub N e` and `sub N i j`. See [Numeric and Symbolic Math](#numeric-and-symbolic-math).
+
 ### Program shape
 
 A program is a list of single-line definitions followed by one final expression.
@@ -277,8 +312,6 @@ A B
 ```
 
 The final expression is required.
-
----
 
 ## Definitions
 
@@ -297,7 +330,29 @@ Current rule of thumb:
 * avoid direct recursive named definitions for now
 * use combinators such as `Y` for recursion experiments
 
----
+### Top-level compound definitions
+
+LambdaScript also supports arithmetic update sugar at the top level:
+
+```ls
+x = 10
+x += 5
+x
+```
+
+Expected:
+
+```text
+15
+```
+
+Supported compound forms:
+
+```text
++=  -=  *=  /=  %=
+```
+
+These are definition sugar, not general mutable assignment inside arbitrary expressions.
 
 ## Booleans and Logic Operators
 
@@ -355,7 +410,7 @@ IMP = \p q.OR (NOT p) q
 IFF = \p q.AND (IMP p q) (IMP q p)
 ```
 
-### Logic operators
+### Logic and equivalence operators
 
 ASCII:
 
@@ -368,8 +423,6 @@ p <-> q
 p <=> q
 ```
 
-`<->` and `<=>` are equivalent spellings for biconditional / equivalence.
-
 Unicode:
 
 ```ls
@@ -380,9 +433,26 @@ p ∨ q
 p → q
 p ↔ q
 p ≣ q
+p ≡ q
 ```
 
-`¬` and `⌐` are equivalent spellings for NOT. `↔` and `≣` are equivalent spellings for biconditional / equivalence.
+Meaning:
+
+* `~`, `¬`, and `⌐` are NOT
+* `^` and `∧` are AND
+* `v` and `∨` are OR
+* `->` and `→` are implication
+* `<->` and `↔` are boolean biconditional / IFF
+* `<=>`, `≣`, and `≡` are generalized equivalence
+
+That distinction matters:
+
+```ls
+SHOW (TRUE <-> TRUE)
+SHOW (TRUE <=> TRUE)
+```
+
+Both reduce to `True`, but they are not the same operator family. `IFF` is the boolean connective. Generalized equivalence is the broader equality-like operator used for numbers, atoms, structural terms, and symbolic membership patterns.
 
 Precedence, highest to lowest:
 
@@ -391,16 +461,11 @@ Precedence, highest to lowest:
 ^ ∧
 v ∨
 -> →
-<-> <=> ↔ ≣
+<-> ↔
+<=> ≣ ≡
 ```
 
 Example:
-
-```ls
-SHOW (TRUE ^ ~ FALSE)
-```
-
-The same expression can be written with Unicode aliases:
 
 ```ls
 SHOW (TRUE ∧ ⌐FALSE)
@@ -413,8 +478,6 @@ True
 ```
 
 Note: if ASCII `v` is enabled as OR, do not use a bare variable named `v`.
-
----
 
 ## Branching
 
@@ -540,6 +603,168 @@ True
 
 ---
 
+## Numeric and Symbolic Math
+
+LambdaScript now has both built-in numeric arithmetic and symbolic math surface forms.
+
+### Numeric literals and arithmetic
+
+Built-in numeric operators:
+
+```ls
++
+-
+*
+/
+%
+**
+```
+
+Examples:
+
+```ls
+1 + 2 * 3
+2 ** 3 ** 2
+√16
+㏑ ℯ
+```
+
+ASCII aliases are also available:
+
+```ls
+sqrt 16
+ln euler
+inf
+INFINITY
+```
+
+Common constants and aliases:
+
+```text
+∞           infinity
+ℯ           euler
+√x          sqrt x
+㏑ x        ln x
+```
+
+Examples:
+
+```ls
+x₀ = 8
+x₀**(-1/3)
+```
+
+Expected:
+
+```text
+0.5
+```
+
+Use parentheses around fractional or negative exponents when you care about grouping:
+
+```ls
+8**(-1/3)
+```
+
+### Symbolic math forms
+
+These forms lower to symbolic constructors. They improve notation, but they do not magically perform calculus by themselves.
+
+```ls
+Σ i = 0 to n . xᵢ
+∫ t = 0 to T . f t
+lim x -> 0 . (sin x) / x
+```
+
+ASCII forms:
+
+```ls
+Sigma i = 0 to n . x_i
+Integral t = 0 to T . f t
+lim x -> 0 . (sin x) / x
+```
+
+Current lowering shape:
+
+```text
+Σ i = a to b . expr      -> sigma a b (\i.expr)
+∫ x = a to b . expr      -> integral a b (\x.expr)
+lim x -> a . expr        -> limit a (\x.expr)
+```
+
+These are ideal for symbolic models and readable math pipelines.
+
+### Membership syntax
+
+LambdaScript also supports set-style membership syntax.
+
+Unicode:
+
+```ls
+x ∈ S
+S ∋ x
+S ∍ x
+```
+
+ASCII:
+
+```ls
+x in S
+S contains x
+```
+
+Current lowering shape:
+
+```text
+x ∈ S        -> elem x S
+x in S       -> elem x S
+S ∋ x        -> contains S x
+S ∍ x        -> contains S x
+S contains x -> contains S x
+```
+
+If you define `elem` or `contains` as real predicates, these can compute to Church booleans. Otherwise they remain symbolic forms.
+
+### Actionable subscripts
+
+Subscripts are not just pretty names anymore.
+
+Supported forms include:
+
+```ls
+Nₑ
+N_e
+N(ᵢ,ⱼ)
+N_(i,j)
+xᵢ
+x₀
+```
+
+Unresolved subscripted forms lower into symbolic `sub` expressions:
+
+```text
+Nₑ         -> sub N e
+N_e        -> sub N e
+N(ᵢ,ⱼ)     -> sub N i j
+N_(i,j)    -> sub N i j
+xᵢ         -> sub x i
+```
+
+But exact user definitions still win:
+
+```ls
+x₀ = 8
+x₀**(-1/3)
+```
+
+Expected:
+
+```text
+0.5
+```
+
+That combination gives you readable symbolic indexing without breaking normal definitional use.
+
 ## Loops and Iteration
 
 LambdaScript does not currently have native `while` or `for`.
@@ -588,7 +813,7 @@ This enables experiments such as factorial, countdown, and recursive tree walks.
 Use recursion carefully. It can explode reduction steps fast. For hard examples, run with a larger step limit:
 
 ```sh
-./lambdaScript -n 1000000 -q examples/hard/02_factorial_y.ls
+./lambdaScript -n 1000000 -q examples/hard/02_factorial_y.lambda
 ```
 
 ---
@@ -654,17 +879,38 @@ Expected:
 True
 ```
 
-### Conditional select
+### Numeric arithmetic
 
 ```ls
-IF = \b then else.b then else
-IF FALSE LEFT RIGHT
+1 + 2 * 3
 ```
 
 Expected:
 
 ```text
-RIGHT
+7
+```
+
+```ls
+2 ** 3 ** 2
+```
+
+Expected:
+
+```text
+512
+```
+
+### Symbolic sigma
+
+```ls
+Σ i = 0 to n . xᵢ
+```
+
+Expected:
+
+```text
+sigma 0 n (\x0.sub x x0)
 ```
 
 ### Pair projection
@@ -709,8 +955,6 @@ Expected:
 ```text
 True
 ```
-
----
 
 ## Worked Examples
 
@@ -1296,7 +1540,7 @@ That represents `3! = 6`.
 Run with a high step limit:
 
 ```sh
-./lambdaScript -n 1000000 -q examples/hard/02_factorial_y.ls
+./lambdaScript -n 1000000 -q examples/hard/02_factorial_y.lambda
 ```
 
 ---
@@ -1343,335 +1587,153 @@ This is a good “is the little machine still alive?” program. 🧪
 
 ## Testing
 
-The tests are small LambdaScript programs, and the README includes their full contents here so the docs are useful even before you open the `tests/` directory.
+The repository now uses `tests/test.sh` as the primary regression suite.
 
-Run one test file:
-
-```sh
-./lambdaScript -q tests/ops.ls
-```
-
-Expected:
-
-```text
-True
-```
-
-Run the full smoke suite:
+Run it with:
 
 ```sh
-sh scripts/run-tests.sh ./lambdaScript
+chmod +x tests/test.sh
+./tests/test.sh
 ```
 
-Or, if the binary is installed:
+or through the Makefile:
 
 ```sh
-sh scripts/run-tests.sh lambdaScript
+make test
 ```
 
-### Test 1: `tests/identity.ls`
+The current suite covers:
 
-Checks that the identity combinator returns its argument.
+* core lambda reduction
+* stdin and file-based top-level definitions
+* comments, trace, and step limits
+* arithmetic and numeric aliases
+* symbolic math forms
+* actionable subscripts
+* torture coverage for mixed ASCII/Unicode syntax
+
+Representative files in `tests/`:
+
+```text
+math_ascii_aliases.lambda
+math_ops.lambda
+math_forms.lambda
+subscripts.lambda
+torture.lambda
+validation.lambda
+```
+
+### `tests/math_ascii_aliases.lambda`
+
+Checks ASCII aliases for numeric math:
 
 ```ls
-; Expected: Z
-I Z
+A = sqrt 16
+B = ln euler
+C = inf
+D = INFINITY
+E = SQRT 25
+F = LN EULER
+cons A (cons B (cons C (cons D (cons E (cons F nil)))))
 ```
 
 Expected output:
 
 ```text
-Z
+cons 4 (cons 1 (cons ∞ (cons ∞ (cons 5 (cons 1 nil)))))
 ```
 
-### Test 2: `tests/branch.ls`
+### `tests/math_ops.lambda`
 
-Checks Church boolean branching.
+Checks numeric operators and Unicode math forms:
 
 ```ls
-; Expected: LEFT
-SHOW = \b.b True False
-NOT = \p.p FALSE TRUE
-AND = \p q.p q FALSE
-OR = \p q.p TRUE q
-IMP = \p q.OR (NOT p) q
-IFF = \p q.AND (IMP p q) (IMP q p)
-IF = \b then else.b then else
-IF (TRUE v FALSE) LEFT RIGHT
+A = 1 + 2 * 3
+B = 2 ** 3 ** 2
+C = √16
+D = ㏑ ℯ
+E = 10 % 4
+x₀ = 41
+x₀ += 1
+cons A (cons B (cons C (cons D (cons E (cons x₀ nil)))))
 ```
 
 Expected output:
 
 ```text
-LEFT
+cons 7 (cons 512 (cons 4 (cons 1 (cons 2 (cons 42 nil)))))
 ```
 
-### Test 3: `tests/ops.ls`
+### `tests/math_forms.lambda`
 
-Checks ASCII and Unicode logic operators, including the alias spellings, plus precedence.
+Checks symbolic math and membership lowering:
 
 ```ls
-; Expected: True
-SHOW = \b.b True False
-NOT = \p.p FALSE TRUE
-AND = \p q.p q FALSE
-OR = \p q.p TRUE q
-IMP = \p q.OR (NOT p) q
-IFF = \p q.AND (IMP p q) (IMP q p)
-
-TEST_AND = ~ (TRUE ^ FALSE)
-TEST_OR = TRUE v FALSE
-TEST_NOT = ⌐FALSE
-TEST_IMP = FALSE -> TRUE
-TEST_IFF = ~ (TRUE <=> FALSE)
-TEST_U_AND = TRUE ∧ TRUE
-TEST_U_IMP = FALSE → FALSE
-TEST_U_IFF = TRUE ≣ TRUE
-TEST_U_NOT = ¬ TRUE <-> FALSE
-TEST_U_NOT_ALT = ⌐TRUE ≣ FALSE
-TEST_PREC_AND_OR = TRUE v FALSE ^ FALSE
-TEST_PREC_IFF_IMP = ~ (FALSE ↔ FALSE -> TRUE)
-
-ALL = TEST_AND ^ TEST_OR ^ TEST_NOT ^ TEST_IMP ^ TEST_IFF ^ TEST_U_AND ^ TEST_U_IMP ^ TEST_U_IFF ^ TEST_U_NOT ^ TEST_U_NOT_ALT ^ TEST_PREC_AND_OR ^ TEST_PREC_IFF_IMP
-SHOW ALL
+cons (Σ i = 0 to 3 . ADD i 1)
+  (cons (∫ x = 0 to 1 . POW x 2)
+    (cons (lim x -> 0 . DIV (sin x) x)
+      (cons (a ∈ SET)
+        (cons (SET ∋ a)
+          (cons (a in SET)
+            (cons (SET contains a) nil))))))
 ```
 
 Expected output:
 
 ```text
-True
+cons (sigma 0 3 (\x0.ADD x0 1)) (cons (integral 0 1 (\x0.POW x0 2)) (cons (limit 0 (\x0.DIV (sin x0) x0)) (cons (elem a SET) (cons (contains SET a) (cons (elem a SET) (cons (contains SET a) nil))))))
 ```
 
-### Test 4: `tests/pairs.ls`
+### `tests/subscripts.lambda`
 
-Checks Church pair construction and projection.
+Checks actionable subscript lowering and numeric interaction:
 
 ```ls
-; Expected: BETA
-PAIR = \a b f.f a b
-FIRST = \p.p (\a b.a)
-SECOND = \p.p (\a b.b)
-SECOND (PAIR ALPHA BETA)
+A = Nₑ
+B = N_e
+C = N(ᵢ,ⱼ)
+D = N_(i,j)
+x₀ = 8
+E = x₀**(-1/3)
+F = Σ i = 0 to n . xᵢ
+cons A (cons B (cons C (cons D (cons E (cons F nil)))))
 ```
 
 Expected output:
 
 ```text
-BETA
+cons (sub N e) (cons (sub N e) (cons (sub N i j) (cons (sub N i j) (cons 0.5 (cons (sigma 0 n (\x0.sub x x0)) nil)))))
 ```
 
-### Test 5: `tests/numerals_iszero.ls`
+### `tests/torture.lambda`
 
-Checks Church numeral zero detection.
+A mixed stress test for the currently working surface:
 
-```ls
-; Expected: True
-SHOW = \b.b True False
-NOT = \p.p FALSE TRUE
-AND = \p q.p q FALSE
-OR = \p q.p TRUE q
-IMP = \p q.OR (NOT p) q
-IFF = \p q.AND (IMP p q) (IMP q p)
+* ASCII and Unicode lambdas
+* logic aliases
+* Church booleans, pairs, numerals, predecessor, equality
+* fixed-point recursion
+* deep nested final expression
 
-ZERO = \f x.x
-ONE = \f x.f x
-TWO = \f x.f (f x)
-THREE = \f x.f (f (f x))
-SUCC = \n f x.f (n f x)
-PLUS = \m n f x.m f (n f x)
-MULT = \m n f.m (n f)
-ISZERO = \n.n (\x.FALSE) TRUE
-
-SHOW (ISZERO ZERO)
-```
-
-Expected output:
-
-```text
-True
-```
-
-### Test 6: `tests/numerals_loop.ls`
-
-Checks bounded iteration through a Church numeral.
-
-```ls
-; Expected: STEP (STEP (STEP START))
-THREE = \f x.f (f (f x))
-THREE STEP START
-```
-
-Expected output:
-
-```text
-STEP (STEP (STEP START))
-```
-
-### Test 7: `tests/arithmetic_eq.ls`
-
-Checks predecessor, subtraction, less-than-or-equal, and numeric equality.
-
-```ls
-; Expected: True
-SHOW = \b.b True False
-NOT = \p.p FALSE TRUE
-AND = \p q.p q FALSE
-OR = \p q.p TRUE q
-IMP = \p q.OR (NOT p) q
-IFF = \p q.AND (IMP p q) (IMP q p)
-
-ZERO = \f x.x
-ONE = \f x.f x
-TWO = \f x.f (f x)
-THREE = \f x.f (f (f x))
-SUCC = \n f x.f (n f x)
-PLUS = \m n f x.m f (n f x)
-MULT = \m n f.m (n f)
-ISZERO = \n.n (\x.FALSE) TRUE
-
-PRED = \n f x.n (\g h.h (g f)) (\u.x) (\u.u)
-SUB = \m n.n PRED m
-LEQ = \m n.ISZERO (SUB m n)
-NUM_EQ = \m n.AND (LEQ m n) (LEQ n m)
-
-SHOW (NUM_EQ TWO (PRED THREE))
-```
-
-Expected output:
-
-```text
-True
-```
-
-### Test Runner: `scripts/run-tests.sh`
-
-The test runner is intentionally plain shell, so it can run anywhere without extra tooling.
+Run it directly:
 
 ```sh
-#!/usr/bin/env sh
-set -eu
-
-BIN="${1:-./lambdaScript}"
-
-pass=0
-fail=0
-
-run_test() {
-    file="$1"
-    expected="$2"
-
-    out="$("$BIN" -q "$file" 2>/tmp/lambdaScript_test_err.$$ || true)"
-    err="$(cat /tmp/lambdaScript_test_err.$$ 2>/dev/null || true)"
-    rm -f /tmp/lambdaScript_test_err.$$
-
-    if [ "$out" = "$expected" ]; then
-        printf 'PASS %s\n' "$file"
-        pass=$((pass + 1))
-    else
-        printf 'FAIL %s\n' "$file"
-        printf '  expected: [%s]\n' "$expected"
-        printf '  actual:   [%s]\n' "$out"
-        if [ -n "$err" ]; then
-            printf '  stderr:   [%s]\n' "$err"
-        fi
-        fail=$((fail + 1))
-    fi
-}
-
-run_test tests/identity.ls "Z"
-run_test tests/branch.ls "LEFT"
-run_test tests/ops.ls "True"
-run_test tests/pairs.ls "BETA"
-run_test tests/numerals_iszero.ls "True"
-run_test tests/numerals_loop.ls "STEP (STEP (STEP START))"
-run_test tests/arithmetic_eq.ls "True"
-
-printf '\npassed: %s\nfailed: %s\n' "$pass" "$fail"
-
-if [ "$fail" -ne 0 ]; then
-    exit 1
-fi
+./lambdaScript -q tests/torture.lambda
 ```
-
-Expected output:
-
-```text
-PASS tests/identity.ls
-PASS tests/branch.ls
-PASS tests/ops.ls
-PASS tests/pairs.ls
-PASS tests/numerals_iszero.ls
-PASS tests/numerals_loop.ls
-PASS tests/arithmetic_eq.ls
-
-passed: 7
-failed: 0
-```
-
-### Native XF Bridge Smoke Test
-
-Once XF has `core.lambda`, add a test like this to XF:
-
-```xf
-out = core.str.trim(core.lambda.file("vendor/lambdaScript/tests/ops.ls"))
-
-if out == "True" {
-    print "PASS core.lambda.file"
-} else {
-    print "FAIL core.lambda.file: " + out
-}
-```
-
-And inline eval:
-
-```xf
-out = core.str.trim(core.lambda.eval("SHOW = \\b.b True False\nSHOW (~ FALSE)"))
-
-if out == "True" {
-    print "PASS core.lambda.eval"
-} else {
-    print "FAIL core.lambda.eval: " + out
-}
-```
-
-### Test Design Pattern
-
-Because LambdaScript currently prints one final expression, each test should reduce to one final value.
-
-Use `SHOW` for booleans:
-
-```ls
-SHOW = \b.b True False
-SHOW (TRUE ^ FALSE)
-```
-
-Use symbolic names for numerals:
-
-```ls
-THREE STEP START
-```
-
-Use free variables for structural outputs:
-
-```ls
-COMP = \f g x.f (g x)
-COMP F G X
-```
-
 
 ## XF Integration
 
 LambdaScript can be called from XF through `core.os.run`.
 
 ```xf
-out = core.os.run("/Volumes/Experiments/lambdaScript/bin/lambdaScript -q /Volumes/Experiments/lambdaScript/tests/ops.ls")
+out = core.os.run("/Volumes/Experiments/lambdaScript/bin/lambdaScript -q /Volumes/Experiments/lambdaScript/tests/ops.lambda")
 print out
 ```
 
 A small assertion:
 
 ```xf
-out = core.str.trim(core.os.run("/Volumes/Experiments/lambdaScript/bin/lambdaScript -q /Volumes/Experiments/lambdaScript/tests/ops.ls"))
+out = core.str.trim(core.os.run("/Volumes/Experiments/lambdaScript/bin/lambdaScript -q /Volumes/Experiments/lambdaScript/tests/ops.lambda"))
 
 if out == "True" {
     print "PASS lambdaScript ops"
@@ -1743,23 +1805,24 @@ Until multi-line definitions exist, one definition per line is the safe format.
 
 ### `unexpected trailing input`
 
-Usually an operator/token was not recognized, or the parser did not expect another term.
+Usually an operator or token was recognized differently than you intended.
 
 Check:
 
 * missing parentheses
 * using `v` as a variable when `v` means OR
-* mixing operator aliases without parentheses when you intended a different grouping
-* unsupported literal syntax such as numbers or strings
+* writing `ln(x)` when you meant adjacency form `ln x`
+* mixing `<->` and `<=>` without realizing they are different operators
 
-### `program must end with an expression`
+### `expected ')' at byte ...`
 
-Add a final expression after definitions.
+This usually means the parser saw a grouped term and did not find the closing `)` it expected.
 
-```ls
-ID = \x.x
-ID Z
-```
+Check:
+
+* missing or extra parentheses
+* `N(ᵢ,ⱼ)` versus normal grouping
+* typos such as an extra trailing `)` in inline `-e` expressions
 
 ### Raw output like `\x0 x1.x0`
 
@@ -1772,6 +1835,12 @@ SHOW = \b.b True False
 SHOW TRUE
 ```
 
+### Symbolic output like `sigma ...`, `integral ...`, `limit ...`, `sub ...`
+
+That is normal.
+
+The `Σ`, `∫`, `lim`, membership, and subscript surface forms lower into symbolic constructors unless you define additional semantics around them.
+
 ### Very long reduction or step-limit warning
 
 Your expression may be recursive, may duplicate work, or may be using a large Church numeral.
@@ -1779,9 +1848,7 @@ Your expression may be recursive, may duplicate work, or may be using a large Ch
 Run with:
 
 ```sh
-./lambdaScript -n 1000000 -q file.ls
+./lambdaScript -n 1000000 -q file.lambda
 ```
 
 or reduce the input size.
-
----
