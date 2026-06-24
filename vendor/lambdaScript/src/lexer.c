@@ -64,6 +64,13 @@ static int is_utf8_contains(const char *src, size_t pos, size_t len) {
 	       (unsigned char)src[pos + 2] == 0x8B;
 }
 
+static int is_utf8_contains_alt(const char *src, size_t pos, size_t len) {
+	return pos + 2 < len &&
+	       (unsigned char)src[pos] == 0xE2 &&
+	       (unsigned char)src[pos + 1] == 0x88 &&
+	       (unsigned char)src[pos + 2] == 0x8D;
+}
+
 static int is_utf8_not(const char *src, size_t pos, size_t len) {
 	return pos + 1 < len &&
 	       (unsigned char)src[pos] == 0xC2 &&
@@ -96,6 +103,13 @@ static int is_utf8_equiv(const char *src, size_t pos, size_t len) {
 	       (unsigned char)src[pos] == 0xE2 &&
 	       (unsigned char)src[pos + 1] == 0x89 &&
 	       (unsigned char)src[pos + 2] == 0xA3;
+}
+
+static int is_utf8_equiv_alt(const char *src, size_t pos, size_t len) {
+	return pos + 2 < len &&
+	       (unsigned char)src[pos] == 0xE2 &&
+	       (unsigned char)src[pos + 1] == 0x89 &&
+	       (unsigned char)src[pos + 2] == 0xA1;
 }
 
 static int is_utf8_infinity(const char *src, size_t pos, size_t len) {
@@ -243,7 +257,7 @@ void lexer_next(Lexer *lexer) {
 	    src[lexer->pos] == '<' &&
 	    src[lexer->pos + 1] == '=' &&
 	    src[lexer->pos + 2] == '>') {
-		lexer->current.kind = TOK_IFF;
+		lexer->current.kind = TOK_EQUIV;
 		lexer->current.length = 3;
 		lexer->pos += 3;
 		return;
@@ -279,7 +293,8 @@ void lexer_next(Lexer *lexer) {
 		return;
 	}
 
-	if (is_utf8_contains(src, lexer->pos, lexer->len)) {
+	if (is_utf8_contains(src, lexer->pos, lexer->len) ||
+	    is_utf8_contains_alt(src, lexer->pos, lexer->len)) {
 		lexer->current.kind = TOK_CONTAINS;
 		lexer->current.length = 3;
 		lexer->pos += 3;
@@ -307,8 +322,15 @@ void lexer_next(Lexer *lexer) {
 		return;
 	}
 
-	if (is_utf8_iff(src, lexer->pos, lexer->len) || is_utf8_equiv(src, lexer->pos, lexer->len)) {
+	if (is_utf8_iff(src, lexer->pos, lexer->len)) {
 		lexer->current.kind = TOK_IFF;
+		lexer->current.length = 3;
+		lexer->pos += 3;
+		return;
+	}
+
+	if (is_utf8_equiv(src, lexer->pos, lexer->len) || is_utf8_equiv_alt(src, lexer->pos, lexer->len)) {
+		lexer->current.kind = TOK_EQUIV;
 		lexer->current.length = 3;
 		lexer->pos += 3;
 		return;

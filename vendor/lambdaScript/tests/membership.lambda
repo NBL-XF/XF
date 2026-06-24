@@ -1,0 +1,5 @@
+SHOW = \b.b True False
+elem = \x S.S x
+contains = \S x.S x
+S = \x.(x <=> a) v (x <=> b)
+cons (SHOW (a ∈ S)) (cons (SHOW (⌐ (c ∈ S))) (cons (SHOW (S ∋ b)) (cons (SHOW (⌐ (S ∍ z))) nil)))

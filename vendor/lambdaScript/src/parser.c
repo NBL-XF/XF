@@ -367,6 +367,135 @@ static Ast *make_binary_call(const char *name, Ast *left, Ast *right) {
 	return app;
 }
 
+
+static Ast *make_nary_subscript_call(const char *base_name, Ast **indices, size_t count) {
+	Ast *node;
+	size_t i;
+	size_t base_len;
+
+	base_len = strlen(base_name);
+	while (base_len > 0 && base_name[base_len - 1] == '_') {
+		base_len--;
+	}
+
+	if (base_len == 0) {
+		base_len = strlen(base_name);
+	}
+
+	node = ast_var_new("sub");
+	if (node == NULL) {
+		err_set("out of memory");
+		goto fail;
+	}
+
+	{
+		char *trimmed = dup_range(base_name, base_len);
+		Ast *base_ast;
+		if (trimmed == NULL) {
+			err_set("out of memory");
+			goto fail;
+		}
+		base_ast = ast_var_new(trimmed);
+		free(trimmed);
+		if (base_ast == NULL) {
+			err_set("out of memory");
+			goto fail;
+		}
+		node = ast_app_new(node, base_ast);
+		if (node == NULL) {
+			err_set("out of memory");
+			goto fail;
+		}
+	}
+
+	for (i = 0; i < count; i++) {
+		node = ast_app_new(node, indices[i]);
+		if (node == NULL) {
+			err_set("out of memory");
+			goto fail;
+		}
+		indices[i] = NULL;
+	}
+
+	return node;
+
+fail:
+	for (i = 0; i < count; i++) {
+		if (indices[i] != NULL) {
+			ast_free(indices[i]);
+		}
+	}
+	if (node != NULL) {
+		ast_free(node);
+	}
+	return NULL;
+}
+
+static Ast *try_parse_paren_subscript_suffix(Parser *parser, const char *base_name, Ast *fallback_ident) {
+	Lexer saved = parser->lexer;
+	Ast *indices[16];
+	size_t count = 0;
+	Ast *first = NULL;
+	Ast *result = NULL;
+
+	memset(indices, 0, sizeof(indices));
+
+	if (parser->lexer.current.kind != TOK_LPAREN) {
+		return fallback_ident;
+	}
+
+	parser_advance(parser);
+	first = parse_term(parser);
+	if (first == NULL) {
+		parser->lexer = saved;
+		return fallback_ident;
+	}
+
+	if (parser->lexer.current.kind != TOK_COMMA) {
+		ast_free(first);
+		parser->lexer = saved;
+		return fallback_ident;
+	}
+
+	indices[count++] = first;
+	while (parser->lexer.current.kind == TOK_COMMA) {
+		if (count >= sizeof(indices) / sizeof(indices[0])) {
+			err_set("too many subscript indices at byte %zu", parser->lexer.current.pos);
+			goto fail_keep;
+		}
+		parser_advance(parser);
+		indices[count] = parse_term(parser);
+		if (indices[count] == NULL) {
+			goto fail_keep;
+		}
+		count++;
+	}
+
+	if (!parser_expect(parser, TOK_RPAREN, "expected ')'")) {
+		goto fail_keep;
+	}
+
+	ast_free(fallback_ident);
+	result = make_nary_subscript_call(base_name, indices, count);
+	if (result == NULL) {
+		goto fail_no_keep;
+	}
+	return result;
+
+fail_keep:
+	/* keep parser error from attempted subscript parse */
+	ast_free(fallback_ident);
+fail_no_keep:
+	while (count > 0) {
+		count--;
+		if (indices[count] != NULL) {
+			ast_free(indices[count]);
+		}
+	}
+	return NULL;
+}
+
+
 static Ast *make_ternary_call(const char *name, Ast *first, Ast *second, Ast *third) {
 	Ast *op;
 	Ast *partial1;
@@ -512,144 +641,12 @@ fail:
 	return NULL;
 }
 
-
-static int ident_ends_with_underscore(const char *name) {
-	size_t len;
-
-	if (name == NULL) {
-		return 0;
-	}
-
-	len = strlen(name);
-	return len > 0 && name[len - 1] == '_';
-}
-
-static int lexer_paren_has_top_level_comma(Lexer lexer) {
-	int depth = 0;
-
-	if (lexer.current.kind != TOK_LPAREN) {
-		return 0;
-	}
-
-	do {
-		if (lexer.current.kind == TOK_LPAREN) {
-			depth++;
-		} else if (lexer.current.kind == TOK_RPAREN) {
-			depth--;
-			if (depth == 0) {
-				return 0;
-			}
-		} else if (lexer.current.kind == TOK_COMMA && depth == 1) {
-			return 1;
-		} else if (lexer.current.kind == TOK_EOF || lexer.current.kind == TOK_INVALID) {
-			return 0;
-		}
-
-		lexer_next(&lexer);
-	} while (depth > 0);
-
-	return 0;
-}
-
-static Ast *make_indexed_call_from_base(Ast *base, Ast **items, size_t count) {
-	Ast *current;
-	size_t i;
-
-	if (base == NULL || count == 0) {
-		ast_free(base);
-		return NULL;
-	}
-
-	current = make_binary_call("sub", base, items[0]);
-	if (current == NULL) {
-		for (i = 1; i < count; i++) {
-			ast_free(items[i]);
-		}
-		return NULL;
-	}
-
-	for (i = 1; i < count; i++) {
-		Ast *next = ast_app_new(current, items[i]);
-		if (next == NULL) {
-			ast_free(current);
-			for (; i < count; i++) {
-				ast_free(items[i]);
-			}
-			err_set("out of memory");
-			return NULL;
-		}
-		current = next;
-	}
-
-	return current;
-}
-
-static Ast *parse_indexed_args(Parser *parser, Ast *base) {
-	Ast **items = NULL;
-	size_t count = 0;
-	size_t capacity = 0;
-	Ast *result = NULL;
-
-	if (!parser_expect(parser, TOK_LPAREN, "expected '('")) {
-		ast_free(base);
-		return NULL;
-	}
-
-	for (;;) {
-		Ast *item;
-		Ast **new_items;
-
-		item = parse_term(parser);
-		if (item == NULL) {
-			goto fail;
-		}
-
-		if (count == capacity) {
-			size_t new_capacity = capacity == 0 ? 4 : capacity * 2;
-			new_items = (Ast **)realloc(items, new_capacity * sizeof(*new_items));
-			if (new_items == NULL) {
-				ast_free(item);
-				err_set("out of memory");
-				goto fail;
-			}
-			items = new_items;
-			capacity = new_capacity;
-		}
-
-		items[count++] = item;
-
-		if (parser->lexer.current.kind == TOK_COMMA) {
-			parser_advance(parser);
-			continue;
-		}
-		break;
-	}
-
-	if (!parser_expect(parser, TOK_RPAREN, "expected ')' after index list")) {
-		goto fail;
-	}
-
-	result = make_indexed_call_from_base(base, items, count);
-	free(items);
-	return result;
-
-fail:
-	ast_free(base);
-	for (size_t i = 0; i < count; i++) {
-		ast_free(items[i]);
-	}
-	free(items);
-	return NULL;
-}
-
 static Ast *parse_atom(Parser *parser) {
 	Ast *node;
 	char *name;
 
 	switch (parser->lexer.current.kind) {
-	case TOK_IDENT: {
-		Lexer lookahead;
-
+	case TOK_IDENT:
 		name = dup_range(parser->lexer.current.start, parser->lexer.current.length);
 		if (name == NULL) {
 			err_set("out of memory");
@@ -663,35 +660,9 @@ static Ast *parse_atom(Parser *parser) {
 			err_set("out of memory");
 			return NULL;
 		}
-
-		lookahead = parser->lexer;
-		if (parser->lexer.current.kind == TOK_LPAREN &&
-		    (ident_ends_with_underscore(name) || lexer_paren_has_top_level_comma(lookahead))) {
-			Ast *base = node;
-			if (ident_ends_with_underscore(name)) {
-				char *trimmed = dup_range(name, strlen(name) - 1);
-				if (trimmed == NULL) {
-					ast_free(base);
-					free(name);
-					err_set("out of memory");
-					return NULL;
-				}
-				ast_free(base);
-				base = ast_var_new(trimmed);
-				free(trimmed);
-				if (base == NULL) {
-					free(name);
-					err_set("out of memory");
-					return NULL;
-				}
-			}
-			free(name);
-			return parse_indexed_args(parser, base);
-		}
-
+		node = try_parse_paren_subscript_suffix(parser, name, node);
 		free(name);
 		return node;
-	}
 
 	case TOK_NUMBER:
 		node = ast_number_new(parser->lexer.current.number);
@@ -998,15 +969,18 @@ static Ast *parse_implication(Parser *parser) {
 	return left;
 }
 
-static Ast *parse_iff(Parser *parser) {
+static Ast *parse_equiv_or_iff(Parser *parser) {
 	Ast *left = parse_implication(parser);
 
 	if (left == NULL) {
 		return NULL;
 	}
 
-	while (parser->lexer.current.kind == TOK_IFF) {
+	while (parser->lexer.current.kind == TOK_IFF ||
+	       parser->lexer.current.kind == TOK_EQUIV) {
+		TokenKind op = parser->lexer.current.kind;
 		Ast *right;
+		const char *name;
 
 		parser_advance(parser);
 		right = parse_implication(parser);
@@ -1015,7 +989,8 @@ static Ast *parse_iff(Parser *parser) {
 			return NULL;
 		}
 
-		left = make_binary_call("IFF", left, right);
+		name = op == TOK_IFF ? "IFF" : "EQUIV";
+		left = make_binary_call(name, left, right);
 		if (left == NULL) {
 			return NULL;
 		}
@@ -1029,7 +1004,7 @@ static Ast *parse_term(Parser *parser) {
 		return parse_abstraction(parser);
 	}
 
-	return parse_iff(parser);
+	return parse_equiv_or_iff(parser);
 }
 
 Ast *parser_parse_expr(const char *source) {

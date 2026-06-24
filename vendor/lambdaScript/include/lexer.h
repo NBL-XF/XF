@@ -18,6 +18,7 @@ typedef enum {
 	TOK_OR,
 	TOK_IMPLIES,
 	TOK_IFF,
+	TOK_EQUIV,
 	TOK_PLUS,
 	TOK_MINUS,
 	TOK_STAR,

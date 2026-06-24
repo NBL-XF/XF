@@ -179,8 +179,6 @@ run_case \
 [steps=2]' \
 	"$BIN" -t -e '(\x.x) ((\y.y) z)'
 
-# tests/test.sh
-
 run_stdin_case \
 	"definition-lhs-must-be-bare-identifier" \
 	1 \
@@ -200,6 +198,42 @@ B = \x.x
 A
 ' \
 	"$BIN" --no-prelude
+
+run_case \
+	"math-ascii-aliases" \
+	0 \
+	'cons 4 (cons 1 (cons ∞ (cons ∞ (cons 5 (cons 1 nil)))))' \
+	'' \
+	"$BIN" -q tests/math_ascii_aliases.lambda
+
+run_case \
+	"math-ops" \
+	0 \
+	'cons 7 (cons 512 (cons 4 (cons 1 (cons 2 (cons 42 nil)))))' \
+	'' \
+	"$BIN" -q tests/math_ops.lambda
+
+run_case \
+	"math-forms" \
+	0 \
+	'cons (sigma 0 3 (\x0.ADD x0 1)) (cons (integral 0 1 (\x0.POW x0 2)) (cons (limit 0 (\x0.DIV (sin x0) x0)) (cons (elem a SET) (cons (contains SET a) (cons (elem a SET) (cons (contains SET a) nil))))))' \
+	'' \
+	"$BIN" -q tests/math_forms.lambda
+
+run_case \
+	"subscripts" \
+	0 \
+	'cons (sub N e) (cons (sub N e) (cons (sub N i j) (cons (sub N i j) (cons 0.5 (cons (sigma 0 n (\x0.sub x x0)) nil)))))' \
+	'' \
+	"$BIN" -q tests/subscripts.lambda
+
+run_case \
+	"torture" \
+	0 \
+	'cons True (cons True (cons True (cons ALPHA (cons BETA (cons (STEP (STEP (STEP START))) (cons (STEP (STEP (STEP (STEP (STEP ZERO_SYMBOL))))) (cons (STEP (STEP (STEP (STEP (STEP (STEP ZERO_SYMBOL)))))) (cons (STEP (STEP (STEP ZERO_SYMBOL))) (cons True (cons (STEP (STEP (STEP (STEP (STEP (STEP ZERO_SYMBOL)))))) (cons UNICODE_OK nil)))))))))))' \
+	'' \
+	"$BIN" -q tests/torture.lambda
+
 printf '\n'
 printf 'passed: %d\n' "$PASS"
 printf 'failed: %d\n' "$FAIL"

@@ -131,6 +131,67 @@ static Value *beta_reduce(const Value *body, const Value *arg) {
 	return result;
 }
 
+
+static int value_structural_equal(const Value *left, const Value *right) {
+	if (left == right) {
+		return 1;
+	}
+	if (left == NULL || right == NULL) {
+		return 0;
+	}
+	if (left->kind != right->kind) {
+		return 0;
+	}
+
+	switch (left->kind) {
+	case VALUE_BOUND_VAR:
+		return left->as.bound_var.index == right->as.bound_var.index;
+
+	case VALUE_FREE_VAR:
+		return strcmp(left->as.free_var.name, right->as.free_var.name) == 0;
+
+	case VALUE_LAM:
+		return value_structural_equal(left->as.lam.body, right->as.lam.body);
+
+	case VALUE_APP:
+		return value_structural_equal(left->as.app.fn, right->as.app.fn) &&
+		       value_structural_equal(left->as.app.arg, right->as.app.arg);
+
+	case VALUE_NUMBER:
+		if (isnan(left->as.number.value) && isnan(right->as.number.value)) {
+			return 1;
+		}
+		return left->as.number.value == right->as.number.value;
+	}
+
+	return 0;
+}
+
+static Value *value_church_boolean(int truthy) {
+	Value *branch;
+	Value *inner;
+
+	branch = value_bound_var_new(truthy ? 1 : 0);
+	if (branch == NULL) {
+		return NULL;
+	}
+
+	inner = value_lam_new(branch);
+	if (inner == NULL) {
+		value_free(branch);
+		return NULL;
+	}
+
+	return value_lam_new(inner);
+}
+
+static int is_equiv_name(const char *name) {
+	return strcmp(name, "EQUIV") == 0 ||
+	       strcmp(name, "equiv") == 0 ||
+	       strcmp(name, "EQ") == 0 ||
+	       strcmp(name, "eq") == 0;
+}
+
 static Value *apply_binary_primitive(const char *name, double left, double right) {
 	if (strcmp(name, "ADD") == 0) {
 		return value_number_new(left + right);
@@ -178,15 +239,18 @@ static Value *try_reduce_primitive(const Value *term) {
 	head = term->as.app.fn;
 	right = term->as.app.arg;
 
-	if (head->kind == VALUE_APP &&
-	    head->as.app.fn->kind == VALUE_FREE_VAR &&
-	    head->as.app.arg->kind == VALUE_NUMBER &&
-	    right->kind == VALUE_NUMBER) {
-		return apply_binary_primitive(
-			head->as.app.fn->as.free_var.name,
-			head->as.app.arg->as.number.value,
-			right->as.number.value
-		);
+	if (head->kind == VALUE_APP && head->as.app.fn->kind == VALUE_FREE_VAR) {
+		if (is_equiv_name(head->as.app.fn->as.free_var.name)) {
+			return value_church_boolean(value_structural_equal(head->as.app.arg, right));
+		}
+
+		if (head->as.app.arg->kind == VALUE_NUMBER && right->kind == VALUE_NUMBER) {
+			return apply_binary_primitive(
+				head->as.app.fn->as.free_var.name,
+				head->as.app.arg->as.number.value,
+				right->as.number.value
+			);
+		}
 	}
 
 	if (head->kind == VALUE_FREE_VAR && right->kind == VALUE_NUMBER) {
