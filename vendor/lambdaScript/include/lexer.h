@@ -12,6 +12,7 @@ typedef enum {
 	TOK_DOT,
 	TOK_LPAREN,
 	TOK_RPAREN,
+	TOK_COMMA,
 	TOK_NOT,
 	TOK_AND,
 	TOK_OR,

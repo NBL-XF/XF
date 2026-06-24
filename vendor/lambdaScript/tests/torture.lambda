@@ -1,0 +1,51 @@
+; tests/torture.lambda
+; LambdaScript torture test for the currently working core:
+; - ASCII and Unicode lambdas
+; - top-level definitions
+; - ASCII and Unicode logic aliases
+; - Church booleans, pairs, numerals, predecessor, equality
+; - fixed-point recursion (factorial)
+; - deep nested application in the final expression
+
+CONS = \h.\t.cons h t
+NIL = nil
+
+SHOW = \b.b True False
+
+PAIR = \a.\b.\f.f a b
+FIRST = \p.p (\a.\b.a)
+SECOND = \p.p (\a.\b.b)
+
+ZERO = \f.\x.x
+ONE = \f.\x.f x
+TWO = \f.\x.f (f x)
+THREE = \f.\x.f (f (f x))
+FOUR = \f.\x.f (f (f (f x)))
+
+SUCC = \n.\f.\x.f (n f x)
+PLUS = \m.\n.\f.\x.m f (n f x)
+MULT = \m.\n.\f.m (n f)
+PRED = \n.\f.\x.n (\g.\h.h (g f)) (\u.x) (\u.u)
+SUB = \m.\n.n PRED m
+ISZERO = \n.n (\x.FALSE) TRUE
+LEQ = \m.\n.ISZERO (SUB m n)
+NUM_EQ = \m.\n.AND (LEQ m n) (LEQ n m)
+
+Y = \fnx.(\self.fnx (self self)) (\self.fnx (self self))
+FACTF = \fact.\n.(ISZERO n) ONE (MULT n (fact (PRED n)))
+FACT = Y FACTF
+
+R1 = SHOW (TRUE ^ ⌐ FALSE)
+R2 = SHOW (TRUE ↔ TRUE)
+R3 = SHOW (¬ FALSE ≣ TRUE)
+R4 = FIRST (PAIR ALPHA BETA)
+R5 = SECOND (PAIR ALPHA BETA)
+R6 = THREE STEP START
+R7 = PLUS TWO THREE STEP ZERO_SYMBOL
+R8 = MULT TWO THREE STEP ZERO_SYMBOL
+R9 = PRED FOUR STEP ZERO_SYMBOL
+R10 = SHOW (NUM_EQ TWO (PRED THREE))
+R11 = FACT THREE STEP ZERO_SYMBOL
+R12 = (λid.id) UNICODE_OK
+
+CONS R1 (CONS R2 (CONS R3 (CONS R4 (CONS R5 (CONS R6 (CONS R7 (CONS R8 (CONS R9 (CONS R10 (CONS R11 (CONS R12 NIL)))))))))))

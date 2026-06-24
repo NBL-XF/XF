@@ -389,25 +389,306 @@ static const char *find_unresolved_def_ref(const Value *value, const Program *pr
 	return NULL;
 }
 
-static Value *lower_ast_with_defs(const Ast *ast, SymTable *env, const DefValue *defs) {
+
+static int utf8_decode_one(const unsigned char *s, size_t len, unsigned int *cp, size_t *used) {
+	if (len == 0) {
+		return 0;
+	}
+
+	if (s[0] < 0x80) {
+		*cp = s[0];
+		*used = 1;
+		return 1;
+	}
+
+	if ((s[0] & 0xE0) == 0xC0 && len >= 2) {
+		*cp = ((unsigned int)(s[0] & 0x1F) << 6) |
+		      (unsigned int)(s[1] & 0x3F);
+		*used = 2;
+		return 1;
+	}
+
+	if ((s[0] & 0xF0) == 0xE0 && len >= 3) {
+		*cp = ((unsigned int)(s[0] & 0x0F) << 12) |
+		      ((unsigned int)(s[1] & 0x3F) << 6) |
+		      (unsigned int)(s[2] & 0x3F);
+		*used = 3;
+		return 1;
+	}
+
+	if ((s[0] & 0xF8) == 0xF0 && len >= 4) {
+		*cp = ((unsigned int)(s[0] & 0x07) << 18) |
+		      ((unsigned int)(s[1] & 0x3F) << 12) |
+		      ((unsigned int)(s[2] & 0x3F) << 6) |
+		      (unsigned int)(s[3] & 0x3F);
+		*used = 4;
+		return 1;
+	}
+
+	return 0;
+}
+
+static int decode_subscript_codepoint(unsigned int cp, char *out) {
+	switch (cp) {
+	case 0x2080: *out = '0'; return 1;
+	case 0x2081: *out = '1'; return 1;
+	case 0x2082: *out = '2'; return 1;
+	case 0x2083: *out = '3'; return 1;
+	case 0x2084: *out = '4'; return 1;
+	case 0x2085: *out = '5'; return 1;
+	case 0x2086: *out = '6'; return 1;
+	case 0x2087: *out = '7'; return 1;
+	case 0x2088: *out = '8'; return 1;
+	case 0x2089: *out = '9'; return 1;
+	case 0x2090: *out = 'a'; return 1; /* ₐ */
+	case 0x2091: *out = 'e'; return 1; /* ₑ */
+	case 0x2095: *out = 'h'; return 1; /* ₕ */
+	case 0x1D62: *out = 'i'; return 1; /* ᵢ */
+	case 0x2C7C: *out = 'j'; return 1; /* ⱼ */
+	case 0x2096: *out = 'k'; return 1; /* ₖ */
+	case 0x2097: *out = 'l'; return 1; /* ₗ */
+	case 0x2098: *out = 'm'; return 1; /* ₘ */
+	case 0x2099: *out = 'n'; return 1; /* ₙ */
+	case 0x2092: *out = 'o'; return 1; /* ₒ */
+	case 0x209A: *out = 'p'; return 1; /* ₚ */
+	case 0x1D63: *out = 'r'; return 1; /* ᵣ */
+	case 0x209B: *out = 's'; return 1; /* ₛ */
+	case 0x209C: *out = 't'; return 1; /* ₜ */
+	case 0x1D64: *out = 'u'; return 1; /* ᵤ */
+	case 0x1D65: *out = 'v'; return 1; /* ᵥ */
+	case 0x2093: *out = 'x'; return 1; /* ₓ */
+	default:
+		return 0;
+	}
+}
+
+static int decode_subscript_string(const char *name, char *out, size_t out_cap) {
+	const unsigned char *p = (const unsigned char *)name;
+	size_t len = strlen(name);
+	size_t pos = 0;
+	size_t out_len = 0;
+
+	while (pos < len) {
+		unsigned int cp;
+		size_t used;
+		if (!utf8_decode_one(p + pos, len - pos, &cp, &used)) {
+			return 0;
+		}
+		if (out_len + 1 >= out_cap || !decode_subscript_codepoint(cp, &out[out_len])) {
+			return 0;
+		}
+		out_len++;
+		pos += used;
+	}
+
+	if (out_len == 0) {
+		return 0;
+	}
+
+	out[out_len] = '\0';
+	return 1;
+}
+
+static int name_has_unicode_subscript_suffix(const char *name, size_t *base_len, char *decoded, size_t decoded_cap) {
+	const unsigned char *p = (const unsigned char *)name;
+	size_t len = strlen(name);
+	size_t pos = 0;
+	size_t first_sub = len;
+
+	while (pos < len) {
+		unsigned int cp;
+		size_t used;
+		char ch;
+		if (!utf8_decode_one(p + pos, len - pos, &cp, &used)) {
+			return 0;
+		}
+		if (decode_subscript_codepoint(cp, &ch)) {
+			first_sub = pos;
+			break;
+		}
+		pos += used;
+	}
+
+	if (first_sub == len || first_sub == 0) {
+		return 0;
+	}
+
+	if (!decode_subscript_string(name + first_sub, decoded, decoded_cap)) {
+		return 0;
+	}
+
+	*base_len = first_sub;
+	return 1;
+}
+
+static int is_ascii_digits_text(const char *text) {
+	size_t i;
+	if (text == NULL || text[0] == '\0') {
+		return 0;
+	}
+	for (i = 0; text[i] != '\0'; i++) {
+		if (!(text[i] >= '0' && text[i] <= '9')) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static int is_simple_ascii_sub_index(const char *suffix) {
+	size_t len;
+	if (suffix == NULL || suffix[0] == '\0') {
+		return 0;
+	}
+	len = strlen(suffix);
+	if (is_ascii_digits_text(suffix)) {
+		return 1;
+	}
+	return len == 1 && ((suffix[0] >= 'A' && suffix[0] <= 'Z') ||
+	                    (suffix[0] >= 'a' && suffix[0] <= 'z'));
+}
+
+static Value *value_app_take(Value *fn, Value *arg) {
+	Value *app = value_app_new(fn, arg);
+	if (app == NULL) {
+		value_free(fn);
+		value_free(arg);
+	}
+	return app;
+}
+
+static Value *lower_name_reference(const char *name, SymTable *env, const DefValue *defs);
+
+static Value *build_sub_reference(const char *base_name, const char *index_name, SymTable *env, const DefValue *defs) {
+	Value *sub_ref = value_free_var_new("sub");
+	Value *base_ref;
+	Value *index_ref;
+	Value *partial;
+
+	if (sub_ref == NULL) {
+		err_set("out of memory");
+		return NULL;
+	}
+
+	base_ref = lower_name_reference(base_name, env, defs);
+	if (base_ref == NULL) {
+		value_free(sub_ref);
+		return NULL;
+	}
+
+	partial = value_app_take(sub_ref, base_ref);
+	if (partial == NULL) {
+		err_set("out of memory");
+		return NULL;
+	}
+
+	if (is_ascii_digits_text(index_name)) {
+		index_ref = value_number_new(strtod(index_name, NULL));
+	} else {
+		index_ref = lower_name_reference(index_name, env, defs);
+	}
+	if (index_ref == NULL) {
+		value_free(partial);
+		return NULL;
+	}
+
+	partial = value_app_take(partial, index_ref);
+	if (partial == NULL) {
+		err_set("out of memory");
+		return NULL;
+	}
+
+	return partial;
+}
+
+static Value *try_lower_subscript_name(const char *name, SymTable *env, const DefValue *defs) {
+	char decoded[128];
+	size_t base_len;
+	char *base = NULL;
+	char *suffix = NULL;
+	const char *underscore;
+
+	if (name == NULL || name[0] == '\0') {
+		return NULL;
+	}
+
+	if (decode_subscript_string(name, decoded, sizeof(decoded))) {
+		if (is_ascii_digits_text(decoded)) {
+			return value_number_new(strtod(decoded, NULL));
+		}
+		return lower_name_reference(decoded, env, defs);
+	}
+
+	if (name_has_unicode_subscript_suffix(name, &base_len, decoded, sizeof(decoded))) {
+		base = (char *)malloc(base_len + 1);
+		if (base == NULL) {
+			err_set("out of memory");
+			return NULL;
+		}
+		memcpy(base, name, base_len);
+		base[base_len] = '\0';
+		Value *result = build_sub_reference(base, decoded, env, defs);
+		free(base);
+		return result;
+	}
+
+	underscore = strrchr(name, '_');
+	if (underscore != NULL && underscore != name && underscore[1] != '\0' && strchr(underscore + 1, '_') == NULL) {
+		suffix = value_strdup(underscore + 1);
+		if (suffix == NULL) {
+			err_set("out of memory");
+			return NULL;
+		}
+		if (is_simple_ascii_sub_index(suffix)) {
+			base = (char *)malloc((size_t)(underscore - name) + 1);
+			if (base == NULL) {
+				free(suffix);
+				err_set("out of memory");
+				return NULL;
+			}
+			memcpy(base, name, (size_t)(underscore - name));
+			base[underscore - name] = '\0';
+			Value *result = build_sub_reference(base, suffix, env, defs);
+			free(base);
+			free(suffix);
+			return result;
+		}
+		free(suffix);
+	}
+
+	return NULL;
+}
+
+static Value *lower_name_reference(const char *name, SymTable *env, const DefValue *defs) {
 	size_t index;
 	Value *resolved;
+	Value *special;
+
+	if (sym_table_lookup(env, name, &index)) {
+		return value_bound_var_new(index);
+	}
+
+	resolved = def_values_lookup(defs, name);
+	if (resolved != NULL) {
+		return value_clone(resolved);
+	}
+
+	special = try_lower_subscript_name(name, env, defs);
+	if (special != NULL) {
+		return special;
+	}
+
+	return value_free_var_new(name);
+}
+
+
+static Value *lower_ast_with_defs(const Ast *ast, SymTable *env, const DefValue *defs) {
 	Value *body;
 	Value *fn;
 	Value *arg;
 
 	switch (ast->kind) {
 	case AST_VAR:
-		if (sym_table_lookup(env, ast->as.var.name, &index)) {
-			return value_bound_var_new(index);
-		}
-
-		resolved = def_values_lookup(defs, ast->as.var.name);
-		if (resolved != NULL) {
-			return value_clone(resolved);
-		}
-
-		return value_free_var_new(ast->as.var.name);
+		return lower_name_reference(ast->as.var.name, env, defs);
 
 	case AST_LAM:
 		if (!sym_table_push(env, ast->as.lam.param)) {

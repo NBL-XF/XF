@@ -355,6 +355,11 @@ void lexer_next(Lexer *lexer) {
 		lexer->current.length = 1;
 		lexer->pos++;
 		return;
+	case ',':
+		lexer->current.kind = TOK_COMMA;
+		lexer->current.length = 1;
+		lexer->pos++;
+		return;
 	case '~':
 		lexer->current.kind = TOK_NOT;
 		lexer->current.length = 1;
