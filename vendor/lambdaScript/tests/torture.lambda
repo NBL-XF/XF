@@ -7,8 +7,7 @@
 ; - fixed-point recursion (factorial)
 ; - deep nested application in the final expression
 
-CONS = \h.\t.cons h t
-NIL = nil
+MK = \h.\t.cons h t
 
 SHOW = \b.b True False
 
@@ -48,4 +47,5 @@ R10 = SHOW (NUM_EQ TWO (PRED THREE))
 R11 = FACT THREE STEP ZERO_SYMBOL
 R12 = (λid.id) UNICODE_OK
 
-CONS R1 (CONS R2 (CONS R3 (CONS R4 (CONS R5 (CONS R6 (CONS R7 (CONS R8 (CONS R9 (CONS R10 (CONS R11 (CONS R12 NIL)))))))))))
+R = MK R1 (MK R2 (MK R3 (MK R4 (MK R5 (MK R6 (MK R7 (MK R8 (MK R9 (MK R10 (MK R11 (MK R12 nil)))))))))))
+R

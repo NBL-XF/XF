@@ -4,5 +4,5 @@ C = √16
 D = ㏑ ℯ
 E = 10 % 4
 x₀ = 41
-x₀ += 1
-cons A (cons B (cons C (cons D (cons E (cons x₀ nil)))))
+x₁ = x₀ + 1
+cons A (cons B (cons C (cons D (cons E (cons x₁ nil)))))

@@ -1,9 +1,4 @@
 SHOW = \b.b True False
-NOT = \p.p FALSE TRUE
-AND = \p q.p q FALSE
-OR = \p q.p TRUE q
-IMP = \p q.OR (NOT p) q
-IFF = \p q.AND (IMP p q) (IMP q p)
 
 A = ~~~~~~~~~~~~~~~TRUE
 B = ¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬FALSE
@@ -15,10 +10,10 @@ F = ~¬⌐~¬⌐~¬⌐TRUE
 
 G = TRUE ^ TRUE
 H = TRUE ∧ TRUE
-I = FALSE v TRUE
+I0 = FALSE v TRUE
 J = FALSE ∨ TRUE
 
-K = (TRUE ^ TRUE) ∧ (FALSE v TRUE)
+K0 = (TRUE ^ TRUE) ∧ (FALSE v TRUE)
 L = (FALSE ∨ FALSE) v (TRUE ∧ TRUE)
 M = TRUE ^ TRUE ∧ TRUE
 N = FALSE v FALSE ∨ TRUE
@@ -26,8 +21,8 @@ N = FALSE v FALSE ∨ TRUE
 O = TRUE -> TRUE
 P = FALSE → TRUE
 Q = TRUE <-> TRUE
-R = FALSE ↔ FALSE
-S = TRUE <=> TRUE
+R0 = FALSE ↔ FALSE
+S0 = TRUE <=> TRUE
 T = TRUE ≡ TRUE
 U = TRUE ≣ TRUE
 
@@ -37,29 +32,5 @@ X = ¬¬¬¬¬¬¬¬¬¬¬¬¬¬¬(FALSE ∨ TRUE)
 Y = ~¬⌐~¬⌐(TRUE -> FALSE)
 Z = ⌐⌐⌐⌐(TRUE <-> TRUE)
 
-cons (SHOW A)
-(cons (SHOW B)
-(cons (SHOW C)
-(cons (SHOW D)
-(cons (SHOW E)
-(cons (SHOW F)
-(cons (SHOW G)
-(cons (SHOW H)
-(cons (SHOW I)
-(cons (SHOW J)
-(cons (SHOW K)
-(cons (SHOW L)
-(cons (SHOW M)
-(cons (SHOW N)
-(cons (SHOW O)
-(cons (SHOW P)
-(cons (SHOW Q)
-(cons (SHOW R)
-(cons (SHOW S)
-(cons (SHOW T)
-(cons (SHOW U)
-(cons (SHOW V)
-(cons (SHOW W)
-(cons (SHOW X)
-(cons (SHOW Y)
-(cons (SHOW Z) nil))))))))))))))))))))))))))
+R = cons (SHOW A) (cons (SHOW B) (cons (SHOW C) (cons (SHOW D) (cons (SHOW E) (cons (SHOW F) (cons (SHOW G) (cons (SHOW H) (cons (SHOW I0) (cons (SHOW J) (cons (SHOW K0) (cons (SHOW L) (cons (SHOW M) (cons (SHOW N) (cons (SHOW O) (cons (SHOW P) (cons (SHOW Q) (cons (SHOW R0) (cons (SHOW S0) (cons (SHOW T) (cons (SHOW U) (cons (SHOW V) (cons (SHOW W) (cons (SHOW X) (cons (SHOW Y) (cons (SHOW Z) nil)))))))))))))))))))))))))
+R
