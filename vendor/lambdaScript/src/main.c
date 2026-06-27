@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 extern char *ls_read_all_stream(FILE *fp);
 
@@ -21,6 +23,112 @@ static int parse_step_limit(const char *text, size_t *out) {
 	return 1;
 }
 
+static char *main_strdup(const char *src) {
+	size_t len;
+	char *copy;
+
+	if (src == NULL) {
+		return NULL;
+	}
+
+	len = strlen(src);
+	copy = (char *)malloc(len + 1);
+	if (copy == NULL) {
+		return NULL;
+	}
+
+	memcpy(copy, src, len + 1);
+	return copy;
+}
+
+static char *join_path(const char *left, const char *right) {
+	size_t llen = strlen(left);
+	size_t rlen = strlen(right);
+	char *path = (char *)malloc(llen + 1 + rlen + 1);
+
+	if (path == NULL) {
+		return NULL;
+	}
+
+	memcpy(path, left, llen);
+	path[llen] = '/';
+	memcpy(path + llen + 1, right, rlen);
+	path[llen + 1 + rlen] = '\0';
+	return path;
+}
+
+static int ensure_directory_exists(const char *path) {
+	char *copy;
+	char *p;
+
+	if (path == NULL || path[0] == '\0') {
+		return 0;
+	}
+
+	copy = main_strdup(path);
+	if (copy == NULL) {
+		return 0;
+	}
+
+	for (p = copy + 1; *p != '\0'; p++) {
+		struct stat st;
+
+		if (*p != '/') {
+			continue;
+		}
+
+		*p = '\0';
+		if (copy[0] != '\0' && stat(copy, &st) != 0) {
+			if (mkdir(copy, 0755) != 0 && errno != EEXIST) {
+				free(copy);
+				return 0;
+			}
+		}
+		*p = '/';
+	}
+
+	{
+		struct stat st;
+
+		if (stat(copy, &st) != 0) {
+			if (mkdir(copy, 0755) != 0 && errno != EEXIST) {
+				free(copy);
+				return 0;
+			}
+		}
+	}
+
+	free(copy);
+	return 1;
+}
+
+static char *default_library_dir(void) {
+	const char *override = getenv("LAMBDASCRIPT_LIB_DIR");
+	const char *xdg = getenv("XDG_DATA_HOME");
+	const char *home = getenv("HOME");
+	char *path;
+
+	if (override != NULL && override[0] != '\0') {
+		return main_strdup(override);
+	}
+
+	if (xdg != NULL && xdg[0] != '\0') {
+		path = join_path(xdg, "lambdascript/lib");
+		if (path != NULL) {
+			return path;
+		}
+	}
+
+	if (home != NULL && home[0] != '\0') {
+		path = join_path(home, ".lambdascript/lib");
+		if (path != NULL) {
+			return path;
+		}
+	}
+
+	return main_strdup(".lambdascript/lib");
+}
+
 static void usage(const char *argv0) {
 	fprintf(stderr, "usage: %s [-q] [-t] [-n STEPS] [-e EXPR] [FILE] [-- ARGS...]\n", argv0);
 	fprintf(stderr, "\n");
@@ -36,6 +144,8 @@ static void usage(const char *argv0) {
 	fprintf(stderr, "program format:\n");
 	fprintf(stderr, "  one definition per line: NAME = EXPR\n");
 	fprintf(stderr, "  final non-definition line is the program expression\n");
+	fprintf(stderr, "  imports: import {LIB} for official libs, import \"path/to/file\" for user files\n");
+	fprintf(stderr, "  official libs live in $LAMBDASCRIPT_LIB_DIR or ~/.lambdascript/lib\n");
 	fprintf(stderr, "  script args are exposed as ARG1, ARG2, ..., ARGC, and ARGS\n");
 	fprintf(stderr, "  logic aliases: ~ or ⌐ or ¬, -> or →, <-> or <=> or ↔ or ≣\n");
 	fprintf(stderr, "  math aliases: sqrt or √, ln or ㏑, inf or infinity or ∞, euler or ℯ\n");
@@ -48,6 +158,8 @@ static void usage(const char *argv0) {
 	fprintf(stderr, "  %s -e 'ID = \\\\x.x\nID z'\n", argv0);
 	fprintf(stderr, "  %s file.ls alpha beta\n", argv0);
 	fprintf(stderr, "  %s -e 'ARG1' -- alpha\n", argv0);
+	fprintf(stderr, "  %s -e 'import {math}\\nmath_id'\n", argv0);
+	fprintf(stderr, "  %s -e 'import \"./shared/list.ls\"\\nmain'\n", argv0);
 }
 
 
@@ -57,6 +169,7 @@ int main(int argc, char **argv) {
 	const char *const *script_argv = NULL;
 	size_t script_argc = 0;
 	char *stdin_source = NULL;
+	char *library_dir = NULL;
 	ls_State *L = NULL;
 	ls_Options options;
 	ls_Result result;
@@ -138,8 +251,20 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
+	library_dir = default_library_dir();
+	if (library_dir == NULL) {
+		fprintf(stderr, "fatal: out of memory\n");
+		return 1;
+	}
+	if (!ensure_directory_exists(library_dir)) {
+		fprintf(stderr, "fatal: failed to create library store '%s'\n", library_dir);
+		free(library_dir);
+		return 1;
+	}
+
 	options.argc = script_argc;
 	options.argv = script_argv;
+	options.library_dir = library_dir;
 	if (expr != NULL) {
 		options.source_name = "<eval>";
 	} else if (file_path != NULL) {

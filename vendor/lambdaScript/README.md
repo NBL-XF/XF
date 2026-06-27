@@ -19,7 +19,7 @@ Today that surface layer includes:
 * numeric literals and arithmetic operators
 * symbolic math forms such as `Σ`, `∫`, and `lim`
 * actionable subscripts such as `Nₑ`, `N_e`, `N(ᵢ,ⱼ)`, and `N_(i,j)`
-* set-style membership syntax such as `x ∈ S` and `S ∋ x`
+* quantifiers and set-style membership syntax such as `forall x : P x`, `x ∈ S`, and `S ∋ x`
 
 ## Table of Contents
 
@@ -105,7 +105,7 @@ Build with your project Makefile, then run the binary.
 Typical local run:
 
 ```sh
-./lambdaScript -q -e 'I z'
+./bin/lambdaScript -q -e 'I z'
 ```
 
 Expected:
@@ -117,7 +117,7 @@ z
 Run a file:
 
 ```sh
-./lambdaScript -q tests/ops.lambda
+./bin/lambdaScript -q tests/ops.lambda
 ```
 
 Expected:
@@ -135,7 +135,7 @@ make test
 ## CLI Usage
 
 ```text
-./lambdaScript [-q] [-t] [-n STEPS] [-e EXPR] [FILE] [-- ARGS...]
+./bin/lambdaScript [-q] [-t] [-n STEPS] [-e EXPR] [FILE] [-- ARGS...]
 ```
 
 Options:
@@ -153,11 +153,11 @@ Options:
 Examples:
 
 ```sh
-./lambdaScript -q -e 'I z'
-./lambdaScript -t -e '(\x.x) z'
-./lambdaScript -n 1000000 -q tests/torture.lambda
-./lambdaScript -q -e 'ARG1' -- alpha
-cat tests/ops.lambda | ./lambdaScript -q
+./bin/lambdaScript -q -e 'I z'
+./bin/lambdaScript -t -e '(\x.x) z'
+./bin/lambdaScript -n 1000000 -q tests/torture.lambda
+./bin/lambdaScript -q -e 'ARG1' -- alpha
+cat tests/ops.lambda | ./bin/lambdaScript -q
 ```
 
 ### Script arguments
@@ -167,7 +167,7 @@ Anything after `--` is exposed to the program as `ARG1`, `ARG2`, ..., `ARGC`, an
 Example:
 
 ```sh
-./lambdaScript -q -e 'ARG1' -- alpha
+./bin/lambdaScript -q -e 'ARG1' -- alpha
 ```
 
 Expected:
@@ -186,7 +186,7 @@ ID hello
 Run:
 
 ```sh
-./lambdaScript -q first.lambda
+./bin/lambdaScript -q first.lambda
 ```
 
 Expected:
@@ -694,9 +694,33 @@ lim x -> a . expr        -> limit a (\x.expr)
 
 These are ideal for symbolic models and readable math pipelines.
 
-### Membership syntax
+### Quantifiers and membership syntax
 
-LambdaScript also supports set-style membership syntax.
+LambdaScript supports both Unicode and ASCII forms for quantified logic and set-style membership.
+
+Quantifiers now prefer `:` as the body separator:
+
+```ls
+forall x : P x
+exists x : P x
+∀ x : P x
+∃ x : P x
+Ǝ x : P x
+ǝ x : P x
+```
+
+Bounded forms:
+
+```ls
+forall x in S : P x
+exists x in S : P x
+∀ x ∈ S : P x
+∃ x ∈ S : P x
+```
+
+Compatibility note: older files using `.` or `,` after the quantifier binder still parse, but `:` is the preferred form.
+
+Membership forms:
 
 Unicode:
 
@@ -710,20 +734,55 @@ ASCII:
 
 ```ls
 x in S
+x memberof S
+x memberOf S
+x elementof S
+x elemof S
 S contains x
+S hasmember x
 ```
 
 Current lowering shape:
 
 ```text
-x ∈ S        -> elem x S
-x in S       -> elem x S
-S ∋ x        -> contains S x
-S ∍ x        -> contains S x
-S contains x -> contains S x
+forall x : expr              -> forall BOOLS (\x.expr)
+exists x : expr              -> exists BOOLS (\x.expr)
+forall x in S : expr         -> forall S (\x.expr)
+exists x in S : expr         -> exists S (\x.expr)
+∀ x ∈ S : expr               -> forall S (\x.expr)
+∃ x ∈ S : expr               -> exists S (\x.expr)
+
+x ∈ S                        -> elem x S
+x in S                       -> elem x S
+x memberof S                 -> elem x S
+x memberOf S                 -> elem x S
+x elementof S                -> elem x S
+x elemof S                   -> elem x S
+S ∋ x                        -> contains S x
+S ∍ x                        -> contains S x
+S contains x                 -> contains S x
+S hasmember x                -> contains S x
 ```
 
-If you define `elem` or `contains` as real predicates, these can compute to Church booleans. Otherwise they remain symbolic forms.
+Runtime notes:
+
+* `elem` and `contains` reduce as real membership predicates.
+* `forall` and `exists` reduce over finite list/set-like domains.
+* unbounded `forall x : ...` and `exists x : ...` use `BOOLS` as the default domain.
+
+Example:
+
+```ls
+SHOW = \b.b True False
+A = \t f.t
+SET = \x.OR (x TRUE FALSE) FALSE
+XS = CONS A (CONS A NIL)
+P_MEMBER = \x.elem x SET
+
+CONS (SHOW (A ∈ SET))
+  (CONS (SHOW (∀ x in XS : P_MEMBER x))
+    (CONS (SHOW (∃ x in XS : P_MEMBER x)) NIL))
+```
 
 ### Actionable subscripts
 
@@ -813,7 +872,7 @@ This enables experiments such as factorial, countdown, and recursive tree walks.
 Use recursion carefully. It can explode reduction steps fast. For hard examples, run with a larger step limit:
 
 ```sh
-./lambdaScript -n 1000000 -q examples/hard/02_factorial_y.lambda
+./bin/lambdaScript -n 1000000 -q examples/hard/02_factorial_y.lambda
 ```
 
 ---
@@ -913,6 +972,20 @@ Expected:
 sigma 0 n (\x0.sub x x0)
 ```
 
+### Quantified logic
+
+```ls
+forall x in BOOLS : x
+exists x in BOOLS : x
+```
+
+Expected:
+
+```text
+FALSE
+TRUE
+```
+
 ### Pair projection
 
 ```ls
@@ -962,6 +1035,24 @@ This section keeps the examples directly in the README, not hidden behind file n
 
 LambdaScript is not XF, so these are not CSV/dataframe examples. The equivalent practical patterns are symbolic reduction, logic selection, Church booleans, Church numerals, pair-encoded state, bounded loops, and recursion through a fixed-point combinator.
 
+### Example 1A: Quantified logic over a finite domain
+
+```ls
+SHOW = \b.b True False
+ID = \x.x
+XS = CONS TRUE (CONS FALSE NIL)
+CONS (SHOW (forall x in XS : x))
+  (CONS (SHOW (exists x in XS : x)) NIL)
+```
+
+Expected output:
+
+```text
+cons False (cons True nil)
+```
+
+This shows the preferred `:` binder syntax and finite-domain quantifier evaluation.
+
 ### Example 1: Identity smoke test
 
 This is the smallest useful program. It checks that application and reduction work.
@@ -988,7 +1079,7 @@ hello
 Run:
 
 ```sh
-./lambdaScript -q examples/easy/01_identity.ls
+./bin/lambdaScript -q examples/easy/01_identity.ls
 ```
 
 ---
@@ -1540,7 +1631,7 @@ That represents `3! = 6`.
 Run with a high step limit:
 
 ```sh
-./lambdaScript -n 1000000 -q examples/hard/02_factorial_y.lambda
+./bin/lambdaScript -n 1000000 -q examples/hard/02_factorial_y.lambda
 ```
 
 ---
@@ -1718,7 +1809,7 @@ A mixed stress test for the currently working surface:
 Run it directly:
 
 ```sh
-./lambdaScript -q tests/torture.lambda
+./bin/lambdaScript -q tests/torture.lambda
 ```
 
 ## XF Integration
@@ -1848,7 +1939,7 @@ Your expression may be recursive, may duplicate work, or may be using a large Ch
 Run with:
 
 ```sh
-./lambdaScript -n 1000000 -q file.lambda
+./bin/lambdaScript -n 1000000 -q file.lambda
 ```
 
 or reduce the input size.

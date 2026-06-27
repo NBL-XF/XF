@@ -43,6 +43,19 @@ typedef struct {
 	const char *source_name;
 	size_t argc;
 	const char *const *argv;
+
+	/*
+	 * Global official-library directory used by:
+	 *
+	 *   import {math}
+	 *
+	 * When NULL, LambdaScript falls back to:
+	 *   1. $LAMBDASCRIPT_LIB_DIR
+	 *   2. $XDG_DATA_HOME/lambdascript/lib
+	 *   3. $HOME/.lambdascript/lib
+	 *   4. ./.lambdascript/lib
+	 */
+	const char *library_dir;
 } ls_Options;
 
 typedef struct {

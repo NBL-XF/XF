@@ -26,6 +26,10 @@ static char *ls_strdup(const char *src);
 static int buf_append_n(LsBuf *buf, const char *text, size_t len);
 static int buf_append(LsBuf *buf, const char *text);
 static char *read_file_text(const char *path);
+static int ls_is_ident_text(const char *s);
+static char *ls_default_library_dir(void);
+static char *canonicalize_path_or_keep(char *path);
+static int file_exists(const char *path);
 
 
 typedef struct DefSeen DefSeen;
@@ -41,6 +45,13 @@ struct ImportStack {
 	const char *path;
 	ImportStack *next;
 };
+
+typedef enum {
+	IMPORT_KIND_INVALID = -1,
+	IMPORT_KIND_NONE = 0,
+	IMPORT_KIND_FILE = 1,
+	IMPORT_KIND_OFFICIAL = 2
+} ImportKind;
 
 static void defseen_free_all(DefSeen *seen) {
 	DefSeen *next;
@@ -242,17 +253,28 @@ static int scan_duplicate_definitions_in_source(const char *source) {
 	return 1;
 }
 
-static int parse_import_line(const char *trimmed, char **out_path) {
+static char *dup_span(const char *start, size_t len) {
+	char *copy = (char *)malloc(len + 1);
+
+	if (copy == NULL) {
+		return NULL;
+	}
+
+	memcpy(copy, start, len);
+	copy[len] = '\0';
+	return copy;
+}
+
+static ImportKind parse_import_line(const char *trimmed, char **out_target) {
 	const char *p = trimmed;
 	const char *start;
 	const char *end;
-	size_t len;
-	char *path;
+	char *target;
 
-	*out_path = NULL;
+	*out_target = NULL;
 
 	if (strncmp(p, "import", 6) != 0 || !isspace((unsigned char)p[6])) {
-		return 0;
+		return IMPORT_KIND_NONE;
 	}
 
 	p += 6;
@@ -260,46 +282,80 @@ static int parse_import_line(const char *trimmed, char **out_path) {
 		p++;
 	}
 
-	if (*p != '"') {
-		return -1;
-	}
-	p++;
-	start = p;
+	if (*p == '"') {
+		p++;
+		start = p;
 
-	while (*p != '\0' && *p != '"') {
-		if (*p == '\\' && p[1] != '\0') {
-			p += 2;
-			continue;
+		while (*p != '\0' && *p != '"') {
+			if (*p == '\\' && p[1] != '\0') {
+				p += 2;
+				continue;
+			}
+			p++;
+		}
+
+		if (*p != '"') {
+			return IMPORT_KIND_INVALID;
+		}
+
+		end = p;
+		p++;
+
+		while (*p != '\0' && isspace((unsigned char)*p)) {
+			p++;
+		}
+		if (*p != '\0') {
+			return IMPORT_KIND_INVALID;
+		}
+
+		target = dup_span(start, (size_t)(end - start));
+		if (target == NULL) {
+			err_set("out of memory");
+			return IMPORT_KIND_INVALID;
+		}
+
+		*out_target = target;
+		return IMPORT_KIND_FILE;
+	}
+
+	if (*p == '{') {
+		p++;
+		while (*p != '\0' && isspace((unsigned char)*p)) {
+			p++;
+		}
+
+		start = p;
+		while (*p != '\0' && pp_is_ident_part_byte((unsigned char)*p)) {
+			p++;
+		}
+		end = p;
+
+		while (*p != '\0' && isspace((unsigned char)*p)) {
+			p++;
+		}
+		if (*p != '}' || !pp_is_ident_span(start, (size_t)(end - start))) {
+			return IMPORT_KIND_INVALID;
 		}
 		p++;
+
+		while (*p != '\0' && isspace((unsigned char)*p)) {
+			p++;
+		}
+		if (*p != '\0') {
+			return IMPORT_KIND_INVALID;
+		}
+
+		target = dup_span(start, (size_t)(end - start));
+		if (target == NULL) {
+			err_set("out of memory");
+			return IMPORT_KIND_INVALID;
+		}
+
+		*out_target = target;
+		return IMPORT_KIND_OFFICIAL;
 	}
 
-	if (*p != '"') {
-		return -1;
-	}
-
-	end = p;
-	p++;
-
-	while (*p != '\0' && isspace((unsigned char)*p)) {
-		p++;
-	}
-
-	if (*p != '\0') {
-		return -1;
-	}
-
-	len = (size_t)(end - start);
-	path = (char *)malloc(len + 1);
-	if (path == NULL) {
-		err_set("out of memory");
-		return -1;
-	}
-
-	memcpy(path, start, len);
-	path[len] = '\0';
-	*out_path = path;
-	return 1;
+	return IMPORT_KIND_INVALID;
 }
 
 static char *dirname_from_path(const char *path) {
@@ -342,12 +398,30 @@ static char *join_path(const char *dir, const char *rel) {
 	return out;
 }
 
-static char *resolve_import_path(const char *importing_name, const char *import_path) {
+static char *join_path_with_suffix(const char *dir, const char *name, const char *suffix) {
+	size_t dlen = strlen(dir);
+	size_t nlen = strlen(name);
+	size_t slen = strlen(suffix);
+	char *out = (char *)malloc(dlen + 1 + nlen + slen + 1);
+
+	if (out == NULL) {
+		return NULL;
+	}
+
+	memcpy(out, dir, dlen);
+	out[dlen] = '/';
+	memcpy(out + dlen + 1, name, nlen);
+	memcpy(out + dlen + 1 + nlen, suffix, slen);
+	out[dlen + 1 + nlen + slen] = '\0';
+	return out;
+}
+
+static char *resolve_user_import_path(const char *importing_name, const char *import_path) {
 	char *dir;
 	char *joined;
 
 	if (import_path[0] == '/') {
-		return ls_strdup(import_path);
+		return canonicalize_path_or_keep(ls_strdup(import_path));
 	}
 
 	if (importing_name == NULL || importing_name[0] == '<') {
@@ -368,15 +442,54 @@ static char *resolve_import_path(const char *importing_name, const char *import_
 		return NULL;
 	}
 
-#if defined(_POSIX_VERSION)
-	resolved = realpath(joined, NULL);
-	if (resolved != NULL) {
-		free(joined);
-		return resolved;
-	}
-#endif
+	return canonicalize_path_or_keep(joined);
+}
 
-	return joined;
+static char *resolve_official_import_path(const char *library_dir, const char *library_name) {
+	char *base_dir = NULL;
+	char *candidate = NULL;
+
+	if (!ls_is_ident_text(library_name)) {
+		err_set("invalid official library name '%s'", library_name);
+		return NULL;
+	}
+
+	if (library_dir == NULL || library_dir[0] == '\0') {
+		base_dir = ls_default_library_dir();
+		if (base_dir == NULL) {
+			err_set("out of memory");
+			return NULL;
+		}
+		library_dir = base_dir;
+	}
+
+	candidate = join_path_with_suffix(library_dir, library_name, ".ls");
+	if (candidate == NULL) {
+		free(base_dir);
+		err_set("out of memory");
+		return NULL;
+	}
+	if (file_exists(candidate)) {
+		free(base_dir);
+		return canonicalize_path_or_keep(candidate);
+	}
+	free(candidate);
+
+	candidate = join_path(library_dir, library_name);
+	if (candidate == NULL) {
+		free(base_dir);
+		err_set("out of memory");
+		return NULL;
+	}
+	if (file_exists(candidate)) {
+		free(base_dir);
+		return canonicalize_path_or_keep(candidate);
+	}
+	free(candidate);
+
+	err_set("official library '%s' not found in '%s'", library_name, library_dir);
+	free(base_dir);
+	return NULL;
 }
 
 static int import_stack_contains(const ImportStack *stack, const char *path) {
@@ -391,6 +504,7 @@ static int import_stack_contains(const ImportStack *stack, const char *path) {
 
 static int preprocess_source_recursive(const char *source,
                                        const char *source_name,
+                                       const char *library_dir,
                                        int library_mode,
                                        DefSeen **seen_defs,
                                        const ImportStack *stack,
@@ -402,6 +516,7 @@ static int append_line_with_newline(LsBuf *out, const char *start, size_t len) {
 
 static int preprocess_source_recursive(const char *source,
                                        const char *source_name,
+                                       const char *library_dir,
                                        int library_mode,
                                        DefSeen **seen_defs,
                                        const ImportStack *stack,
@@ -451,11 +566,16 @@ static int preprocess_source_recursive(const char *source,
 			}
 		} else {
 			import_kind = parse_import_line(trimmed, &import_path);
-			if (import_kind == 1) {
-				char *resolved = resolve_import_path(source_name, import_path);
+			if (import_kind == IMPORT_KIND_FILE || import_kind == IMPORT_KIND_OFFICIAL) {
+				char *resolved;
 				char *child_source;
 				ImportStack child_stack;
 
+				if (import_kind == IMPORT_KIND_FILE) {
+					resolved = resolve_user_import_path(source_name, import_path);
+				} else {
+					resolved = resolve_official_import_path(library_dir, import_path);
+				}
 				free(import_path);
 				import_path = NULL;
 
@@ -480,7 +600,7 @@ static int preprocess_source_recursive(const char *source,
 
 				child_stack.path = resolved;
 				child_stack.next = (ImportStack *)stack;
-				ok = preprocess_source_recursive(child_source, resolved, 1, seen_defs, &child_stack, out);
+				ok = preprocess_source_recursive(child_source, resolved, library_dir, 1, seen_defs, &child_stack, out);
 				free(child_source);
 				free(resolved);
 				free(raw_line);
@@ -488,7 +608,7 @@ static int preprocess_source_recursive(const char *source,
 					return 0;
 				}
 			} else {
-				if (import_kind < 0) {
+				if (import_kind == IMPORT_KIND_INVALID) {
 					err_set("%s:%zu: invalid import syntax", source_name != NULL ? source_name : "<input>", line_no);
 					free(raw_line);
 					return 0;
@@ -537,7 +657,7 @@ static int preprocess_source_recursive(const char *source,
 	return 1;
 }
 
-static char *preprocess_imports(const char *source, const char *source_name) {
+static char *preprocess_imports(const char *source, const char *source_name, const char *library_dir) {
 	LsBuf out = {0};
 	DefSeen *seen = NULL;
 	ImportStack root;
@@ -545,7 +665,7 @@ static char *preprocess_imports(const char *source, const char *source_name) {
 	root.path = source_name != NULL ? source_name : "<input>";
 	root.next = NULL;
 
-	if (!preprocess_source_recursive(source, source_name, 0, &seen, &root, &out)) {
+	if (!preprocess_source_recursive(source, source_name, library_dir, 0, &seen, &root, &out)) {
 		defseen_free_all(seen);
 		free(out.data);
 		return NULL;
@@ -678,6 +798,55 @@ char *ls_read_all_stream(FILE *fp) {
 
 	buffer[length] = '\0';
 	return buffer;
+}
+
+static char *ls_default_library_dir(void) {
+	const char *override = getenv("LAMBDASCRIPT_LIB_DIR");
+	const char *xdg = getenv("XDG_DATA_HOME");
+	const char *home = getenv("HOME");
+	char *dir;
+
+	if (override != NULL && override[0] != '\0') {
+		return ls_strdup(override);
+	}
+	if (xdg != NULL && xdg[0] != '\0') {
+		dir = join_path(xdg, "lambdascript/lib");
+		if (dir != NULL) {
+			return dir;
+		}
+	}
+	if (home != NULL && home[0] != '\0') {
+		dir = join_path(home, ".lambdascript/lib");
+		if (dir != NULL) {
+			return dir;
+		}
+	}
+	return ls_strdup(".lambdascript/lib");
+}
+
+static int file_exists(const char *path) {
+	FILE *fp = fopen(path, "rb");
+
+	if (fp == NULL) {
+		return 0;
+	}
+
+	fclose(fp);
+	return 1;
+}
+
+static char *canonicalize_path_or_keep(char *path) {
+#if defined(_POSIX_VERSION)
+	char *resolved;
+
+	resolved = realpath(path, NULL);
+	if (resolved != NULL) {
+		free(path);
+		return resolved;
+	}
+#endif
+
+	return path;
 }
 
 static char *read_file_text(const char *path) {
@@ -1029,6 +1198,7 @@ void ls_options_init(ls_Options *options) {
 	options->source_name = NULL;
 	options->argc = 0;
 	options->argv = NULL;
+	options->library_dir = NULL;
 }
 
 void ls_result_init(ls_Result *result) {
@@ -1083,7 +1253,7 @@ int ls_eval_string(ls_State *L, const char *source, const ls_Options *options, l
 	ls_result_free(result);
 
 	{
-		char *preprocessed = preprocess_imports(source, options->source_name);
+		char *preprocessed = preprocess_imports(source, options->source_name, options->library_dir);
 		if (preprocessed == NULL) {
 			goto fail;
 		}
