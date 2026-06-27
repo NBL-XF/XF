@@ -268,7 +268,7 @@ run_case \
 run_case \
 	"membership" \
 	0 \
-	'cons True (cons True (cons True (cons True nil)))' \
+	"cons True (cons True (cons True (cons True (cons True (cons True (cons True (cons True (nil))))))))" \
 	'' \
 	"$BIN" -q tests/membership.lambda
 

@@ -1,5 +1,8 @@
 SHOW = \b.b True False
-elem = \x SET.SET x
-contains = \SET x.SET x
-SET = \x.(x <=> a) v (x <=> b)
-cons (SHOW (a ∈ SET)) (cons (SHOW (⌐ (c ∈ SET))) (cons (SHOW (SET ∋ b)) (cons (SHOW (⌐ (SET ∍ z))) nil)))
+A = \t f.t
+SET = \x.OR (x True False) FALSE
+XS = CONS A (CONS A NIL)
+P_MEMBER = \x.elem x SET
+P_TRUE_ONLY = \x.x True False
+P_NOT_FALSE = \x.NOT (x False True)
+CONS (SHOW (A ∈ SET)) (CONS (SHOW (A memberof SET)) (CONS (SHOW (SET ∋ A)) (CONS (SHOW (SET ∍ A)) (CONS (SHOW (∀ x in XS. P_MEMBER x)) (CONS (SHOW (∃ x in XS. P_MEMBER x)) (CONS (SHOW (Ǝ x in XS. P_TRUE_ONLY x)) (CONS (SHOW (ǝ x in XS. P_NOT_FALSE x)) NIL)))))))

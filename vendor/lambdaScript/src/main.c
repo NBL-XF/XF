@@ -40,7 +40,8 @@ static void usage(const char *argv0) {
 	fprintf(stderr, "  logic aliases: ~ or ⌐ or ¬, -> or →, <-> or <=> or ↔ or ≣\n");
 	fprintf(stderr, "  math aliases: sqrt or √, ln or ㏑, inf or infinity or ∞, euler or ℯ\n");
 	fprintf(stderr, "  symbolic forms: Sigma/Σ x = a to b . expr, Integral/∫ x = a to b . expr\n");
-	fprintf(stderr, "                  lim x -> a . expr, x ∈ S, S ∋ x, contains, in\n");
+	fprintf(stderr, "                  lim x -> a . expr, forall/∀ x : expr, exists/∃/Ǝ/ǝ x : expr\n");
+	fprintf(stderr, "                  x ∈ S, S ∋ x, S ∍ x, in/memberof/elementof/elemof, contains/hasmember\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "examples:\n");
 	fprintf(stderr, "  %s -e 'I z'\n", argv0);

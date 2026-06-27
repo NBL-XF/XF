@@ -42,6 +42,11 @@ Value *value_free_var_new(const char *name);
 Value *value_lam_new(Value *body);
 Value *value_app_new(Value *fn, Value *arg);
 Value *value_number_new(double value);
+Value *value_church_boolean_new(int truthy);
+int value_is_church_boolean(const Value *value, int *out_truth);
+Value *value_scott_nil_new(void);
+Value *value_scott_cons_take(Value *head, Value *tail);
+int value_match_scott_list(const Value *value, int *is_nil_out, const Value **head_out, const Value **tail_out);
 Value *value_clone(const Value *value);
 void value_free(Value *value);
 

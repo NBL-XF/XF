@@ -806,7 +806,8 @@ if (!buf_append(buf,
                 "\n"
                 "; LambdaScript argument builtins\n"
                 "NIL = \\c.\\n.n\n"
-                "CONS = \\h.\\t.\\c.\\n.c h t\n")) {
+                "CONS = \\h.\\t.\\c.\\n.c h t\n"
+                "BOOLS = CONS (\\t.\\f.t) (CONS (\\t.\\f.f) NIL)\n")) {
     return 0;
 }
 	if (!buf_append_symbol_def(buf, "ARG0", source_name)) {

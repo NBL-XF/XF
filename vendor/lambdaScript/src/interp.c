@@ -235,6 +235,325 @@ static int value_has_normal_step(const Value *value, int *out_has_step) {
 	return 1;
 }
 
+
+
+static int reduce_clone_normal(const Value *value, Value **out_value) {
+	size_t steps = 0;
+	int reached_limit = 0;
+
+	if (out_value == NULL) {
+		err_set("invalid reduce target");
+		return 0;
+	}
+
+	*out_value = interp_reduce_normal(value, 4096, &steps, &reached_limit);
+	if (*out_value == NULL) {
+		return 0;
+	}
+	if (reached_limit) {
+		value_free(*out_value);
+		*out_value = NULL;
+		err_set("reduction step limit reached");
+		return 0;
+	}
+	return 1;
+}
+
+static const Value *value_head(const Value *value) {
+	while (value != NULL && value->kind == VALUE_APP) {
+		value = value->as.app.fn;
+	}
+	return value;
+}
+
+static int marker_boolean_value(const Value *value, int *out_truth) {
+	const Value *head;
+
+	if (church_boolean_value(value, out_truth)) {
+		return 1;
+	}
+
+	head = value_head(value);
+	if (head == NULL || head->kind != VALUE_FREE_VAR) {
+		return 0;
+	}
+
+	if (strcmp(head->as.free_var.name, "True") == 0 ||
+	    strcmp(head->as.free_var.name, "TRUE") == 0) {
+		*out_truth = 1;
+		return 1;
+	}
+
+	if (strcmp(head->as.free_var.name, "False") == 0 ||
+	    strcmp(head->as.free_var.name, "FALSE") == 0 ||
+	    strcmp(head->as.free_var.name, "nil") == 0 ||
+	    strcmp(head->as.free_var.name, "NIL") == 0) {
+		*out_truth = 0;
+		return 1;
+	}
+
+	return 0;
+}
+
+static int normalized_boolean_value(const Value *value, int *out_truth) {
+	Value *reduced;
+	int ok;
+
+	if (!reduce_clone_normal(value, &reduced)) {
+		return 0;
+	}
+
+	ok = marker_boolean_value(reduced, out_truth);
+	value_free(reduced);
+	return ok;
+}
+
+static int is_boolean_binary_name(const char *name) {
+	return strcmp(name, "AND") == 0 ||
+	       strcmp(name, "OR") == 0 ||
+	       strcmp(name, "IMP") == 0 ||
+	       strcmp(name, "IFF") == 0;
+}
+
+static Value *apply_boolean_binary_primitive(const char *name, int left, int right) {
+	if (strcmp(name, "AND") == 0) {
+		return value_church_boolean(left && right);
+	}
+	if (strcmp(name, "OR") == 0) {
+		return value_church_boolean(left || right);
+	}
+	if (strcmp(name, "IMP") == 0) {
+		return value_church_boolean((!left) || right);
+	}
+	if (strcmp(name, "IFF") == 0) {
+		return value_church_boolean(left == right);
+	}
+	return NULL;
+}
+
+static int list_value_is_nil(const Value *value) {
+	return value != NULL &&
+	       value->kind == VALUE_LAM &&
+	       value->as.lam.body != NULL &&
+	       value->as.lam.body->kind == VALUE_LAM &&
+	       value->as.lam.body->as.lam.body != NULL &&
+	       value->as.lam.body->as.lam.body->kind == VALUE_BOUND_VAR &&
+	       value->as.lam.body->as.lam.body->as.bound_var.index == 0;
+}
+
+static int list_value_unpack_cons(const Value *value, Value **out_head, Value **out_tail) {
+	const Value *body;
+	const Value *step1;
+	const Value *head_term;
+	const Value *tail_term;
+
+	if (out_head == NULL || out_tail == NULL) {
+		err_set("invalid list unpack target");
+		return 0;
+	}
+
+	*out_head = NULL;
+	*out_tail = NULL;
+
+	if (value == NULL ||
+	    value->kind != VALUE_LAM ||
+	    value->as.lam.body == NULL ||
+	    value->as.lam.body->kind != VALUE_LAM) {
+		return 0;
+	}
+
+	body = value->as.lam.body->as.lam.body;
+	if (body == NULL ||
+	    body->kind != VALUE_APP ||
+	    body->as.app.fn == NULL ||
+	    body->as.app.fn->kind != VALUE_APP ||
+	    body->as.app.fn->as.app.fn == NULL ||
+	    body->as.app.fn->as.app.fn->kind != VALUE_BOUND_VAR ||
+	    body->as.app.fn->as.app.fn->as.bound_var.index != 1) {
+		return 0;
+	}
+
+	step1 = body->as.app.fn;
+	head_term = step1->as.app.arg;
+	tail_term = body->as.app.arg;
+
+	*out_head = value_shift(head_term, -2);
+	if (*out_head == NULL) {
+		return 0;
+	}
+
+	*out_tail = value_shift(tail_term, -2);
+	if (*out_tail == NULL) {
+		value_free(*out_head);
+		*out_head = NULL;
+		return 0;
+	}
+
+	return 1;
+}
+
+static Value *apply_value_pair(const Value *fn, const Value *arg) {
+	return value_app_new(value_clone(fn), value_clone(arg));
+}
+
+static Value *reduce_applied_once(const Value *fn, const Value *arg) {
+	Value *app;
+	Value *reduced;
+
+	app = apply_value_pair(fn, arg);
+	if (app == NULL) {
+		err_set("out of memory");
+		return NULL;
+	}
+
+	reduced = interp_reduce_normal(app, 4096, NULL, NULL);
+	value_free(app);
+	return reduced;
+}
+
+static Value *reduce_elem_primitive(const Value *needle, const Value *set) {
+	Value *predicate_result = NULL;
+	int truth = 0;
+	Value *set_normal = NULL;
+	Value *needle_normal = NULL;
+	Value *current = NULL;
+
+	predicate_result = reduce_applied_once(set, needle);
+	if (predicate_result != NULL) {
+		if (marker_boolean_value(predicate_result, &truth)) {
+			value_free(predicate_result);
+			return value_church_boolean(truth);
+		}
+		value_free(predicate_result);
+	}
+
+	if (!reduce_clone_normal(set, &set_normal)) {
+		err_clear();
+		return NULL;
+	}
+	if (!reduce_clone_normal(needle, &needle_normal)) {
+		value_free(set_normal);
+		err_clear();
+		return NULL;
+	}
+
+	current = set_normal;
+	set_normal = NULL;
+
+	for (;;) {
+		Value *head_item = NULL;
+		Value *tail_item = NULL;
+		Value *head_normal = NULL;
+
+		if (list_value_is_nil(current)) {
+			value_free(current);
+			value_free(needle_normal);
+			return value_church_boolean(0);
+		}
+
+		if (!list_value_unpack_cons(current, &head_item, &tail_item)) {
+			value_free(current);
+			value_free(needle_normal);
+			return NULL;
+		}
+
+		if (!reduce_clone_normal(head_item, &head_normal)) {
+			value_free(head_item);
+			value_free(tail_item);
+			value_free(current);
+			value_free(needle_normal);
+			return NULL;
+		}
+
+		if (value_structural_equal(needle_normal, head_normal)) {
+			value_free(head_normal);
+			value_free(head_item);
+			value_free(tail_item);
+			value_free(current);
+			value_free(needle_normal);
+			return value_church_boolean(1);
+		}
+
+		value_free(head_normal);
+		value_free(head_item);
+		value_free(current);
+		current = NULL;
+
+		if (!reduce_clone_normal(tail_item, &current)) {
+			value_free(tail_item);
+			value_free(needle_normal);
+			return NULL;
+		}
+		value_free(tail_item);
+	}
+}
+
+static Value *reduce_contains_primitive(const Value *set, const Value *needle) {
+	return reduce_elem_primitive(needle, set);
+}
+
+static Value *reduce_quantifier_primitive(const char *name, const Value *domain, const Value *predicate) {
+	Value *current = NULL;
+	int want_forall = strcmp(name, "forall") == 0 || strcmp(name, "FORALL") == 0;
+
+	if (!reduce_clone_normal(domain, &current)) {
+		return NULL;
+	}
+
+	for (;;) {
+		Value *head_item = NULL;
+		Value *tail_item = NULL;
+		Value *pred_result = NULL;
+		int truth = 0;
+
+		if (list_value_is_nil(current)) {
+			value_free(current);
+			return value_church_boolean(want_forall ? 1 : 0);
+		}
+
+		if (!list_value_unpack_cons(current, &head_item, &tail_item)) {
+			value_free(current);
+			return NULL;
+		}
+
+		pred_result = reduce_applied_once(predicate, head_item);
+		value_free(head_item);
+		if (pred_result == NULL) {
+			value_free(tail_item);
+			value_free(current);
+			return NULL;
+		}
+
+		if (!marker_boolean_value(pred_result, &truth)) {
+			value_free(pred_result);
+			value_free(tail_item);
+			value_free(current);
+			return NULL;
+		}
+		value_free(pred_result);
+
+		if (want_forall && !truth) {
+			value_free(tail_item);
+			value_free(current);
+			return value_church_boolean(0);
+		}
+		if (!want_forall && truth) {
+			value_free(tail_item);
+			value_free(current);
+			return value_church_boolean(1);
+		}
+
+		value_free(current);
+		current = NULL;
+
+		if (!reduce_clone_normal(tail_item, &current)) {
+			value_free(tail_item);
+			return NULL;
+		}
+		value_free(tail_item);
+	}
+}
+
 static int is_equiv_name(const char *name) {
 	return strcmp(name, "EQUIV") == 0 ||
 	       strcmp(name, "equiv") == 0 ||
@@ -290,13 +609,24 @@ static Value *try_reduce_primitive(const Value *term) {
 	right = term->as.app.arg;
 
 	if (head->kind == VALUE_APP && head->as.app.fn->kind == VALUE_FREE_VAR) {
-		if (is_equiv_name(head->as.app.fn->as.free_var.name)) {
+		const char *name = head->as.app.fn->as.free_var.name;
+		const Value *left_arg = head->as.app.arg;
+
+		if (strcmp(name, "True") == 0 || strcmp(name, "TRUE") == 0) {
+			return value_clone(left_arg);
+		}
+		if (strcmp(name, "False") == 0 || strcmp(name, "FALSE") == 0 ||
+		    strcmp(name, "nil") == 0 || strcmp(name, "NIL") == 0) {
+			return value_clone(right);
+		}
+
+		if (is_equiv_name(name)) {
 			int left_truth = 0;
 			int right_truth = 0;
 			int left_has_step = 0;
 			int right_has_step = 0;
 
-			if (!value_has_normal_step(head->as.app.arg, &left_has_step)) {
+			if (!value_has_normal_step(left_arg, &left_has_step)) {
 				return NULL;
 			}
 			if (left_has_step) {
@@ -309,25 +639,53 @@ static Value *try_reduce_primitive(const Value *term) {
 				return NULL;
 			}
 
-			if (church_boolean_value(head->as.app.arg, &left_truth) &&
-			    church_boolean_value(right, &right_truth)) {
+			if (marker_boolean_value(left_arg, &left_truth) &&
+			    marker_boolean_value(right, &right_truth)) {
 				return value_church_boolean(left_truth == right_truth);
 			}
 
-			return value_church_boolean(value_structural_equal(head->as.app.arg, right));
+			return value_church_boolean(value_structural_equal(left_arg, right));
 		}
 
-		if (head->as.app.arg->kind == VALUE_NUMBER && right->kind == VALUE_NUMBER) {
-			return apply_binary_primitive(
-				head->as.app.fn->as.free_var.name,
-				head->as.app.arg->as.number.value,
-				right->as.number.value
-			);
+		if (left_arg->kind == VALUE_NUMBER && right->kind == VALUE_NUMBER) {
+			return apply_binary_primitive(name, left_arg->as.number.value, right->as.number.value);
+		}
+
+		if (is_boolean_binary_name(name)) {
+			int left_truth = 0;
+			int right_truth = 0;
+			if (normalized_boolean_value(left_arg, &left_truth) &&
+			    normalized_boolean_value(right, &right_truth)) {
+				return apply_boolean_binary_primitive(name, left_truth, right_truth);
+			}
+		}
+
+		if (strcmp(name, "elem") == 0) {
+			return reduce_elem_primitive(left_arg, right);
+		}
+		if (strcmp(name, "contains") == 0) {
+			return reduce_contains_primitive(left_arg, right);
+		}
+		if (strcmp(name, "forall") == 0 || strcmp(name, "exists") == 0 ||
+		    strcmp(name, "FORALL") == 0 || strcmp(name, "EXISTS") == 0) {
+			return reduce_quantifier_primitive(name, left_arg, right);
 		}
 	}
 
-	if (head->kind == VALUE_FREE_VAR && right->kind == VALUE_NUMBER) {
-		return apply_unary_primitive(head->as.free_var.name, right->as.number.value);
+	if (head->kind == VALUE_FREE_VAR) {
+		if (right->kind == VALUE_NUMBER) {
+			Value *numeric = apply_unary_primitive(head->as.free_var.name, right->as.number.value);
+			if (numeric != NULL) {
+				return numeric;
+			}
+		}
+
+		if (strcmp(head->as.free_var.name, "NOT") == 0) {
+			int truth = 0;
+			if (normalized_boolean_value(right, &truth)) {
+				return value_church_boolean(!truth);
+			}
+		}
 	}
 
 	left = head;

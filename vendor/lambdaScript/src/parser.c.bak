@@ -180,8 +180,7 @@ static int parser_is_atom_start(TokenKind kind) {
 	       kind == TOK_SIGMA ||
 	       kind == TOK_INTEGRAL ||
 	       kind == TOK_LIMIT ||
-	       kind == TOK_FORALL ||
-	       kind == TOK_EXISTS;
+	       kind == TOK_FORALL;
 }
 
 static void parser_advance(Parser *parser) {
@@ -643,18 +642,26 @@ fail:
 	return NULL;
 }
 
-
-static Ast *parse_logic_binder(Parser *parser, const char *name) {
+/*
+ * ∀ <var> ∈ <set> , <body>
+ *
+ * Desugars to:  forall <set> (λ<var>.<body>)
+ *
+ * The comma plays the role of '.' in lambda — it opens the body scope.
+ * The membership operator (∈ / in) binds the quantified variable to its
+ * domain, mirroring the way lim uses '->' and sigma/integral use '= ... to'.
+ */
+static Ast *parse_forall(Parser *parser) {
 	char *param_name = NULL;
-	Ast *domain = NULL;
+	Ast *set = NULL;
 	Ast *body = NULL;
 	Ast *lambda = NULL;
 	Ast *result = NULL;
 
-	parser_advance(parser);
+	parser_advance(parser); /* consume ∀ / forall */
 
 	if (parser->lexer.current.kind != TOK_IDENT) {
-		err_set("expected identifier after %s at byte %zu", name, parser->lexer.current.pos);
+		err_set("expected identifier after ∀ at byte %zu", parser->lexer.current.pos);
 		goto fail;
 	}
 
@@ -665,21 +672,25 @@ static Ast *parse_logic_binder(Parser *parser, const char *name) {
 	}
 	parser_advance(parser);
 
-	if (parser->lexer.current.kind == TOK_IN) {
-		parser_advance(parser);
-		domain = parse_term(parser);
-		if (domain == NULL) {
-			goto fail;
-		}
-	}
-
-	if (parser->lexer.current.kind != TOK_COLON &&
-	    parser->lexer.current.kind != TOK_DOT &&
-	    parser->lexer.current.kind != TOK_COMMA) {
-		err_set("expected ':' after quantifier binder at byte %zu", parser->lexer.current.pos);
+	/* require ∈ / in between the bound variable and its domain set */
+	if (parser->lexer.current.kind != TOK_IN &&
+	    !token_is_ident_text_value(&parser->lexer.current, "in") &&
+	    !token_is_ident_text_value(&parser->lexer.current, "IN")) {
+		err_set("expected '\xe2\x88\x88' (∈) or 'in' after ∀ variable at byte %zu",
+		        parser->lexer.current.pos);
 		goto fail;
 	}
 	parser_advance(parser);
+
+	set = parse_term(parser);
+	if (set == NULL) {
+		goto fail;
+	}
+
+	/* comma separates the domain constraint from the body, like '.' in lambda */
+	if (!parser_expect(parser, TOK_COMMA, "expected ',' after forall domain set")) {
+		goto fail;
+	}
 
 	body = parse_term(parser);
 	if (body == NULL) {
@@ -693,22 +704,16 @@ static Ast *parse_logic_binder(Parser *parser, const char *name) {
 		goto fail;
 	}
 
-	if (domain == NULL) {
-		domain = ast_var_new("BOOLS");
-		if (domain == NULL) {
-			err_set("out of memory");
-			goto fail;
-		}
-	}
-
-	result = make_binary_call(name, domain, lambda);
-	domain = NULL;
+	result = make_binary_call("forall", set, lambda);
+	set = NULL;
 	lambda = NULL;
+
+	free(param_name);
 	return result;
 
 fail:
 	free(param_name);
-	ast_free(domain);
+	ast_free(set);
 	ast_free(body);
 	ast_free(lambda);
 	return NULL;
@@ -771,10 +776,7 @@ static Ast *parse_atom(Parser *parser) {
 		return parse_symbolic_binder(parser, TOK_LIMIT, "limit");
 
 	case TOK_FORALL:
-		return parse_logic_binder(parser, "forall");
-
-	case TOK_EXISTS:
-		return parse_logic_binder(parser, "exists");
+		return parse_forall(parser);
 
 	default:
 		err_set("unexpected token at byte %zu", parser->lexer.current.pos);
@@ -936,10 +938,12 @@ static Ast *parse_membership(Parser *parser) {
 
 	while (parser->lexer.current.kind == TOK_IN ||
 	       parser->lexer.current.kind == TOK_CONTAINS ||
+	       parser->lexer.current.kind == TOK_CONTAINSALL ||
 	       token_is_ident_text_value(&parser->lexer.current, "in") ||
 	       token_is_ident_text_value(&parser->lexer.current, "contains") ||
 	       token_is_ident_text_value(&parser->lexer.current, "CONTAINS")) {
 		int is_in = parser->lexer.current.kind == TOK_IN || token_is_ident_text_value(&parser->lexer.current, "in");
+		int is_containsall = parser->lexer.current.kind == TOK_CONTAINSALL;
 		Ast *right;
 
 		parser_advance(parser);
@@ -949,7 +953,7 @@ static Ast *parse_membership(Parser *parser) {
 			return NULL;
 		}
 
-		left = make_binary_call(is_in ? "elem" : "contains", left, right);
+		left = make_binary_call(is_in ? "elem" : (is_containsall ? "containsall" : "contains"), left, right);
 		if (left == NULL) {
 			return NULL;
 		}

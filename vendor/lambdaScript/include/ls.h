@@ -5,6 +5,21 @@
 
 typedef struct ls_State ls_State;
 
+
+/*
+ * Built-in logical/set operators recognized by the evaluator:
+ *
+ *   elem x S      membership on Scott lists, or fallback to predicate-set application S x
+ *   contains S x  alias for elem x S
+ *   forall S p    universal quantifier over a finite Scott list domain
+ *   exists S p    existential quantifier over a finite Scott list domain
+ *
+ * Parser sugar lowers unbounded quantifiers to BOOLS, so:
+ *
+ *   forall x . expr   == forall BOOLS (\x.expr)
+ *   exists x . expr   == exists BOOLS (\x.expr)
+ */
+
 typedef struct {
 	size_t max_steps;
 	int trace;

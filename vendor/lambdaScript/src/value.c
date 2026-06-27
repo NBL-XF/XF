@@ -26,6 +26,88 @@ typedef struct DefValue {
 	struct DefValue *next;
 } DefValue;
 
+static int render_value(StrBuf *buf, NameStack *env, const Value *value, int parent_prec);
+static int sb_append(StrBuf *buf, const char *text);
+static int sb_append_n(StrBuf *buf, const char *text, size_t length);
+
+static int value_is_scott_nil_shape(const Value *value) {
+	return value != NULL &&
+	       value->kind == VALUE_LAM &&
+	       value->as.lam.body != NULL &&
+	       value->as.lam.body->kind == VALUE_LAM &&
+	       value->as.lam.body->as.lam.body != NULL &&
+	       value->as.lam.body->as.lam.body->kind == VALUE_BOUND_VAR &&
+	       value->as.lam.body->as.lam.body->as.bound_var.index == 0;
+}
+
+static int value_is_scott_cons_shape(const Value *value, const Value **out_head, const Value **out_tail) {
+	const Value *body;
+	const Value *apply_c;
+
+	if (value == NULL ||
+	    value->kind != VALUE_LAM ||
+	    value->as.lam.body == NULL ||
+	    value->as.lam.body->kind != VALUE_LAM ||
+	    value->as.lam.body->as.lam.body == NULL) {
+		return 0;
+	}
+
+	body = value->as.lam.body->as.lam.body;
+	if (body->kind != VALUE_APP ||
+	    body->as.app.fn == NULL ||
+	    body->as.app.fn->kind != VALUE_APP ||
+	    body->as.app.fn->as.app.fn == NULL ||
+	    body->as.app.fn->as.app.fn->kind != VALUE_BOUND_VAR ||
+	    body->as.app.fn->as.app.fn->as.bound_var.index != 1) {
+		return 0;
+	}
+
+	apply_c = body->as.app.fn;
+	if (out_head != NULL) {
+		*out_head = apply_c->as.app.arg;
+	}
+	if (out_tail != NULL) {
+		*out_tail = body->as.app.arg;
+	}
+	return 1;
+}
+
+static int render_scott_list(StrBuf *buf, NameStack *env, const Value *value) {
+	const Value *head = NULL;
+	const Value *tail = NULL;
+
+	if (value_is_scott_nil_shape(value)) {
+		return sb_append(buf, "nil");
+	}
+
+	if (!value_is_scott_cons_shape(value, &head, &tail)) {
+		return 0;
+	}
+
+	if (!sb_append(buf, "cons ")) {
+		return 0;
+	}
+	if (!render_value(buf, env, head, 3)) {
+		return 0;
+	}
+	if (!sb_append(buf, " ")) {
+		return 0;
+	}
+	if (!sb_append(buf, "(")) {
+		return 0;
+	}
+	if (value_is_scott_nil_shape(tail) || value_is_scott_cons_shape(tail, NULL, NULL)) {
+		if (!render_scott_list(buf, env, tail)) {
+			return 0;
+		}
+	} else {
+		if (!render_value(buf, env, tail, 0)) {
+			return 0;
+		}
+	}
+	return sb_append(buf, ")");
+}
+
 static char *value_strdup(const char *src) {
 	size_t len;
 	char *dst;
@@ -797,6 +879,10 @@ done:
 static int render_value(StrBuf *buf, NameStack *env, const Value *value, int parent_prec) {
 	int need_parens;
 	size_t env_index;
+
+	if (value_is_scott_cons_shape(value, NULL, NULL)) {
+		return render_scott_list(buf, env, value);
+	}
 
 	switch (value->kind) {
 	case VALUE_BOUND_VAR:

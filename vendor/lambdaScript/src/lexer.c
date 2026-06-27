@@ -50,6 +50,32 @@ static int is_utf8_integral(const char *src, size_t pos, size_t len) {
 	       (unsigned char)src[pos + 2] == 0xAB;
 }
 
+static int is_utf8_forall(const char *src, size_t pos, size_t len) {
+	return pos + 2 < len &&
+	       (unsigned char)src[pos] == 0xE2 &&
+	       (unsigned char)src[pos + 1] == 0x88 &&
+	       (unsigned char)src[pos + 2] == 0x80;
+}
+
+static int is_utf8_exists(const char *src, size_t pos, size_t len) {
+	return pos + 2 < len &&
+	       (unsigned char)src[pos] == 0xE2 &&
+	       (unsigned char)src[pos + 1] == 0x88 &&
+	       (unsigned char)src[pos + 2] == 0x83;
+}
+
+static int is_utf8_exists_alt_upper(const char *src, size_t pos, size_t len) {
+	return pos + 1 < len &&
+	       (unsigned char)src[pos] == 0xC6 &&
+	       (unsigned char)src[pos + 1] == 0x8E;
+}
+
+static int is_utf8_exists_alt_lower(const char *src, size_t pos, size_t len) {
+	return pos + 1 < len &&
+	       (unsigned char)src[pos] == 0xC7 &&
+	       (unsigned char)src[pos + 1] == 0x9D;
+}
+
 static int is_utf8_element_of(const char *src, size_t pos, size_t len) {
 	return pos + 2 < len &&
 	       (unsigned char)src[pos] == 0xE2 &&
@@ -217,6 +243,28 @@ void lexer_next(Lexer *lexer) {
 		return;
 	}
 
+	if (is_utf8_forall(src, lexer->pos, lexer->len)) {
+		lexer->current.kind = TOK_FORALL;
+		lexer->current.length = 3;
+		lexer->pos += 3;
+		return;
+	}
+
+	if (is_utf8_exists(src, lexer->pos, lexer->len)) {
+		lexer->current.kind = TOK_EXISTS;
+		lexer->current.length = 3;
+		lexer->pos += 3;
+		return;
+	}
+
+	if (is_utf8_exists_alt_upper(src, lexer->pos, lexer->len) ||
+	    is_utf8_exists_alt_lower(src, lexer->pos, lexer->len)) {
+		lexer->current.kind = TOK_EXISTS;
+		lexer->current.length = 2;
+		lexer->pos += 2;
+		return;
+	}
+
 	if (is_utf8_sqrt(src, lexer->pos, lexer->len)) {
 		lexer->current.kind = TOK_SQRT;
 		lexer->current.length = 3;
@@ -367,6 +415,11 @@ void lexer_next(Lexer *lexer) {
 		lexer->current.length = 1;
 		lexer->pos++;
 		return;
+	case ':':
+		lexer->current.kind = TOK_COLON;
+		lexer->current.length = 1;
+		lexer->pos++;
+		return;
 	case '(':
 		lexer->current.kind = TOK_LPAREN;
 		lexer->current.length = 1;
@@ -469,18 +522,40 @@ void lexer_next(Lexer *lexer) {
 			lexer->current.kind = TOK_LIMIT;
 			return;
 		}
+		if (ident_equals(lexer->current.start, lexer->current.length, "forall") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "FORALL")) {
+			lexer->current.kind = TOK_FORALL;
+			return;
+		}
+		if (ident_equals(lexer->current.start, lexer->current.length, "exists") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "EXISTS")) {
+			lexer->current.kind = TOK_EXISTS;
+			return;
+		}
 		if (ident_equals(lexer->current.start, lexer->current.length, "to") ||
 		    ident_equals(lexer->current.start, lexer->current.length, "TO")) {
 			lexer->current.kind = TOK_TO;
 			return;
 		}
 		if (ident_equals(lexer->current.start, lexer->current.length, "in") ||
-		    ident_equals(lexer->current.start, lexer->current.length, "IN")) {
+		    ident_equals(lexer->current.start, lexer->current.length, "IN") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "memberof") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "memberOf") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "MEMBEROF") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "elementof") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "elementOf") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "ELEMENTOF") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "elemof") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "elemOf") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "ELEMOF")) {
 			lexer->current.kind = TOK_IN;
 			return;
 		}
 		if (ident_equals(lexer->current.start, lexer->current.length, "contains") ||
-		    ident_equals(lexer->current.start, lexer->current.length, "CONTAINS")) {
+		    ident_equals(lexer->current.start, lexer->current.length, "CONTAINS") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "hasmember") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "hasMember") ||
+		    ident_equals(lexer->current.start, lexer->current.length, "HASMEMBER")) {
 			lexer->current.kind = TOK_CONTAINS;
 			return;
 		}
