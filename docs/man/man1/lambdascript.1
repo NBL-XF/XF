@@ -1,0 +1,110 @@
+.Dd June 29, 2026
+.Dt LAMBDASCRIPT 1
+.Os
+.Sh NAME
+.Nm lambdascript
+.Nd LambdaScript interpreter
+.Sh SYNOPSIS
+.Nm
+.Op Fl q
+.Op Fl t
+.Op Fl n Ar steps
+.Op Fl e Ar expr
+.Op Fl -no-prelude
+.Op Ar file
+.Op Fl -
+.Op Ar args ...
+.Sh DESCRIPTION
+.Nm
+evaluates LambdaScript expressions from a string, file, or standard input.
+The language centers on lambda calculus, numeric operators, symbolic logic, quantified forms, and list-like runtime values.
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl e Ar expr
+Evaluate an inline expression.
+.It Fl n Ar steps
+Limit or report reduction steps.
+.It Fl q
+Quiet mode; print the reduced term without extra narration.
+.It Fl t
+Trace reductions.
+.It Fl -no-prelude
+Disable the default prelude bindings.
+.It Fl h , Fl -help
+Show usage information.
+.El
+.Sh PRELUDE
+The default prelude includes combinators and boolean helpers such as
+.Ic I ,
+.Ic K ,
+.Ic S ,
+.Ic TRUE ,
+.Ic FALSE ,
+.Ic AND ,
+.Ic OR ,
+.Ic NOT ,
+.Ic IMP ,
+and
+.Ic IFF .
+.Sh IMPORTS
+Two import forms are supported:
+.Bl -tag -width Ds
+.It Ic import\ "path/to/file"
+Import a user-defined file by path.
+.It Ic import\ {Lib}
+Import an official global library.
+.El
+Global library lookup uses:
+.Bl -enum
+.It
+.Ev LAMBDASCRIPT_LIB_DIR
+.It
+.Ev XDG_DATA_HOME Ns Pa /lambdascript/lib
+.It
+.Ev HOME Ns Pa /.lambdascript/lib
+.It
+.Pa ./.lambdascript/lib
+.El
+.Sh OFFICIAL GLOBAL LIBRARIES
+Current shipped libraries include:
+.Bl -tag -width Ds
+.It Ic Logic
+Defines
+.Ic NAND ,
+.Ic NOR ,
+and
+.Ic XOR .
+.It Ic Vector
+Defines immutable-sequence helpers such as
+.Ic EMPTY ,
+.Ic PUSH ,
+.Ic FIRST ,
+.Ic REST ,
+.Ic LENGTH ,
+.Ic APPEND ,
+.Ic MAP ,
+.Ic FILTER ,
+.Ic FOLD ,
+and
+.Ic REVERSE .
+.El
+.Sh ARGUMENTS
+When a script is executed with trailing arguments, runtime names such as
+.Ic ARG1 ,
+.Ic ARG2 ,
+.Ic ARGC ,
+and
+.Ic ARGS
+are populated.
+.Sh EXAMPLES
+Evaluate inline code:
+.Bd -literal -offset indent
+lambdascript -q -e '(\x.x) y'
+.Ed
+.Pp
+Run a file with script arguments:
+.Bd -literal -offset indent
+lambdascript program.lambda -- one two three
+.Ed
+.Sh SEE ALSO
+.Xr lambdascript 7

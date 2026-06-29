@@ -1,0 +1,73 @@
+.Dd June 29, 2026
+.Dt XF-LANG 7
+.Os
+.Sh NAME
+.Nm xf-lang
+.Nd overview of the XF language
+.Sh DESCRIPTION
+XF is a compiled-to-VM scripting language with an interactive REPL and a broad built-in module system.
+The language surface includes declarations, expressions, statements, imports, formatting, pattern and text processing, and runtime concurrency.
+.Sh LEXICAL AND SYNTACTIC SHAPE
+The lexer and parser expose keywords and types including:
+.Bl -bullet
+.It
+numeric, string, boolean, array, map, set, and tuple-oriented values
+.It
+control flow and function syntax
+.It
+import forms
+.It
+formatted output through
+.Ic print ,
+.Ic printf ,
+and
+.Ic outfmt
+.It
+runtime concurrency through
+.Ic spawn
+and
+.Ic join
+.El
+.Sh SPECIAL VARIABLES
+XF includes AWK-style record and formatting variables:
+.Bl -tag -width Ds
+.It Ic NR
+Total input record count.
+.It Ic FNR
+Per-file input record count.
+.It Ic NF
+Field count for the current record.
+.It Ic FS
+Input field separator.
+.It Ic RS
+Input record separator.
+.It Ic OFS
+Output field separator.
+.It Ic ORS
+Output record separator.
+.It Ic OFMT
+Numeric output format.
+.El
+.Sh EXECUTION MODEL
+Source is tokenized, parsed, compiled, and executed on a VM.
+The runtime also includes GC, SIMD support, and multithreaded helpers.
+See
+.Xr xf-vm 7 ,
+.Xr xf-gc 7 ,
+and
+.Xr xf-mt 7 .
+.Sh MODULES
+Core functionality ships as built-in namespaces.
+See
+.Xr xf-core 7 .
+.Sh EMBEDDED LANGUAGES
+XF ships bridges for embedded LambdaScript and ByteLang through core modules.
+Those subsystems remain separately documented by
+.Xr lambdascript 1 ,
+.Xr lambdascript 7 ,
+.Xr bytelang 1 ,
+and
+.Xr bytelang 7 .
+.Sh SEE ALSO
+.Xr xf 1 ,
+.Xr xf-core 7

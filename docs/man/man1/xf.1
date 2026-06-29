@@ -1,0 +1,79 @@
+.Dd June 29, 2026
+.Dt XF 1
+.Os
+.Sh NAME
+.Nm xf
+.Nd XF language interpreter and REPL
+.Sh SYNOPSIS
+.Nm
+.Op Fl j Ar jobs
+.Op Fl e Ar code
+.Op Ar file.xf
+.Sh DESCRIPTION
+.Nm
+runs XF programs from a file, evaluates inline XF code, or starts an interactive REPL when no input is given.
+The implementation uses a lexer, parser, compiler, and VM pipeline.
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl e Ar code
+Evaluate inline XF source.
+.It Fl j Ar jobs
+Set the worker thread count used by runtime concurrency support.
+.It Fl -version
+Print the version and exit.
+.El
+.Sh OPERANDS
+.Bl -tag -width Ds
+.It Ar file.xf
+Path to an XF script to execute.
+.El
+.Sh REPL
+When no script path and no
+.Fl e
+expression are supplied,
+.Nm
+starts a readline-based interactive session.
+.Sh LANGUAGE OVERVIEW
+XF provides a dynamic scripting language with a VM runtime, built-in core modules, import support, formatted output, records, arrays, maps, tuples, sets, regular expressions, and concurrency primitives such as
+.Ic spawn
+and
+.Ic join .
+Special runtime variables include
+.Ic NR ,
+.Ic NF ,
+.Ic FNR ,
+.Ic FS ,
+.Ic RS ,
+.Ic OFS ,
+.Ic ORS ,
+and
+.Ic OFMT .
+See
+.Xr xf-lang 7
+and
+.Xr xf-core 7 .
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa bin/release/xf
+Typical built executable in the source tree.
+.El
+.Sh EXAMPLES
+Evaluate inline code:
+.Bd -literal -offset indent
+xf -e 'print("hello")'
+.Ed
+.Pp
+Run a script:
+.Bd -literal -offset indent
+xf script.xf
+.Ed
+.Pp
+Run with four worker threads:
+.Bd -literal -offset indent
+xf -j 4 pipeline.xf
+.Ed
+.Sh SEE ALSO
+.Xr xf-lang 7 ,
+.Xr xf-core 7
+.Sh AUTHORS
+XF project authors.

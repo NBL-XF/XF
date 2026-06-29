@@ -5,5 +5,3 @@ define macro "Array" "array";
 #define fn Array.set "native";
 #define fn Array.get "native";
 #define fn Array.length "native";
-
-

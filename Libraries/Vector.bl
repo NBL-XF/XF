@@ -1,24 +1,32 @@
+import {Array}
+
 define macro "Vector" "array";
 
 define fn Vector.new(capacity) {
+    if (capacity < 1) {
+        capacity = 1;
+    }
+
     new Array data = Array.new(capacity);
-    new array v = array_new(3);
-    array_set(v, 0, data);
-    array_set(v, 1, 0);
-    array_set(v, 2, capacity);
+    new Vector v = Array.new(3);
+
+    Array.set(v, 0, data);
+    Array.set(v, 1, 0);
+    Array.set(v, 2, capacity);
+
     return v;
 }
 
+define fn Vector.data(v) {
+    return Array.get(v, 0);
+}
+
 define fn Vector.length(v) {
-    return array_get(v, 1);
+    return Array.get(v, 1);
 }
 
 define fn Vector.capacity(v) {
-    return array_get(v, 2);
-}
-
-define fn Vector.data(v) {
-    return array_get(v, 0);
+    return Array.get(v, 2);
 }
 
 define fn Vector.push(v, value) {
@@ -32,24 +40,30 @@ define fn Vector.push(v, value) {
             next = 1;
         }
         data = Array.grow(data, next);
-        array_set(v, 0, data);
-        array_set(v, 2, next);
+        Array.set(v, 0, data);
+        Array.set(v, 2, next);
     }
 
     Array.set(data, len, value);
-    array_set(v, 1, len + 1);
+    Array.set(v, 1, len + 1);
     return v;
 }
 
 define fn Vector.get(v, index) {
-    if (index < 0 || index >= Vector.length(v)) {
+    if (index < 0) {
+        assert(0);
+    }
+    if (index >= Vector.length(v)) {
         assert(0);
     }
     return Array.get(Vector.data(v), index);
 }
 
 define fn Vector.set(v, index, value) {
-    if (index < 0 || index >= Vector.length(v)) {
+    if (index < 0) {
+        assert(0);
+    }
+    if (index >= Vector.length(v)) {
         assert(0);
     }
     return Array.set(Vector.data(v), index, value);

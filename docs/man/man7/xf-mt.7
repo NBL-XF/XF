@@ -1,0 +1,16 @@
+.Dd June 29, 2026
+.Dt XF-MT 7
+.Os
+.Sh NAME
+.Nm xf-mt
+.Nd XF multithreading support
+.Sh DESCRIPTION
+XF includes runtime multithreading support, object and global locking helpers, and user-visible concurrency constructs such as
+.Ic spawn
+and
+.Ic join .
+Worker count can be selected from the command line with
+.Fl j .
+.Sh SEE ALSO
+.Xr xf 1 ,
+.Xr xf-lang 7

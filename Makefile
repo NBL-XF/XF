@@ -1,4 +1,4 @@
-# Makefile
+# File: Makefile
 
 .DEFAULT_GOAL := all
 
@@ -37,6 +37,17 @@ LDLIBS ?= -lm -lpthread -lreadline
 
 PREFIX  ?= /usr/local
 DESTDIR ?=
+
+MANDIR      := $(PREFIX)/share/man
+DOC_MANDIR  ?= docs/man
+MAN1_SRC    := $(wildcard $(DOC_MANDIR)/man1/*.1)
+MAN3_SRC    := $(wildcard $(DOC_MANDIR)/man3/*.3)
+MAN5_SRC    := $(wildcard $(DOC_MANDIR)/man5/*.5)
+MAN7_SRC    := $(wildcard $(DOC_MANDIR)/man7/*.7)
+MAN1_DST    := $(addprefix $(DESTDIR)$(MANDIR)/man1/,$(notdir $(MAN1_SRC)))
+MAN3_DST    := $(addprefix $(DESTDIR)$(MANDIR)/man3/,$(notdir $(MAN3_SRC)))
+MAN5_DST    := $(addprefix $(DESTDIR)$(MANDIR)/man5/,$(notdir $(MAN5_SRC)))
+MAN7_DST    := $(addprefix $(DESTDIR)$(MANDIR)/man7/,$(notdir $(MAN7_SRC)))
 
 OBJDIR = obj/$(MODE)
 BINDIR = bin/$(MODE)
@@ -153,7 +164,7 @@ $(OBJDIR)/lib/%.o: lib/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(LS_INC) $(BYTE_INC) -c $< -o $@
 
-install: $(LIBXF) $(BIN)
+install: $(LIBXF) $(BIN) install-man
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -d $(DESTDIR)$(PREFIX)/lib
 	install -d $(DESTDIR)$(PREFIX)/include/xf
@@ -163,10 +174,34 @@ install: $(LIBXF) $(BIN)
 	               lib/driver.h \
 	               $(DESTDIR)$(PREFIX)/include/xf/
 
-uninstall:
+install-man:
+	@if [ -n "$(MAN1_SRC)$(MAN3_SRC)$(MAN5_SRC)$(MAN7_SRC)" ]; then \
+		install -d $(DESTDIR)$(MANDIR); \
+	fi
+	@if [ -n "$(MAN1_SRC)" ]; then \
+		install -d $(DESTDIR)$(MANDIR)/man1; \
+		install -m 644 $(MAN1_SRC) $(DESTDIR)$(MANDIR)/man1/; \
+	fi
+	@if [ -n "$(MAN3_SRC)" ]; then \
+		install -d $(DESTDIR)$(MANDIR)/man3; \
+		install -m 644 $(MAN3_SRC) $(DESTDIR)$(MANDIR)/man3/; \
+	fi
+	@if [ -n "$(MAN5_SRC)" ]; then \
+		install -d $(DESTDIR)$(MANDIR)/man5; \
+		install -m 644 $(MAN5_SRC) $(DESTDIR)$(MANDIR)/man5/; \
+	fi
+	@if [ -n "$(MAN7_SRC)" ]; then \
+		install -d $(DESTDIR)$(MANDIR)/man7; \
+		install -m 644 $(MAN7_SRC) $(DESTDIR)$(MANDIR)/man7/; \
+	fi
+
+uninstall: uninstall-man
 	rm -f  $(DESTDIR)$(PREFIX)/bin/xf
 	rm -f  $(DESTDIR)$(PREFIX)/lib/libxf.a
 	rm -rf $(DESTDIR)$(PREFIX)/include/xf
+
+uninstall-man:
+	rm -f $(MAN1_DST) $(MAN3_DST) $(MAN5_DST) $(MAN7_DST)
 
 clean:
 	rm -rf obj/* bin/*
@@ -175,4 +210,4 @@ clean:
 
 export ASAN_SYMBOLIZER_PATH=$(LLVM_PREFIX)/llvm-symbolizer
 
-.PHONY: all run install uninstall clean
+.PHONY: all run install install-man uninstall uninstall-man clean

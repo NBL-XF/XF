@@ -1,0 +1,70 @@
+.Dd June 29, 2026
+.Dt BYTELANG 1
+.Os
+.Sh NAME
+.Nm bytelang
+.Nd ByteLang interpreter
+.Sh SYNOPSIS
+.Nm
+.Op Fl -check
+.Op Fl -print-result
+.Ar file.bl
+.Sh DESCRIPTION
+.Nm
+runs ByteLang source files, checks them without execution, or prints a script's final returned value.
+ByteLang is a small imperative scripting language aimed at hand-rolled abstractions, low-level work, arrays, buffers, named functions, and explicit runtime control.
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl -check
+Parse and validate only.
+.It Fl -print-result
+Print the final returned value, if any.
+.It Fl -help
+Show usage information.
+.El
+.Sh IMPORTS
+Two import forms are supported:
+.Bl -tag -width Ds
+.It Ic import\ "path/to/file"
+Import a user-defined file by path.
+.It Ic import\ {Lib}
+Import an official global library from
+.Pa ~/.bytelang/lib .
+.El
+The interpreter creates the global library directory on first run when needed, and project builds may sync checked-in libraries into that location.
+.Sh OFFICIAL GLOBAL LIBRARIES
+.Bl -tag -width Ds
+.It Ic String
+Defines the
+.Ic String
+macro alias and native entry points
+.Ic String.concat ,
+.Ic String.cmp ,
+and
+.Ic String.length .
+.It Ic Array
+Defines native calls
+.Ic Array.new ,
+.Ic Array.grow ,
+.Ic Array.set ,
+.Ic Array.get ,
+and
+.Ic Array.length .
+.It Ic Vector
+Defines a growable vector convention layered over
+.Ic Array .
+.It Ic Tensor
+Defines a tensor convention using flat data storage plus shape and rank metadata.
+.El
+.Sh EXAMPLES
+Check a file:
+.Bd -literal -offset indent
+bytelang --check script.bl
+.Ed
+.Pp
+Run and print the returned value:
+.Bd -literal -offset indent
+bytelang --print-result result.bl
+.Ed
+.Sh SEE ALSO
+.Xr bytelang 7
