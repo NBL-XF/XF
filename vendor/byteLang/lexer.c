@@ -152,6 +152,7 @@ BLToken bl_lexer_next(BLLexer *lexer) {
         case '*': return bl_make_token(TOK_STAR, start, 1, line, column);
         case '/': return bl_make_token(TOK_SLASH, start, 1, line, column);
         case '%': return bl_make_token(TOK_PERCENT, start, 1, line, column);
+        case '.': return bl_make_token(TOK_DOT, start, 1, line, column);
         case '!':
             if (bl_lexer_match(lexer, '=')) return bl_make_token(TOK_NEQ, start, 2, line, column);
             return bl_make_token(TOK_BANG, start, 1, line, column);

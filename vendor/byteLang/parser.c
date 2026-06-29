@@ -91,6 +91,49 @@ static int bl_expect(BLParser *parser, BLTokenKind kind, const char *message) {
     return 0;
 }
 
+static char *bl_text_concat3(const char *left, const char *middle, const char *right) {
+    size_t left_len = left ? strlen(left) : 0;
+    size_t middle_len = middle ? strlen(middle) : 0;
+    size_t right_len = right ? strlen(right) : 0;
+    char *text = (char *)calloc(left_len + middle_len + right_len + 1, 1);
+    if (!text) {
+        perror("calloc");
+        exit(1);
+    }
+    if (left_len) memcpy(text, left, left_len);
+    if (middle_len) memcpy(text + left_len, middle, middle_len);
+    if (right_len) memcpy(text + left_len + middle_len, right, right_len);
+    return text;
+}
+
+static char *bl_parse_qualified_ident_text(BLParser *parser, const char *message) {
+    if (parser->current.kind != TOK_IDENT) {
+        bl_parser_set_error(parser, parser->current.line, parser->current.column, "%s", message);
+        return NULL;
+    }
+
+    char *name = bl_token_text(parser->current);
+    bl_advance(parser);
+
+    while (!parser->error && bl_match(parser, TOK_DOT)) {
+        if (parser->current.kind != TOK_IDENT) {
+            free(name);
+            bl_parser_set_error(parser, parser->current.line, parser->current.column, "expected identifier after '.'");
+            return NULL;
+        }
+
+        char *segment = bl_token_text(parser->current);
+        bl_advance(parser);
+
+        char *joined = bl_text_concat3(name, ".", segment);
+        free(name);
+        free(segment);
+        name = joined;
+    }
+
+    return name;
+}
+
 static BLNode *bl_parse_statement(BLParser *parser);
 static BLNode *bl_parse_expression(BLParser *parser);
 
@@ -127,9 +170,12 @@ static BLNode *bl_parse_primary(BLParser *parser) {
         return node;
     }
 
-    if (bl_match(parser, TOK_IDENT)) {
-        BLNode *node = bl_new_node(parser, AST_IDENT, token.line, token.column);
-        node->as.ident.name = bl_token_text(token);
+    if (parser->current.kind == TOK_IDENT) {
+        BLToken ident = parser->current;
+        char *name = bl_parse_qualified_ident_text(parser, "expected identifier");
+        if (!name) return NULL;
+        BLNode *node = bl_new_node(parser, AST_IDENT, ident.line, ident.column);
+        node->as.ident.name = name;
         return node;
     }
 
@@ -305,18 +351,26 @@ static BLNode *bl_parse_expression(BLParser *parser) {
 
 static BLNode *bl_parse_fn_definition(BLParser *parser) {
     BLToken name = parser->current;
-    if (!bl_expect(parser, TOK_IDENT, "expected function name")) return NULL;
+    char *fn_name = bl_parse_qualified_ident_text(parser, "expected function name");
+    if (!fn_name) return NULL;
 
     if (parser->current.kind == TOK_STRING) {
         bl_advance(parser);
-        if (!bl_expect(parser, TOK_SEMI, "expected ';' after native definition")) return NULL;
+        if (!bl_expect(parser, TOK_SEMI, "expected ';' after native definition")) {
+            free(fn_name);
+            return NULL;
+        }
+        free(fn_name);
         return NULL;
     }
 
-    if (!bl_expect(parser, TOK_LPAREN, "expected '(' after function name")) return NULL;
+    if (!bl_expect(parser, TOK_LPAREN, "expected '(' after function name")) {
+        free(fn_name);
+        return NULL;
+    }
 
     BLNode *node = bl_new_node(parser, AST_FN_DEF, name.line, name.column);
-    node->as.fn_def.name = bl_token_text(name);
+    node->as.fn_def.name = fn_name;
 
     while (!parser->error && parser->current.kind != TOK_RPAREN) {
         BLToken param = parser->current;
@@ -384,11 +438,17 @@ static BLNode *bl_parse_statement(BLParser *parser) {
     if (bl_match(parser, TOK_HASH)) {
         if (!bl_expect(parser, TOK_DEFINE, "expected define after '#'")) return NULL;
         if (!bl_expect(parser, TOK_FN, "expected fn after '#define'")) return NULL;
-        BLToken name = parser->current;
-        if (!bl_expect(parser, TOK_IDENT, "expected function name")) return NULL;
-        if (!bl_expect(parser, TOK_STRING, "expected native snippet string")) return NULL;
-        if (!bl_expect(parser, TOK_SEMI, "expected ';' after native snippet")) return NULL;
-        (void)name;
+        char *native_name = bl_parse_qualified_ident_text(parser, "expected function name");
+        if (!native_name) return NULL;
+        if (!bl_expect(parser, TOK_STRING, "expected native snippet string")) {
+            free(native_name);
+            return NULL;
+        }
+        if (!bl_expect(parser, TOK_SEMI, "expected ';' after native snippet")) {
+            free(native_name);
+            return NULL;
+        }
+        free(native_name);
         return NULL;
     }
 

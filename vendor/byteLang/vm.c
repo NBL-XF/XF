@@ -82,6 +82,50 @@ static size_t bl_value_length(BLValue value) {
     return 0;
 }
 
+static int bl_value_is_string_like(BLValue value) {
+    return bl_value_is_string(value) || bl_value_is_buffer(value);
+}
+
+static BLValue bl_stringify_value_as_buffer(BLValue value) {
+    if (bl_value_is_buffer(value)) return bl_value_clone(value);
+
+    if (bl_value_is_string(value)) {
+        BLString *string = bl_value_as_string(value);
+        return bl_value_cstring_buffer_n(string->data, string->size);
+    }
+
+    if (value.tag == BLV_INT) {
+        char text[64];
+        snprintf(text, sizeof(text), "%lld", value.as.i);
+        return bl_value_cstring_buffer_copy(text);
+    }
+
+    return bl_value_cstring_buffer_copy("");
+}
+
+static int bl_get_string_like(BLValue value, const unsigned char **bytes, size_t *length) {
+    int ok = 0;
+    const unsigned char *data = bl_value_cstring_bytes(value, length, &ok);
+    if (!ok || !data) return 0;
+    if (bytes) *bytes = data;
+    return 1;
+}
+
+static int bl_buffer_resize_owned(BLBuffer *buffer, size_t new_size) {
+    unsigned char *data = (unsigned char *)realloc(buffer->data, new_size ? new_size : 1);
+    if (!data) {
+        perror("realloc");
+        exit(1);
+    }
+    if (new_size > buffer->size) {
+        memset(data + buffer->size, 0, new_size - buffer->size);
+    }
+    buffer->data = data;
+    buffer->size = new_size;
+    buffer->owned = 1;
+    return 1;
+}
+
 static BLEnv *bl_env_create(BLEnv *parent) {
     BLEnv *env = (BLEnv *)calloc(1, sizeof(BLEnv));
     if (!env) {
@@ -176,21 +220,85 @@ static BLValue bl_builtin_string_new(BLVM *vm, BLNode *call_node, BLValue *args,
         BLString *string = bl_value_as_string(args[0]);
         return bl_value_string_n(string->data, string->size);
     }
+    if (bl_value_is_buffer(args[0])) {
+        size_t length = 0;
+        int ok = 0;
+        const unsigned char *bytes = bl_value_cstring_bytes(args[0], &length, &ok);
+        if (!ok) {
+            return bl_runtime_error(vm, call_node, "string_new expects string, buffer, or int");
+        }
+        return bl_value_string_n((const char *)bytes, length);
+    }
     if (args[0].tag == BLV_INT) {
         char tmp[2];
         tmp[0] = (char)(args[0].as.i & 0xff);
         tmp[1] = '\0';
         return bl_value_string_copy(tmp);
     }
-    return bl_runtime_error(vm, call_node, "string_new expects string or int");
+    return bl_runtime_error(vm, call_node, "string_new expects string, buffer, or int");
 }
 
 static BLValue bl_builtin_string_eq(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
     (void)vm;
     (void)call_node;
-    (void)call_node;
     if (argc < 2) return bl_value_int(0);
     return bl_value_int(bl_value_compare_eq(args[0], args[1]));
+}
+
+static BLValue bl_builtin_string_concat(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
+    const unsigned char *left_bytes = NULL;
+    const unsigned char *right_bytes = NULL;
+    size_t left_len = 0;
+    size_t right_len = 0;
+
+    if (argc < 2 || !bl_get_string_like(args[0], &left_bytes, &left_len) || !bl_get_string_like(args[1], &right_bytes, &right_len)) {
+        return bl_runtime_error(vm, call_node, "String.concat expects string values");
+    }
+
+    BLValue value = bl_value_buffer(left_len + right_len + 1);
+    BLBuffer *buffer = bl_value_as_buffer(value);
+
+    if (left_len) memcpy(buffer->data, left_bytes, left_len);
+    if (right_len) memcpy(buffer->data + left_len, right_bytes, right_len);
+    buffer->data[left_len + right_len] = 0;
+    return value;
+}
+
+static BLValue bl_builtin_string_cmp(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
+    const unsigned char *left_bytes = NULL;
+    const unsigned char *right_bytes = NULL;
+    size_t left_len = 0;
+    size_t right_len = 0;
+
+    if (argc < 2 || !bl_get_string_like(args[0], &left_bytes, &left_len) || !bl_get_string_like(args[1], &right_bytes, &right_len)) {
+        return bl_runtime_error(vm, call_node, "String.cmp expects string values");
+    }
+
+    size_t shared = left_len < right_len ? left_len : right_len;
+    int cmp = 0;
+    if (shared > 0) {
+        cmp = memcmp(left_bytes, right_bytes, shared);
+    }
+    if (cmp == 0) {
+        if (left_len < right_len) cmp = -1;
+        else if (left_len > right_len) cmp = 1;
+    }
+    return bl_value_int((long long)cmp);
+}
+
+static BLValue bl_builtin_string_length(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
+    int ok = 0;
+    size_t length = 0;
+
+    if (argc < 1) {
+        return bl_runtime_error(vm, call_node, "String.length expects one argument");
+    }
+
+    length = bl_value_cstring_length(args[0], &ok);
+    if (!ok) {
+        return bl_runtime_error(vm, call_node, "String.length expects string value");
+    }
+    return bl_value_int((long long)length);
 }
 
 static BLValue bl_builtin_len(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
@@ -384,6 +492,9 @@ static BLValue bl_call_user_function(BLVM *vm, BLNode *call_node, BLNode *fn_nod
 static BLValue bl_builtin_call(BLVM *vm, BLNode *call_node, const char *name, BLValue *args, size_t argc) {
     if (strcmp(name, "string_new") == 0) return bl_builtin_string_new(vm, call_node, args, argc);
     if (strcmp(name, "string_eq") == 0) return bl_builtin_string_eq(vm, call_node, args, argc);
+    if (strcmp(name, "String.concat") == 0) return bl_builtin_string_concat(vm, call_node, args, argc);
+    if (strcmp(name, "String.cmp") == 0) return bl_builtin_string_cmp(vm, call_node, args, argc);
+    if (strcmp(name, "String.length") == 0) return bl_builtin_string_length(vm, call_node, args, argc);
     if (strcmp(name, "len") == 0) return bl_builtin_len(vm, call_node, args, argc);
     if (strcmp(name, "array_new") == 0) return bl_builtin_array_new(vm, call_node, args, argc);
     if (strcmp(name, "array_grow") == 0) return bl_builtin_array_grow(vm, call_node, args, argc);
@@ -471,7 +582,11 @@ static BLValue bl_eval(BLVM *vm, BLEnv *env, BLNode *node) {
                         }
                         memcpy(buffer, a, len_a);
                         memcpy(buffer + len_a, b, len_b + 1);
-                        result = bl_value_string_copy(buffer);
+                        if (bl_value_is_buffer(left) || bl_value_is_buffer(right)) {
+                            result = bl_value_cstring_buffer_n(buffer, len_a + len_b);
+                        } else {
+                            result = bl_value_string_copy(buffer);
+                        }
                         free(buffer);
                         free(a);
                         free(b);
@@ -667,6 +782,13 @@ static BLExecResult bl_exec(BLVM *vm, BLEnv *env, BLNode *node) {
         case AST_VAR_DECL: {
             BLValue value = node->as.var_decl.init ? bl_eval(vm, env, node->as.var_decl.init) : bl_value_null();
             if (vm->error) return result;
+
+            if (strcmp(node->as.var_decl.type_name, "String") == 0) {
+                BLValue converted = bl_stringify_value_as_buffer(value);
+                bl_value_release(value);
+                value = converted;
+            }
+
             bl_env_define(env, node->as.var_decl.name, value);
             bl_value_release(value);
             return result;

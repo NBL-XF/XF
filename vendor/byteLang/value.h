@@ -56,6 +56,9 @@ BLValue bl_value_int(long long value);
 BLValue bl_value_string_copy(const char *text);
 BLValue bl_value_string_n(const char *text, size_t length);
 BLValue bl_value_buffer(size_t size);
+BLValue bl_value_buffer_n(const unsigned char *data, size_t size);
+BLValue bl_value_cstring_buffer_n(const char *text, size_t length);
+BLValue bl_value_cstring_buffer_copy(const char *text);
 BLValue bl_value_array(size_t size);
 
 int bl_value_is_truthy(BLValue value);
@@ -72,6 +75,8 @@ BLBuffer *bl_value_as_buffer(BLValue value);
 BLArray *bl_value_as_array(BLValue value);
 
 char *bl_value_to_cstring(BLValue value);
+size_t bl_value_cstring_length(BLValue value, int *ok);
+const unsigned char *bl_value_cstring_bytes(BLValue value, size_t *length, int *ok);
 long long bl_value_to_int(BLValue value, int *ok);
 int bl_value_compare_eq(BLValue left, BLValue right);
 

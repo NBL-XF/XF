@@ -65,6 +65,29 @@ BLValue bl_value_buffer(size_t size) {
     return value;
 }
 
+BLValue bl_value_buffer_n(const unsigned char *data, size_t size) {
+    BLValue value = bl_value_buffer(size);
+    BLBuffer *buffer = bl_value_as_buffer(value);
+    if (data && size) {
+        memcpy(buffer->data, data, size);
+    }
+    return value;
+}
+
+BLValue bl_value_cstring_buffer_n(const char *text, size_t length) {
+    BLValue value = bl_value_buffer(length + 1);
+    BLBuffer *buffer = bl_value_as_buffer(value);
+    if (text && length) {
+        memcpy(buffer->data, text, length);
+    }
+    buffer->data[length] = 0;
+    return value;
+}
+
+BLValue bl_value_cstring_buffer_copy(const char *text) {
+    return bl_value_cstring_buffer_n(text ? text : "", text ? strlen(text) : 0);
+}
+
 BLValue bl_value_array(size_t size) {
     BLArray *array = (BLArray *)bl_object_alloc(sizeof(BLArray), BLO_ARRAY);
     array->items = (BLValue *)calloc(size ? size : 1, sizeof(BLValue));
@@ -168,28 +191,74 @@ BLArray *bl_value_as_array(BLValue value) {
     return bl_value_is_array(value) ? (BLArray *)value.as.obj : NULL;
 }
 
-char *bl_value_to_cstring(BLValue value) {
+size_t bl_value_cstring_length(BLValue value, int *ok) {
+    if (bl_value_is_string(value)) {
+        if (ok) *ok = 1;
+        return bl_value_as_string(value)->size;
+    }
+
+    if (bl_value_is_buffer(value)) {
+        BLBuffer *buffer = bl_value_as_buffer(value);
+        size_t length = 0;
+        while (length < buffer->size && buffer->data[length] != 0) {
+            length += 1;
+        }
+        if (ok) *ok = 1;
+        return length;
+    }
+
+    if (ok) *ok = 0;
+    return 0;
+}
+
+const unsigned char *bl_value_cstring_bytes(BLValue value, size_t *length, int *ok) {
     if (bl_value_is_string(value)) {
         BLString *string = bl_value_as_string(value);
-        char *copy = (char *)calloc(string->size + 1, 1);
+        if (length) *length = string->size;
+        if (ok) *ok = 1;
+        return (const unsigned char *)string->data;
+    }
+
+    if (bl_value_is_buffer(value)) {
+        BLBuffer *buffer = bl_value_as_buffer(value);
+        size_t n = 0;
+        while (n < buffer->size && buffer->data[n] != 0) {
+            n += 1;
+        }
+        if (length) *length = n;
+        if (ok) *ok = 1;
+        return buffer->data;
+    }
+
+    if (length) *length = 0;
+    if (ok) *ok = 0;
+    return NULL;
+}
+
+char *bl_value_to_cstring(BLValue value) {
+    int ok = 0;
+    size_t length = 0;
+    const unsigned char *bytes = bl_value_cstring_bytes(value, &length, &ok);
+    if (ok && bytes) {
+        char *copy = (char *)calloc(length + 1, 1);
         if (!copy) {
             perror("calloc");
             exit(1);
         }
-        memcpy(copy, string->data, string->size);
+        if (length) memcpy(copy, bytes, length);
         return copy;
     }
 
     if (value.tag == BLV_INT) {
         char buffer[64];
         snprintf(buffer, sizeof(buffer), "%lld", value.as.i);
-        size_t length = strlen(buffer);
-        char *copy = (char *)calloc(length + 1, 1);
+        size_t text_length = strlen(buffer);
+        char *copy = (char *)calloc(text_length + 1, 1);
         if (!copy) {
             perror("calloc");
             exit(1);
         }
-        memcpy(copy, buffer, length + 1);
+        memcpy(copy, buffer, text_length + 1);
         return copy;
     }
 
@@ -208,12 +277,16 @@ long long bl_value_to_int(BLValue value, int *ok) {
         return value.as.i;
     }
 
-    if (bl_value_is_string(value)) {
-        BLString *string = bl_value_as_string(value);
-        char *end = NULL;
-        long long result = strtoll(string->data, &end, 10);
-        if (ok) *ok = (end && *end == '\0');
-        return result;
+    {
+        char *text = bl_value_to_cstring(value);
+        if (strcmp(text, "null") != 0 || bl_value_is_string(value) || bl_value_is_buffer(value)) {
+            char *end = NULL;
+            long long result = strtoll(text, &end, 10);
+            if (ok) *ok = (end && *end == '\0');
+            free(text);
+            return result;
+        }
+        free(text);
     }
 
     if (ok) *ok = 0;
@@ -221,16 +294,21 @@ long long bl_value_to_int(BLValue value, int *ok) {
 }
 
 int bl_value_compare_eq(BLValue left, BLValue right) {
-    if (left.tag != right.tag) return 0;
-    if (left.tag == BLV_NULL) return 1;
-    if (left.tag == BLV_INT) return left.as.i == right.as.i;
-    if (left.as.obj == right.as.obj) return 1;
+    if (left.tag == BLV_NULL && right.tag == BLV_NULL) return 1;
+    if (left.tag == BLV_INT && right.tag == BLV_INT) return left.as.i == right.as.i;
+    if (left.tag == BLV_OBJECT && right.tag == BLV_OBJECT && left.as.obj == right.as.obj) return 1;
 
-    if (bl_value_is_string(left) && bl_value_is_string(right)) {
-        BLString *a = bl_value_as_string(left);
-        BLString *b = bl_value_as_string(right);
-        if (a->size != b->size) return 0;
-        return memcmp(a->data, b->data, a->size) == 0;
+    if ((bl_value_is_string(left) || bl_value_is_buffer(left)) &&
+        (bl_value_is_string(right) || bl_value_is_buffer(right))) {
+        size_t left_len = 0;
+        size_t right_len = 0;
+        int left_ok = 0;
+        int right_ok = 0;
+        const unsigned char *left_bytes = bl_value_cstring_bytes(left, &left_len, &left_ok);
+        const unsigned char *right_bytes = bl_value_cstring_bytes(right, &right_len, &right_ok);
+        if (!left_ok || !right_ok) return 0;
+        if (left_len != right_len) return 0;
+        return left_len == 0 || memcmp(left_bytes, right_bytes, left_len) == 0;
     }
 
     return 0;

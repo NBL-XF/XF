@@ -23,6 +23,8 @@ CFLAGS ?= -O2 $(WARNFLAGS)
 BUILD_DIR := build
 OBJDIR := $(BUILD_DIR)/obj
 BINDIR := $(BUILD_DIR)/bin
+LOCAL_LIB_DIR := Libraries
+GLOBAL_LIB_DIR := $(HOME)/.bytelang/lib
 
 LIB_SRCS := interpreter.c parser.c lexer.c vm.c value.c
 LIB_OBJS := $(patsubst %.c,$(OBJDIR)/%.o,$(LIB_SRCS))
@@ -31,9 +33,9 @@ LIB := $(BINDIR)/libbl.a
 BIN := $(BINDIR)/bytelang
 TEST_RUNNER := tests/run_tests.sh
 
-.PHONY: all clean check
+.PHONY: all clean check sync-libs
 
-all: $(LIB) $(BIN)
+all: $(LIB) $(BIN) sync-libs
 
 $(OBJDIR) $(BINDIR):
 	mkdir -p $@
@@ -47,6 +49,15 @@ $(LIB): $(LIB_OBJS) | $(BINDIR)
 
 $(BIN): $(CLI_OBJS) $(LIB) | $(BINDIR)
 	$(CC) $(CFLAGS) -o $@ $(CLI_OBJS) $(LIB)
+
+sync-libs:
+	@mkdir -p "$(GLOBAL_LIB_DIR)"
+	@if [ -d "$(LOCAL_LIB_DIR)" ]; then \
+		cp -R "$(LOCAL_LIB_DIR)"/. "$(GLOBAL_LIB_DIR)"/; \
+		printf 'Synced %s -> %s\n' "$(LOCAL_LIB_DIR)" "$(GLOBAL_LIB_DIR)"; \
+	else \
+		printf 'Skipping lib sync: %s does not exist\n' "$(LOCAL_LIB_DIR)"; \
+	fi
 
 check: $(BIN)
 	$(TEST_RUNNER) ./$(BIN)

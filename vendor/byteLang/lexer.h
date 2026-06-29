@@ -43,7 +43,8 @@ typedef enum {
     TOK_STAR,
     TOK_SLASH,
     TOK_PERCENT,
-    TOK_BANG
+    TOK_BANG,
+    TOK_DOT
 } BLTokenKind;
 
 typedef struct {
