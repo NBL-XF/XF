@@ -1,0 +1,39 @@
+define macro "Tensor" "array";
+
+define fn Tensor.new(data_capacity, rank) {
+    new Array data = Array.new(data_capacity);
+    new Array shape = Array.new(rank);
+    new array t = array_new(3);
+    array_set(t, 0, data);
+    array_set(t, 1, shape);
+    array_set(t, 2, rank);
+    return t;
+}
+
+define fn Tensor.data(t) {
+    return array_get(t, 0);
+}
+
+define fn Tensor.shape(t) {
+    return array_get(t, 1);
+}
+
+define fn Tensor.rank(t) {
+    return array_get(t, 2);
+}
+
+define fn Tensor.set_dim(t, dim, size) {
+    return Array.set(Tensor.shape(t), dim, size);
+}
+
+define fn Tensor.dim(t, dim) {
+    return Array.get(Tensor.shape(t), dim);
+}
+
+define fn Tensor.flat_get(t, index) {
+    return Array.get(Tensor.data(t), index);
+}
+
+define fn Tensor.flat_set(t, index, value) {
+    return Array.set(Tensor.data(t), index, value);
+}

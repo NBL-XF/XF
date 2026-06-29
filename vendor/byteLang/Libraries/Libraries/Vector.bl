@@ -1,0 +1,56 @@
+define macro "Vector" "array";
+
+define fn Vector.new(capacity) {
+    new Array data = Array.new(capacity);
+    new array v = array_new(3);
+    array_set(v, 0, data);
+    array_set(v, 1, 0);
+    array_set(v, 2, capacity);
+    return v;
+}
+
+define fn Vector.length(v) {
+    return array_get(v, 1);
+}
+
+define fn Vector.capacity(v) {
+    return array_get(v, 2);
+}
+
+define fn Vector.data(v) {
+    return array_get(v, 0);
+}
+
+define fn Vector.push(v, value) {
+    new int len = Vector.length(v);
+    new int cap = Vector.capacity(v);
+    new Array data = Vector.data(v);
+
+    if (len >= cap) {
+        new int next = cap * 2;
+        if (next < 1) {
+            next = 1;
+        }
+        data = Array.grow(data, next);
+        array_set(v, 0, data);
+        array_set(v, 2, next);
+    }
+
+    Array.set(data, len, value);
+    array_set(v, 1, len + 1);
+    return v;
+}
+
+define fn Vector.get(v, index) {
+    if (index < 0 || index >= Vector.length(v)) {
+        assert(0);
+    }
+    return Array.get(Vector.data(v), index);
+}
+
+define fn Vector.set(v, index, value) {
+    if (index < 0 || index >= Vector.length(v)) {
+        assert(0);
+    }
+    return Array.set(Vector.data(v), index, value);
+}
