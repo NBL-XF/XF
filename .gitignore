@@ -1,3 +1,11 @@
 bin/*
 obj/*
 lib/*.alib/release/static/libxf.a
+
+xf.tar.gz
+xf-mandocs.zip
+*.log
+*.err
+*.out
+.DS_Store
+**/.DS_Store

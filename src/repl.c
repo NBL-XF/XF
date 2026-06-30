@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <readline/readline.h>
 #include <readline/history.h>
 
@@ -13,6 +14,37 @@
 #include "../include/value.h"
 #include "../include/interp.h"
 #define VERSION "1.0.2"
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+static int xf_repl_history_path(char *buf, size_t buf_len) {
+    if (!buf || buf_len == 0) return 0;
+
+    const char *override = getenv("XF_HISTORY_FILE");
+    if (override && *override) {
+        return snprintf(buf, buf_len, "%s", override) < (int)buf_len;
+    }
+
+    const char *home = getenv("HOME");
+    if (!home || !*home) return 0;
+
+    return snprintf(buf, buf_len, "%s/.xf_history", home) < (int)buf_len;
+}
+
+static void xf_repl_load_history(void) {
+    char path[PATH_MAX];
+    if (!xf_repl_history_path(path, sizeof(path))) return;
+    read_history(path);
+}
+
+static void xf_repl_save_history(void) {
+    char path[PATH_MAX];
+    if (!xf_repl_history_path(path, sizeof(path))) return;
+    write_history(path);
+}
+
 
 static void bind_runtime_specials(Interp *it) {
     if (!it || !it->vm) return;
@@ -239,6 +271,7 @@ int xf_run_repl(void) {
     printf("xf repl v%s  (:quit to exit)\n", VERSION);
 
     using_history();
+    xf_repl_load_history();
 
     char *line;
     while ((line = readline(">> ")) != NULL) {
@@ -265,8 +298,10 @@ int xf_run_repl(void) {
 
         /* add non-duplicate entries to history */
         HIST_ENTRY *prev = history_length > 0 ? history_get(history_base + history_length - 1) : NULL;
-        if (!prev || strcmp(prev->line, line) != 0)
+        if (!prev || strcmp(prev->line, line) != 0) {
             add_history(line);
+            xf_repl_save_history();
+        }
 
         vm.had_error = false;
         memset(vm.err_msg, 0, sizeof(vm.err_msg));
@@ -277,6 +312,7 @@ int xf_run_repl(void) {
 
     if (!line) printf("\n"); /* handle Ctrl+D cleanly */
 
+    xf_repl_save_history();
     xf_repl_clear_eval_artifacts(&vm);
     sym_free(&syms);
     vm_free(&vm);

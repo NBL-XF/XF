@@ -117,16 +117,73 @@ static xf_Value csy_close(xf_Value *args, size_t argc) {
 
 /* ── file helpers ─────────────────────────────────────────────── */
 
+
+static bool csy_read_stream_all(FILE *fp, char **out_buf, size_t *out_len) {
+    if (!fp || !out_buf || !out_len) return false;
+
+    size_t cap = 8192;
+    size_t len = 0;
+    char *buf = malloc(cap + 1);
+    if (!buf) return false;
+
+    for (;;) {
+        if (len == cap) {
+            if (cap > ((((size_t)-1) - 1) / 2)) {
+                free(buf);
+                return false;
+            }
+
+            size_t next_cap = cap * 2;
+            char *next = realloc(buf, next_cap + 1);
+            if (!next) {
+                free(buf);
+                return false;
+            }
+
+            buf = next;
+            cap = next_cap;
+        }
+
+        size_t nread = fread(buf + len, 1, cap - len, fp);
+        len += nread;
+
+        if (nread == 0) {
+            if (ferror(fp)) {
+                free(buf);
+                return false;
+            }
+            break;
+        }
+    }
+
+    buf[len] = '\0';
+    *out_buf = buf;
+    *out_len = len;
+    return true;
+}
+
+
 static xf_Value csy_read(xf_Value *args, size_t argc) {
     NEED(1);
     const char *path; size_t plen;
     if (!arg_str(args, argc, 0, &path, &plen)) return propagate(args, argc);
-    FILE *fp = fopen(path, "r");
+
+    FILE *fp = fopen(path, "rb");
     if (!fp) return xf_val_nav(XF_TYPE_STR);
-    char buf[65536]; size_t n = 0; int c;
-    while (n < sizeof(buf)-1 && (c = fgetc(fp)) != EOF) buf[n++] = (char)c;
-    buf[n] = '\0'; fclose(fp);
-    return make_str_val(buf, n);
+
+    char *buf = NULL;
+    size_t len = 0;
+    bool ok = csy_read_stream_all(fp, &buf, &len);
+    fclose(fp);
+
+    if (!ok) {
+        free(buf);
+        return xf_val_nav(XF_TYPE_STR);
+    }
+
+    xf_Value out = make_str_val(buf, len);
+    free(buf);
+    return out;
 }
 
 static xf_Value csy_write(xf_Value *args, size_t argc) {
@@ -182,13 +239,27 @@ static xf_Value csy_run(xf_Value *args, size_t argc) {
     NEED(1);
     const char *cmd; size_t cmdlen;
     if (!arg_str(args, argc, 0, &cmd, &cmdlen)) return propagate(args, argc);
+
     FILE *fp = popen(cmd, "r");
     if (!fp) return xf_val_nav(XF_TYPE_STR);
-    char buf[65536]; size_t n = 0; int c;
-    while (n < sizeof(buf)-1 && (c = fgetc(fp)) != EOF) buf[n++] = (char)c;
-    buf[n] = '\0'; pclose(fp);
-    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
-    return make_str_val(buf, n);
+
+    char *buf = NULL;
+    size_t len = 0;
+    bool ok = csy_read_stream_all(fp, &buf, &len);
+    pclose(fp);
+
+    if (!ok) {
+        free(buf);
+        return xf_val_nav(XF_TYPE_STR);
+    }
+
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+        buf[--len] = '\0';
+    }
+
+    xf_Value out = make_str_val(buf, len);
+    free(buf);
+    return out;
 }
 
 static xf_Value csy_run_lines(xf_Value *args, size_t argc) {
