@@ -70,6 +70,17 @@ Ast *ast_app_new(Ast *fn, Ast *arg) {
 	return node;
 }
 
+Ast *ast_number_new(double value) {
+	Ast *node = (Ast *)calloc(1, sizeof(*node));
+	if (node == NULL) {
+		return NULL;
+	}
+
+	node->kind = AST_NUMBER;
+	node->as.number.value = value;
+	return node;
+}
+
 void ast_free(Ast *node) {
 	if (node == NULL) {
 		return;
@@ -87,14 +98,15 @@ void ast_free(Ast *node) {
 		ast_free(node->as.app.fn);
 		ast_free(node->as.app.arg);
 		break;
+	case AST_NUMBER:
+		break;
 	}
 
 	free(node);
 }
 
 Program *program_new(void) {
-	Program *program = (Program *)calloc(1, sizeof(*program));
-	return program;
+	return (Program *)calloc(1, sizeof(Program));
 }
 
 int program_add_def(Program *program, const char *name, Ast *expr) {
@@ -136,13 +148,11 @@ void program_free(Program *program) {
 		return;
 	}
 
-	def = program->defs;
-	while (def != NULL) {
+	for (def = program->defs; def != NULL; def = next) {
 		next = def->next;
 		free(def->name);
 		ast_free(def->expr);
 		free(def);
-		def = next;
 	}
 
 	ast_free(program->expr);

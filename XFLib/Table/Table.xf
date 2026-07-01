@@ -1,0 +1,252 @@
+map fn table_copy_row(map row) {
+    map out = {}
+    for (k in row) {
+        out[k] = row[k]
+    }
+    return out
+}
+
+arr fn table_copy_rows(arr rows) {
+    arr out = []
+    for (row in rows) {
+        push(out, table_copy_row(row))
+    }
+    return out
+}
+
+arr fn table_copy_arr(arr xs) {
+    arr out = []
+    for (x in xs) {
+        push(out, x)
+    }
+    return out
+}
+
+map fn table_new(arr columns, arr rows) {
+    return {
+        "__kind": "Table",
+        "columns": table_copy_arr(columns),
+        "rows": table_copy_rows(rows)
+    }
+}
+
+map fn table_empty() {
+    return table_new([], [])
+}
+
+bool fn table_is(map t) {
+    return t["__kind"] == "Table"
+}
+
+num fn table_row_count(map t) {
+    return t["rows"].len
+}
+
+num fn table_col_count(map t) {
+    return t["columns"].len
+}
+
+bool fn table_has_column(map t, str name) {
+    for (col in t["columns"]) {
+        if (col == name) {
+            return TRUE
+        }
+    }
+    return FALSE
+}
+
+arr fn table_columns(map t) {
+    return table_copy_arr(t["columns"])
+}
+
+arr fn table_rows(map t) {
+    return table_copy_rows(t["rows"])
+}
+
+map fn table_row(map t, num idx) {
+    return table_copy_row(t["rows"][idx])
+}
+
+arr fn table_column(map t, str name) {
+    arr out = []
+    for (row in t["rows"]) {
+        push(out, row[name])
+    }
+    return out
+}
+
+map fn table_from_rows(arr rows) {
+    arr columns = []
+    map seen = {}
+
+    for (row in rows) {
+        for (k in row) {
+            if (!has(seen, k)) {
+                seen[k] = TRUE
+                push(columns, k)
+            }
+        }
+    }
+
+    return table_new(columns, rows)
+}
+
+map fn table_from_csv_lines(arr lines) {
+    if (lines.len == 0) {
+        return table_empty()
+    }
+
+    arr headers = core.generics.split(lines[0], ",")
+    arr rows = []
+
+    num i = 1
+    while (i < lines.len) {
+        str line = core.str.trim(lines[i])
+        if (line != "") {
+            arr parts = core.generics.split(line, ",")
+            map row = {}
+            num j = 0
+            while (j < headers.len) {
+                if (j < parts.len) {
+                    row[headers[j]] = core.str.trim(parts[j])
+                } else {
+                    row[headers[j]] = ""
+                }
+                j = j + 1
+            }
+            push(rows, row)
+        }
+        i = i + 1
+    }
+
+    return table_new(headers, rows)
+}
+
+map fn table_from_csv_path(str path) {
+    return table_from_csv_lines(core.os.lines(path))
+}
+
+map fn table_head(map t, num n) {
+    arr rows = []
+    num i = 0
+    while (i < t["rows"].len && i < n) {
+        push(rows, table_copy_row(t["rows"][i]))
+        i = i + 1
+    }
+    return table_new(t["columns"], rows)
+}
+
+map fn table_select(map t, arr wanted) {
+    arr rows = []
+
+    for (src in t["rows"]) {
+        map row = {}
+        for (col in wanted) {
+            row[col] = src[col]
+        }
+        push(rows, row)
+    }
+
+    return table_new(wanted, rows)
+}
+
+map fn table_rename(map t, str old_name, str new_name) {
+    arr columns = []
+    for (col in t["columns"]) {
+        if (col == old_name) {
+            push(columns, new_name)
+        } else {
+            push(columns, col)
+        }
+    }
+
+    arr rows = []
+    for (src in t["rows"]) {
+        map row = table_copy_row(src)
+        row[new_name] = row[old_name]
+        remove(row, old_name)
+        push(rows, row)
+    }
+
+    return table_new(columns, rows)
+}
+
+map fn table_add_column(map t, str name, fn f) {
+    arr columns = table_copy_arr(t["columns"])
+    if (!table_has_column(t, name)) {
+        push(columns, name)
+    }
+
+    arr rows = []
+    for (src in t["rows"]) {
+        map row = table_copy_row(src)
+        row[name] = f(row)
+        push(rows, row)
+    }
+
+    return table_new(columns, rows)
+}
+
+map fn table_map_rows(map t, fn f) {
+    arr rows = []
+    for (src in t["rows"]) {
+        push(rows, f(table_copy_row(src)))
+    }
+    return table_from_rows(rows)
+}
+
+map fn table_filter(map t, fn pred) {
+    arr rows = []
+    for (src in t["rows"]) {
+        if (pred(src)) {
+            push(rows, table_copy_row(src))
+        }
+    }
+    return table_new(t["columns"], rows)
+}
+
+map fn table_group_sum(map t, str group_col, str value_col, str out_col) {
+    map acc = {}
+
+    for (row in t["rows"]) {
+        str key = row[group_col] .. ""
+        num value = row[value_col] + 0
+        if (!has(acc, key)) {
+            acc[key] = 0
+        }
+        acc[key] = acc[key] + value
+    }
+
+    arr rows = []
+    for (key in acc) {
+        map row = {}
+        row[group_col] = key
+        row[out_col] = acc[key]
+        push(rows, row)
+    }
+
+    return table_from_rows(rows)
+}
+
+str fn table_render(map t) {
+    return core.format.table(t["rows"], t["columns"])
+}
+
+arr fn table_to_csv_lines(map t) {
+    arr out = []
+    push(out, core.generics.join(t["columns"], ","))
+
+    for (row in t["rows"]) {
+        arr vals = []
+        for (col in t["columns"]) {
+            push(vals, row[col])
+        }
+        push(out, core.format.csv_row(vals))
+    }
+
+    return out
+}
+
+num fn table_write_csv(map t, str path) {
+    return core.os.write(path, core.generics.join(table_to_csv_lines(t), "\n"))
+}

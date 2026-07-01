@@ -4,7 +4,8 @@
 typedef enum {
 	AST_VAR,
 	AST_LAM,
-	AST_APP
+	AST_APP,
+	AST_NUMBER
 } AstKind;
 
 typedef struct Ast Ast;
@@ -25,6 +26,9 @@ struct Ast {
 			Ast *fn;
 			Ast *arg;
 		} app;
+		struct {
+			double value;
+		} number;
 	} as;
 };
 
@@ -43,6 +47,7 @@ struct Program {
 Ast *ast_var_new(const char *name);
 Ast *ast_lam_new(const char *param, Ast *body);
 Ast *ast_app_new(Ast *fn, Ast *arg);
+Ast *ast_number_new(double value);
 void ast_free(Ast *node);
 
 Program *program_new(void);

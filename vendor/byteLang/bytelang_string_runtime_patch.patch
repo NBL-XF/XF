@@ -1,0 +1,556 @@
+--- lexer.h
++++ lexer.h
+@@ -43,7 +43,8 @@
+     TOK_STAR,
+     TOK_SLASH,
+     TOK_PERCENT,
+-    TOK_BANG
++    TOK_BANG,
++    TOK_DOT
+ } BLTokenKind;
+ 
+ typedef struct {
+--- lexer.c
++++ lexer.c
+@@ -152,6 +152,7 @@
+         case '*': return bl_make_token(TOK_STAR, start, 1, line, column);
+         case '/': return bl_make_token(TOK_SLASH, start, 1, line, column);
+         case '%': return bl_make_token(TOK_PERCENT, start, 1, line, column);
++        case '.': return bl_make_token(TOK_DOT, start, 1, line, column);
+         case '!':
+             if (bl_lexer_match(lexer, '=')) return bl_make_token(TOK_NEQ, start, 2, line, column);
+             return bl_make_token(TOK_BANG, start, 1, line, column);
+--- parser.c
++++ parser.c
+@@ -89,6 +89,49 @@
+     }
+     bl_parser_set_error(parser, parser->current.line, parser->current.column, "%s", message);
+     return 0;
++}
++
++static char *bl_text_concat3(const char *left, const char *middle, const char *right) {
++    size_t left_len = left ? strlen(left) : 0;
++    size_t middle_len = middle ? strlen(middle) : 0;
++    size_t right_len = right ? strlen(right) : 0;
++    char *text = (char *)calloc(left_len + middle_len + right_len + 1, 1);
++    if (!text) {
++        perror("calloc");
++        exit(1);
++    }
++    if (left_len) memcpy(text, left, left_len);
++    if (middle_len) memcpy(text + left_len, middle, middle_len);
++    if (right_len) memcpy(text + left_len + middle_len, right, right_len);
++    return text;
++}
++
++static char *bl_parse_qualified_ident_text(BLParser *parser, const char *message) {
++    if (parser->current.kind != TOK_IDENT) {
++        bl_parser_set_error(parser, parser->current.line, parser->current.column, "%s", message);
++        return NULL;
++    }
++
++    char *name = bl_token_text(parser->current);
++    bl_advance(parser);
++
++    while (!parser->error && bl_match(parser, TOK_DOT)) {
++        if (parser->current.kind != TOK_IDENT) {
++            free(name);
++            bl_parser_set_error(parser, parser->current.line, parser->current.column, "expected identifier after '.'");
++            return NULL;
++        }
++
++        char *segment = bl_token_text(parser->current);
++        bl_advance(parser);
++
++        char *joined = bl_text_concat3(name, ".", segment);
++        free(name);
++        free(segment);
++        name = joined;
++    }
++
++    return name;
+ }
+ 
+ static BLNode *bl_parse_statement(BLParser *parser);
+@@ -127,9 +170,12 @@
+         return node;
+     }
+ 
+-    if (bl_match(parser, TOK_IDENT)) {
+-        BLNode *node = bl_new_node(parser, AST_IDENT, token.line, token.column);
+-        node->as.ident.name = bl_token_text(token);
++    if (parser->current.kind == TOK_IDENT) {
++        BLToken ident = parser->current;
++        char *name = bl_parse_qualified_ident_text(parser, "expected identifier");
++        if (!name) return NULL;
++        BLNode *node = bl_new_node(parser, AST_IDENT, ident.line, ident.column);
++        node->as.ident.name = name;
+         return node;
+     }
+ 
+@@ -305,18 +351,26 @@
+ 
+ static BLNode *bl_parse_fn_definition(BLParser *parser) {
+     BLToken name = parser->current;
+-    if (!bl_expect(parser, TOK_IDENT, "expected function name")) return NULL;
++    char *fn_name = bl_parse_qualified_ident_text(parser, "expected function name");
++    if (!fn_name) return NULL;
+ 
+     if (parser->current.kind == TOK_STRING) {
+         bl_advance(parser);
+-        if (!bl_expect(parser, TOK_SEMI, "expected ';' after native definition")) return NULL;
+-        return NULL;
+-    }
+-
+-    if (!bl_expect(parser, TOK_LPAREN, "expected '(' after function name")) return NULL;
++        if (!bl_expect(parser, TOK_SEMI, "expected ';' after native definition")) {
++            free(fn_name);
++            return NULL;
++        }
++        free(fn_name);
++        return NULL;
++    }
++
++    if (!bl_expect(parser, TOK_LPAREN, "expected '(' after function name")) {
++        free(fn_name);
++        return NULL;
++    }
+ 
+     BLNode *node = bl_new_node(parser, AST_FN_DEF, name.line, name.column);
+-    node->as.fn_def.name = bl_token_text(name);
++    node->as.fn_def.name = fn_name;
+ 
+     while (!parser->error && parser->current.kind != TOK_RPAREN) {
+         BLToken param = parser->current;
+@@ -384,11 +438,17 @@
+     if (bl_match(parser, TOK_HASH)) {
+         if (!bl_expect(parser, TOK_DEFINE, "expected define after '#'")) return NULL;
+         if (!bl_expect(parser, TOK_FN, "expected fn after '#define'")) return NULL;
+-        BLToken name = parser->current;
+-        if (!bl_expect(parser, TOK_IDENT, "expected function name")) return NULL;
+-        if (!bl_expect(parser, TOK_STRING, "expected native snippet string")) return NULL;
+-        if (!bl_expect(parser, TOK_SEMI, "expected ';' after native snippet")) return NULL;
+-        (void)name;
++        char *native_name = bl_parse_qualified_ident_text(parser, "expected function name");
++        if (!native_name) return NULL;
++        if (!bl_expect(parser, TOK_STRING, "expected native snippet string")) {
++            free(native_name);
++            return NULL;
++        }
++        if (!bl_expect(parser, TOK_SEMI, "expected ';' after native snippet")) {
++            free(native_name);
++            return NULL;
++        }
++        free(native_name);
+         return NULL;
+     }
+ 
+--- value.h
++++ value.h
+@@ -56,6 +56,9 @@
+ BLValue bl_value_string_copy(const char *text);
+ BLValue bl_value_string_n(const char *text, size_t length);
+ BLValue bl_value_buffer(size_t size);
++BLValue bl_value_buffer_n(const unsigned char *data, size_t size);
++BLValue bl_value_cstring_buffer_n(const char *text, size_t length);
++BLValue bl_value_cstring_buffer_copy(const char *text);
+ BLValue bl_value_array(size_t size);
+ 
+ int bl_value_is_truthy(BLValue value);
+@@ -72,6 +75,8 @@
+ BLArray *bl_value_as_array(BLValue value);
+ 
+ char *bl_value_to_cstring(BLValue value);
++size_t bl_value_cstring_length(BLValue value, int *ok);
++const unsigned char *bl_value_cstring_bytes(BLValue value, size_t *length, int *ok);
+ long long bl_value_to_int(BLValue value, int *ok);
+ int bl_value_compare_eq(BLValue left, BLValue right);
+ 
+--- value.c
++++ value.c
+@@ -63,6 +63,29 @@
+     value.tag = BLV_OBJECT;
+     value.as.obj = &buffer->base;
+     return value;
++}
++
++BLValue bl_value_buffer_n(const unsigned char *data, size_t size) {
++    BLValue value = bl_value_buffer(size);
++    BLBuffer *buffer = bl_value_as_buffer(value);
++    if (data && size) {
++        memcpy(buffer->data, data, size);
++    }
++    return value;
++}
++
++BLValue bl_value_cstring_buffer_n(const char *text, size_t length) {
++    BLValue value = bl_value_buffer(length + 1);
++    BLBuffer *buffer = bl_value_as_buffer(value);
++    if (text && length) {
++        memcpy(buffer->data, text, length);
++    }
++    buffer->data[length] = 0;
++    return value;
++}
++
++BLValue bl_value_cstring_buffer_copy(const char *text) {
++    return bl_value_cstring_buffer_n(text ? text : "", text ? strlen(text) : 0);
+ }
+ 
+ BLValue bl_value_array(size_t size) {
+@@ -168,28 +191,74 @@
+     return bl_value_is_array(value) ? (BLArray *)value.as.obj : NULL;
+ }
+ 
+-char *bl_value_to_cstring(BLValue value) {
++size_t bl_value_cstring_length(BLValue value, int *ok) {
++    if (bl_value_is_string(value)) {
++        if (ok) *ok = 1;
++        return bl_value_as_string(value)->size;
++    }
++
++    if (bl_value_is_buffer(value)) {
++        BLBuffer *buffer = bl_value_as_buffer(value);
++        size_t length = 0;
++        while (length < buffer->size && buffer->data[length] != 0) {
++            length += 1;
++        }
++        if (ok) *ok = 1;
++        return length;
++    }
++
++    if (ok) *ok = 0;
++    return 0;
++}
++
++const unsigned char *bl_value_cstring_bytes(BLValue value, size_t *length, int *ok) {
+     if (bl_value_is_string(value)) {
+         BLString *string = bl_value_as_string(value);
+-        char *copy = (char *)calloc(string->size + 1, 1);
+-        if (!copy) {
+-            perror("calloc");
+-            exit(1);
+-        }
+-        memcpy(copy, string->data, string->size);
+-        return copy;
+-    }
+-
+-    if (value.tag == BLV_INT) {
+-        char buffer[64];
+-        snprintf(buffer, sizeof(buffer), "%lld", value.as.i);
+-        size_t length = strlen(buffer);
++        if (length) *length = string->size;
++        if (ok) *ok = 1;
++        return (const unsigned char *)string->data;
++    }
++
++    if (bl_value_is_buffer(value)) {
++        BLBuffer *buffer = bl_value_as_buffer(value);
++        size_t n = 0;
++        while (n < buffer->size && buffer->data[n] != 0) {
++            n += 1;
++        }
++        if (length) *length = n;
++        if (ok) *ok = 1;
++        return buffer->data;
++    }
++
++    if (length) *length = 0;
++    if (ok) *ok = 0;
++    return NULL;
++}
++
++char *bl_value_to_cstring(BLValue value) {
++    int ok = 0;
++    size_t length = 0;
++    const unsigned char *bytes = bl_value_cstring_bytes(value, &length, &ok);
++    if (ok && bytes) {
+         char *copy = (char *)calloc(length + 1, 1);
+         if (!copy) {
+             perror("calloc");
+             exit(1);
+         }
+-        memcpy(copy, buffer, length + 1);
++        if (length) memcpy(copy, bytes, length);
++        return copy;
++    }
++
++    if (value.tag == BLV_INT) {
++        char buffer[64];
++        snprintf(buffer, sizeof(buffer), "%lld", value.as.i);
++        size_t text_length = strlen(buffer);
++        char *copy = (char *)calloc(text_length + 1, 1);
++        if (!copy) {
++            perror("calloc");
++            exit(1);
++        }
++        memcpy(copy, buffer, text_length + 1);
+         return copy;
+     }
+ 
+@@ -208,12 +277,16 @@
+         return value.as.i;
+     }
+ 
+-    if (bl_value_is_string(value)) {
+-        BLString *string = bl_value_as_string(value);
+-        char *end = NULL;
+-        long long result = strtoll(string->data, &end, 10);
+-        if (ok) *ok = (end && *end == '\0');
+-        return result;
++    {
++        char *text = bl_value_to_cstring(value);
++        if (strcmp(text, "null") != 0 || bl_value_is_string(value) || bl_value_is_buffer(value)) {
++            char *end = NULL;
++            long long result = strtoll(text, &end, 10);
++            if (ok) *ok = (end && *end == '\0');
++            free(text);
++            return result;
++        }
++        free(text);
+     }
+ 
+     if (ok) *ok = 0;
+@@ -221,16 +294,21 @@
+ }
+ 
+ int bl_value_compare_eq(BLValue left, BLValue right) {
+-    if (left.tag != right.tag) return 0;
+-    if (left.tag == BLV_NULL) return 1;
+-    if (left.tag == BLV_INT) return left.as.i == right.as.i;
+-    if (left.as.obj == right.as.obj) return 1;
+-
+-    if (bl_value_is_string(left) && bl_value_is_string(right)) {
+-        BLString *a = bl_value_as_string(left);
+-        BLString *b = bl_value_as_string(right);
+-        if (a->size != b->size) return 0;
+-        return memcmp(a->data, b->data, a->size) == 0;
++    if (left.tag == BLV_NULL && right.tag == BLV_NULL) return 1;
++    if (left.tag == BLV_INT && right.tag == BLV_INT) return left.as.i == right.as.i;
++    if (left.tag == BLV_OBJECT && right.tag == BLV_OBJECT && left.as.obj == right.as.obj) return 1;
++
++    if ((bl_value_is_string(left) || bl_value_is_buffer(left)) &&
++        (bl_value_is_string(right) || bl_value_is_buffer(right))) {
++        size_t left_len = 0;
++        size_t right_len = 0;
++        int left_ok = 0;
++        int right_ok = 0;
++        const unsigned char *left_bytes = bl_value_cstring_bytes(left, &left_len, &left_ok);
++        const unsigned char *right_bytes = bl_value_cstring_bytes(right, &right_len, &right_ok);
++        if (!left_ok || !right_ok) return 0;
++        if (left_len != right_len) return 0;
++        return left_len == 0 || memcmp(left_bytes, right_bytes, left_len) == 0;
+     }
+ 
+     return 0;
+--- vm.c
++++ vm.c
+@@ -82,6 +82,50 @@
+     return 0;
+ }
+ 
++static int bl_value_is_string_like(BLValue value) {
++    return bl_value_is_string(value) || bl_value_is_buffer(value);
++}
++
++static BLValue bl_stringify_value_as_buffer(BLValue value) {
++    if (bl_value_is_buffer(value)) return bl_value_clone(value);
++
++    if (bl_value_is_string(value)) {
++        BLString *string = bl_value_as_string(value);
++        return bl_value_cstring_buffer_n(string->data, string->size);
++    }
++
++    if (value.tag == BLV_INT) {
++        char text[64];
++        snprintf(text, sizeof(text), "%lld", value.as.i);
++        return bl_value_cstring_buffer_copy(text);
++    }
++
++    return bl_value_cstring_buffer_copy("");
++}
++
++static int bl_get_string_like(BLValue value, const unsigned char **bytes, size_t *length) {
++    int ok = 0;
++    const unsigned char *data = bl_value_cstring_bytes(value, length, &ok);
++    if (!ok || !data) return 0;
++    if (bytes) *bytes = data;
++    return 1;
++}
++
++static int bl_buffer_resize_owned(BLBuffer *buffer, size_t new_size) {
++    unsigned char *data = (unsigned char *)realloc(buffer->data, new_size ? new_size : 1);
++    if (!data) {
++        perror("realloc");
++        exit(1);
++    }
++    if (new_size > buffer->size) {
++        memset(data + buffer->size, 0, new_size - buffer->size);
++    }
++    buffer->data = data;
++    buffer->size = new_size;
++    buffer->owned = 1;
++    return 1;
++}
++
+ static BLEnv *bl_env_create(BLEnv *parent) {
+     BLEnv *env = (BLEnv *)calloc(1, sizeof(BLEnv));
+     if (!env) {
+@@ -176,21 +220,85 @@
+         BLString *string = bl_value_as_string(args[0]);
+         return bl_value_string_n(string->data, string->size);
+     }
++    if (bl_value_is_buffer(args[0])) {
++        size_t length = 0;
++        int ok = 0;
++        const unsigned char *bytes = bl_value_cstring_bytes(args[0], &length, &ok);
++        if (!ok) {
++            return bl_runtime_error(vm, call_node, "string_new expects string, buffer, or int");
++        }
++        return bl_value_string_n((const char *)bytes, length);
++    }
+     if (args[0].tag == BLV_INT) {
+         char tmp[2];
+         tmp[0] = (char)(args[0].as.i & 0xff);
+         tmp[1] = '\0';
+         return bl_value_string_copy(tmp);
+     }
+-    return bl_runtime_error(vm, call_node, "string_new expects string or int");
++    return bl_runtime_error(vm, call_node, "string_new expects string, buffer, or int");
+ }
+ 
+ static BLValue bl_builtin_string_eq(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
+     (void)vm;
+     (void)call_node;
+-    (void)call_node;
+     if (argc < 2) return bl_value_int(0);
+     return bl_value_int(bl_value_compare_eq(args[0], args[1]));
++}
++
++static BLValue bl_builtin_string_concat(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
++    const unsigned char *left_bytes = NULL;
++    const unsigned char *right_bytes = NULL;
++    size_t left_len = 0;
++    size_t right_len = 0;
++
++    if (argc < 2 || !bl_get_string_like(args[0], &left_bytes, &left_len) || !bl_get_string_like(args[1], &right_bytes, &right_len)) {
++        return bl_runtime_error(vm, call_node, "String.concat expects string values");
++    }
++
++    BLValue value = bl_value_buffer(left_len + right_len + 1);
++    BLBuffer *buffer = bl_value_as_buffer(value);
++
++    if (left_len) memcpy(buffer->data, left_bytes, left_len);
++    if (right_len) memcpy(buffer->data + left_len, right_bytes, right_len);
++    buffer->data[left_len + right_len] = 0;
++    return value;
++}
++
++static BLValue bl_builtin_string_cmp(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
++    const unsigned char *left_bytes = NULL;
++    const unsigned char *right_bytes = NULL;
++    size_t left_len = 0;
++    size_t right_len = 0;
++
++    if (argc < 2 || !bl_get_string_like(args[0], &left_bytes, &left_len) || !bl_get_string_like(args[1], &right_bytes, &right_len)) {
++        return bl_runtime_error(vm, call_node, "String.cmp expects string values");
++    }
++
++    size_t shared = left_len < right_len ? left_len : right_len;
++    int cmp = 0;
++    if (shared > 0) {
++        cmp = memcmp(left_bytes, right_bytes, shared);
++    }
++    if (cmp == 0) {
++        if (left_len < right_len) cmp = -1;
++        else if (left_len > right_len) cmp = 1;
++    }
++    return bl_value_int((long long)cmp);
++}
++
++static BLValue bl_builtin_string_length(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
++    int ok = 0;
++    size_t length = 0;
++
++    if (argc < 1) {
++        return bl_runtime_error(vm, call_node, "String.length expects one argument");
++    }
++
++    length = bl_value_cstring_length(args[0], &ok);
++    if (!ok) {
++        return bl_runtime_error(vm, call_node, "String.length expects string value");
++    }
++    return bl_value_int((long long)length);
+ }
+ 
+ static BLValue bl_builtin_len(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
+@@ -384,6 +492,9 @@
+ static BLValue bl_builtin_call(BLVM *vm, BLNode *call_node, const char *name, BLValue *args, size_t argc) {
+     if (strcmp(name, "string_new") == 0) return bl_builtin_string_new(vm, call_node, args, argc);
+     if (strcmp(name, "string_eq") == 0) return bl_builtin_string_eq(vm, call_node, args, argc);
++    if (strcmp(name, "String.concat") == 0) return bl_builtin_string_concat(vm, call_node, args, argc);
++    if (strcmp(name, "String.cmp") == 0) return bl_builtin_string_cmp(vm, call_node, args, argc);
++    if (strcmp(name, "String.length") == 0) return bl_builtin_string_length(vm, call_node, args, argc);
+     if (strcmp(name, "len") == 0) return bl_builtin_len(vm, call_node, args, argc);
+     if (strcmp(name, "array_new") == 0) return bl_builtin_array_new(vm, call_node, args, argc);
+     if (strcmp(name, "array_grow") == 0) return bl_builtin_array_grow(vm, call_node, args, argc);
+@@ -471,7 +582,11 @@
+                         }
+                         memcpy(buffer, a, len_a);
+                         memcpy(buffer + len_a, b, len_b + 1);
+-                        result = bl_value_string_copy(buffer);
++                        if (bl_value_is_buffer(left) || bl_value_is_buffer(right)) {
++                            result = bl_value_cstring_buffer_n(buffer, len_a + len_b);
++                        } else {
++                            result = bl_value_string_copy(buffer);
++                        }
+                         free(buffer);
+                         free(a);
+                         free(b);
+@@ -667,6 +782,13 @@
+         case AST_VAR_DECL: {
+             BLValue value = node->as.var_decl.init ? bl_eval(vm, env, node->as.var_decl.init) : bl_value_null();
+             if (vm->error) return result;
++
++            if (strcmp(node->as.var_decl.type_name, "String") == 0) {
++                BLValue converted = bl_stringify_value_as_buffer(value);
++                bl_value_release(value);
++                value = converted;
++            }
++
+             bl_env_define(env, node->as.var_decl.name, value);
+             bl_value_release(value);
+             return result;
+--- /dev/null
++++ Libraries/String.bl
+@@ -0,0 +1,5 @@
++define macro "String" "ptr";
++
++#define fn String.concat "native";
++#define fn String.cmp "native";
++#define fn String.length "native";
+--- /dev/null
++++ tests/import_string.bl
+@@ -0,0 +1,22 @@
++import {String}
++
++new String a = "abc";
++new String b = "def";
++new String c = String.concat(a, b);
++
++println(c);
++println(String.length(c));
++println(String.cmp(c, "abcdef"));
++
++assert(String.length(a) == 3);
++assert(String.length(c) == 6);
++assert(String.cmp(c, "abcdef") == 0);
++
++free a;
++delete a;
++free b;
++delete b;
++free c;
++delete c;
++
++return 0;

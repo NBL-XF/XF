@@ -1,0 +1,99 @@
+str fn bindata_shell_quote(str s) {
+    return "'" .. core.str.replace_all(s, "'", "'\"'\"'") .. "'"
+}
+
+str fn bindata_temp_path(str prefix) {
+    return "/tmp/" .. prefix .. "_" .. core.os.time() .. "_" .. core.math.int(core.math.rand() * 1000000)
+}
+
+bool fn bindata_has_python() {
+    return core.os.exec("python3 -V >/dev/null 2>&1") == 0
+}
+
+map fn bindata_wrap_map(str kind, map value) {
+    return {
+        "kind": kind,
+        "value": value
+    }
+}
+
+map fn bindata_wrap_arr(str kind, arr value) {
+    return {
+        "kind": kind,
+        "value": value
+    }
+}
+
+num fn bindata_write_pack(str path, map pack) {
+    str tmp_json = bindata_temp_path("xf_bindata_write") .. ".json"
+    num ok_write = core.os.write(tmp_json, core.format.json(pack))
+    if (ok_write == 0) {
+        return 0
+    }
+
+    str cmd =
+        "python3 -c \"import json,struct,sys;obj=json.load(open(sys.argv[1],'r',encoding='utf-8'));payload=json.dumps(obj,separators=(',',':')).encode('utf-8');f=open(sys.argv[2],'wb');f.write(b'XFBD01');f.write(struct.pack('>Q',len(payload)));f.write(payload);f.close()\" " ..
+        bindata_shell_quote(tmp_json) .. " " ..
+        bindata_shell_quote(path)
+
+    num code = core.os.exec(cmd)
+    core.os.exec("rm -f " .. bindata_shell_quote(tmp_json))
+
+    if (code == 0) {
+        return 1
+    }
+    return 0
+}
+
+num fn bindata_write_map(str path, str kind, map value) {
+    return bindata_write_pack(path, bindata_wrap_map(kind, value))
+}
+
+num fn bindata_write_arr(str path, str kind, arr value) {
+    return bindata_write_pack(path, bindata_wrap_arr(kind, value))
+}
+
+map fn bindata_read(str path) {
+    str tmp_json = bindata_temp_path("xf_bindata_read") .. ".json"
+    str cmd =
+        "python3 -c \"import json,struct,sys;f=open(sys.argv[1],'rb');magic=f.read(6);n=struct.unpack('>Q',f.read(8))[0];payload=f.read(n);f.close();obj=json.loads(payload.decode('utf-8'));json.dump(obj,open(sys.argv[2],'w',encoding='utf-8'),indent=2)\" " ..
+        bindata_shell_quote(path) .. " " ..
+        bindata_shell_quote(tmp_json)
+
+    num code = core.os.exec(cmd)
+    if (code != 0) {
+        return {"kind": "ERR", "value": NAV}
+    }
+
+    arr lines = core.os.lines(tmp_json)
+    core.os.exec("rm -f " .. bindata_shell_quote(tmp_json))
+    str json = core.generics.join(lines, "\n")
+    return core.format.from_json(json)
+}
+
+num fn bindata_write_table(str path, map table) {
+    return bindata_write_map(path, "Table", table)
+}
+
+num fn bindata_write_tensor(str path, map tensor) {
+    return bindata_write_map(path, "Tensor", tensor)
+}
+
+num fn bindata_write_samples(str path, arr samples) {
+    return bindata_write_arr(path, "Samples", samples)
+}
+
+map fn bindata_read_table(str path) {
+    map pack = bindata_read(path)
+    return pack["value"]
+}
+
+map fn bindata_read_tensor(str path) {
+    map pack = bindata_read(path)
+    return pack["value"]
+}
+
+arr fn bindata_read_samples(str path) {
+    map pack = bindata_read(path)
+    return pack["value"]
+}

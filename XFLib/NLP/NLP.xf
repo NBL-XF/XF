@@ -1,0 +1,203 @@
+str fn nlp_normalize(str text) {
+    str s = core.str.lower(text)
+    s = core.str.replace_all(s, "\n", " ")
+    s = core.str.replace_all(s, "\t", " ")
+    s = core.str.replace_all(s, "\r", " ")
+    s = core.str.replace_all(s, ".", " ")
+    s = core.str.replace_all(s, ",", " ")
+    s = core.str.replace_all(s, "!", " ")
+    s = core.str.replace_all(s, "?", " ")
+    s = core.str.replace_all(s, ":", " ")
+    s = core.str.replace_all(s, ";", " ")
+    s = core.str.replace_all(s, "(", " ")
+    s = core.str.replace_all(s, ")", " ")
+    s = core.str.replace_all(s, "[", " ")
+    s = core.str.replace_all(s, "]", " ")
+    s = core.str.replace_all(s, "{", " ")
+    s = core.str.replace_all(s, "}", " ")
+    s = core.str.replace_all(s, "\"", " ")
+    s = core.str.replace_all(s, "'", " ")
+    s = core.str.replace_all(s, "/", " ")
+    s = core.str.replace_all(s, "\\", " ")
+    s = core.str.replace_all(s, "-", " ")
+    return core.str.trim(s)
+}
+
+arr fn nlp_tokens(str text) {
+    str clean = nlp_normalize(text)
+    arr raw = core.generics.split(clean, " ")
+    arr out = []
+
+    for (tok in raw) {
+        str one = core.str.trim(tok)
+        if (one != "") {
+            push(out, one)
+        }
+    }
+
+    return out
+}
+
+map fn nlp_vocab_new() {
+    map stoi = {}
+    arr itos = []
+
+    stoi["<PAD>"] = 0
+    push(itos, "<PAD>")
+
+    stoi["<UNK>"] = 1
+    push(itos, "<UNK>")
+
+    return {
+        "__kind": "NLPVocab",
+        "stoi": stoi,
+        "itos": itos,
+        "size": 2
+    }
+}
+
+void fn nlp_vocab_add_token(map vocab, str token) {
+    if (!has(vocab["stoi"], token)) {
+        vocab["stoi"][token] = vocab["itos"].len
+        push(vocab["itos"], token)
+        vocab["size"] = vocab["itos"].len
+    }
+}
+
+map fn nlp_vocab_build(arr texts, num min_freq) {
+    map freq = {}
+
+    for (text in texts) {
+        arr toks = nlp_tokens(text)
+        for (tok in toks) {
+            if (!has(freq, tok)) {
+                freq[tok] = 0
+            }
+            freq[tok] = freq[tok] + 1
+        }
+    }
+
+    map vocab = nlp_vocab_new()
+
+    for (tok in freq) {
+        if (freq[tok] >= min_freq) {
+            nlp_vocab_add_token(vocab, tok)
+        }
+    }
+
+    return vocab
+}
+
+num fn nlp_vocab_index(map vocab, str token) {
+    if (has(vocab["stoi"], token)) {
+        return vocab["stoi"][token]
+    }
+    return vocab["stoi"]["<UNK>"]
+}
+
+arr fn nlp_encode_tokens(map vocab, arr toks, num max_len) {
+    arr out = []
+    num i = 0
+
+    while (i < toks.len && out.len < max_len) {
+        push(out, nlp_vocab_index(vocab, toks[i]))
+        i = i + 1
+    }
+
+    while (out.len < max_len) {
+        push(out, vocab["stoi"]["<PAD>"])
+    }
+
+    return out
+}
+
+arr fn nlp_encode_text(map vocab, str text, num max_len) {
+    return nlp_encode_tokens(vocab, nlp_tokens(text), max_len)
+}
+
+arr fn nlp_decode_indices(map vocab, arr idxs) {
+    arr out = []
+    for (idx in idxs) {
+        num i = idx + 0
+        if (i >= 0 && i < vocab["itos"].len) {
+            push(out, vocab["itos"][i])
+        } else {
+            push(out, "<UNK>")
+        }
+    }
+    return out
+}
+
+map fn nlp_one_hot_index(num idx, num size) {
+    map out = tensor_zeros([size])
+    if (idx >= 0 && idx < size) {
+        tensor_set1(out, idx, 1)
+    }
+    return out
+}
+
+arr fn nlp_text_to_one_hot_seq(map vocab, str text, num max_len) {
+    arr idxs = nlp_encode_text(vocab, text, max_len)
+    arr seq = []
+
+    for (idx in idxs) {
+        push(seq, nlp_one_hot_index(idx, vocab["size"]))
+    }
+
+    return seq
+}
+
+map fn nlp_make_rnn_sample(map vocab, str text, num max_len, num label) {
+    return {
+        "x": nlp_text_to_one_hot_seq(vocab, text, max_len),
+        "label": label
+    }
+}
+
+map fn nlp_bow_vector(map vocab, str text) {
+    map out = tensor_zeros([vocab["size"]])
+    arr toks = nlp_tokens(text)
+
+    for (tok in toks) {
+        num idx = nlp_vocab_index(vocab, tok)
+        tensor_set1(out, idx, tensor_get1(out, idx) + 1)
+    }
+
+    return out
+}
+
+map fn nlp_ngram_counts(str text, num n) {
+    map counts = {}
+    arr toks = nlp_tokens(text)
+
+    if (n <= 0 || toks.len < n) {
+        return counts
+    }
+
+    num i = 0
+    while (i + n <= toks.len) {
+        arr chunk = []
+        num j = 0
+        while (j < n) {
+            push(chunk, toks[i + j])
+            j = j + 1
+        }
+
+        str key = core.generics.join(chunk, "_")
+        if (!has(counts, key)) {
+            counts[key] = 0
+        }
+        counts[key] = counts[key] + 1
+        i = i + 1
+    }
+
+    return counts
+}
+
+map fn nlp_vocab_from_table(map t, str column, num min_freq) {
+    arr texts = []
+    for (row in t["rows"]) {
+        push(texts, row[column] .. "")
+    }
+    return nlp_vocab_build(texts, min_freq)
+}

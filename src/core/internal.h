@@ -64,6 +64,7 @@ extern bool     arg_str(xf_Value *args, size_t argc, size_t i,
 extern xf_Value propagate(xf_Value *args, size_t argc);
 extern xf_Value make_str_val(const char *data, size_t len);
 
+xf_module_t *build_byte(void);
 /* ── fn-caller context (defined in helpers.c) ─────────────────── */
 
 extern void            core_set_fn_caller(void *vm, void *syms, xf_fn_caller_t caller);

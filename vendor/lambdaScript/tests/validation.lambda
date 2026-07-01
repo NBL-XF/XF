@@ -1,0 +1,34 @@
+; validation.lambda
+; Symbolic validation version of normalized propagation and target-state update.
+;
+; This version uses LambdaScript's newer math surface forms where they help:
+;   - numeric literals: 0, 1
+;   - integral binder: ∫ t = 0 to T . expr
+;
+; It remains intentionally symbolic. The names add, sub, mul, div, exp, neg,
+; integral, sum_neighbors, and Phi are left as free symbols so the reduced
+; result stays readable and host/runtime backends can still interpret it later.
+
+ONE_MINUS = \x.sub 1 x
+
+G = \alpha beta.mul (mul (mul (V_EDGE alpha beta) (C_EDGE alpha beta)) (A_EDGE alpha beta)) (U_EDGE alpha beta)
+DECAY = \alpha.exp (neg (mul (LAMBDA_RATE alpha) (ONE_MINUS (TAU_STAR alpha))))
+FAST_MEMORY = \alpha beta.mul (mul (H_MEM alpha) (RHO alpha beta)) (DECAY alpha)
+SLOW_DIFFUSION = \alpha beta.mul (mul (L_MEM alpha) (KAPPA alpha beta)) (ONE_MINUS (DECAY alpha))
+DIFFUSED_MEMORY = \alpha beta.add (FAST_MEMORY alpha beta) (SLOW_DIFFUSION alpha beta)
+PROPAGATION_KERNEL = \alpha beta.mul (G alpha beta) (DIFFUSED_MEMORY alpha beta)
+
+ACTIVATION_DERIVATIVE = \alpha r t.D_SIGMA alpha r t
+NUMERATOR_TERM = \alpha beta r t.mul (PROPAGATION_KERNEL alpha beta) (ACTIVATION_DERIVATIVE alpha r t)
+NUMERATOR_INTEGRAND = \beta r t.sum_neighbors beta (\alpha.NUMERATOR_TERM alpha beta r t)
+NUMERATOR = \beta r T.∫ t = 0 to T . NUMERATOR_INTEGRAND beta r t
+
+NORMALIZATION_COMPONENT = \alpha beta.add (mul (H_MEM alpha) (RHO alpha beta)) (mul (L_MEM alpha) (KAPPA alpha beta))
+NORMALIZATION_TERM = \alpha beta.mul (G alpha beta) (NORMALIZATION_COMPONENT alpha beta)
+DENOMINATOR_INTEGRAND = \beta t.sum_neighbors beta (\alpha.NORMALIZATION_TERM alpha beta)
+DENOMINATOR = \beta T epsilon.add epsilon (∫ t = 0 to T . DENOMINATOR_INTEGRAND beta t)
+
+I_HAT_BETA_NEXT = \beta r T epsilon.div (NUMERATOR beta r T) (DENOMINATOR beta T epsilon)
+TARGET_STATE_NEXT = \beta r T epsilon.Phi beta (S_STATE beta r) (A_STATE beta r) (I_HAT_BETA_NEXT beta r T epsilon) (K_CONTEXT beta) (V_CONTEXT beta)
+
+TARGET_STATE_NEXT BETA R T EPSILON

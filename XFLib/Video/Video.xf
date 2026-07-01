@@ -1,0 +1,121 @@
+str fn video_shell_quote(str s) {
+    return "'" .. core.str.replace_all(s, "'", "'\"'\"'") .. "'"
+}
+
+num fn video_mkdir(str path) {
+    if (core.os.exec("mkdir -p " .. video_shell_quote(path)) == 0) {
+        return 1
+    }
+    return 0
+}
+
+num fn video_extract_frames(str video_path, str frames_dir, num fps) {
+    video_mkdir(frames_dir)
+
+    str cmd =
+        "ffmpeg -y -i " .. video_shell_quote(video_path) ..
+        " -vf fps=" .. fps ..
+        " " .. video_shell_quote(frames_dir .. "/frame_%06d.png") ..
+        " >/dev/null 2>&1"
+
+    if (core.os.exec(cmd) == 0) {
+        return 1
+    }
+    return 0
+}
+
+num fn video_extract_audio(str video_path, str audio_path, num sample_rate) {
+    return audio_extract_wav(video_path, audio_path, sample_rate)
+}
+
+arr fn video_list_frames(str frames_dir) {
+    str cmd = "find " .. video_shell_quote(frames_dir) .. " -maxdepth 1 -type f | sort"
+    return core.os.run_lines(cmd)
+}
+
+map fn video_frame_tensor(str frame_path, num normalized) {
+    return tensor_from_image_path_gray(frame_path, normalized)
+}
+
+map fn video_classify_frame(map cnn_model, str frame_path, num normalized) {
+    map x = video_frame_tensor(frame_path, normalized)
+    map pred = cnn_forward(cnn_model, x)
+
+    return {
+        "path": frame_path,
+        "pred": pred["pred"],
+        "confidence": pred["confidence"]
+    }
+}
+
+arr fn video_classify_frames(map cnn_model, str frames_dir, num normalized) {
+    arr files = video_list_frames(frames_dir)
+    arr out = []
+
+    for (path in files) {
+        push(out, video_classify_frame(cnn_model, path, normalized))
+    }
+
+    return out
+}
+
+map fn video_majority_vote(arr frame_results) {
+    map counts = {}
+    num best_pred = -1
+    num best_count = -1
+
+    for (one in frame_results) {
+        str key = one["pred"] .. ""
+        if (!has(counts, key)) {
+            counts[key] = 0
+        }
+        counts[key] = counts[key] + 1
+
+        if (counts[key] > best_count) {
+            best_count = counts[key]
+            best_pred = one["pred"]
+        }
+    }
+
+    return {
+        "pred": best_pred,
+        "count": best_count,
+        "counts": counts
+    }
+}
+
+map fn video_audio_nlp(str video_path, str audio_path, str transcript_path, num sample_rate, str cmd_template) {
+    num ok_audio = video_extract_audio(video_path, audio_path, sample_rate)
+    if (ok_audio == 0) {
+        return {
+            "ok": 0,
+            "text": "",
+            "tokens": []
+        }
+    }
+
+    return audio_transcribe_read(audio_path, transcript_path, cmd_template)
+}
+
+map fn video_analyze(map cnn_model, str video_path, str frames_dir, str audio_path, str transcript_path, num fps, num normalized, num sample_rate, str cmd_template) {
+    num ok_frames = video_extract_frames(video_path, frames_dir, fps)
+    arr frame_results = []
+
+    if (ok_frames == 1) {
+        frame_results = video_classify_frames(cnn_model, frames_dir, normalized)
+    }
+
+    map vote = video_majority_vote(frame_results)
+    map audio_info = video_audio_nlp(video_path, audio_path, transcript_path, sample_rate, cmd_template)
+
+    return {
+        "video": video_path,
+        "frames_ok": ok_frames,
+        "frames": frame_results,
+        "frame_count": frame_results.len,
+        "frame_vote": vote,
+        "audio": audio_info,
+        "text": audio_info["text"],
+        "tokens": audio_info["tokens"]
+    }
+}

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 struct ls_State {
 	int reserved;
@@ -20,6 +21,662 @@ typedef struct {
 	size_t length;
 	size_t capacity;
 } LsBuf;
+
+static char *ls_strdup(const char *src);
+static int buf_append_n(LsBuf *buf, const char *text, size_t len);
+static int buf_append(LsBuf *buf, const char *text);
+static char *read_file_text(const char *path);
+static int ls_is_ident_text(const char *s);
+static char *ls_default_library_dir(void);
+static char *canonicalize_path_or_keep(char *path);
+static int file_exists(const char *path);
+
+
+typedef struct DefSeen DefSeen;
+struct DefSeen {
+	char *name;
+	char *path;
+	size_t line;
+	DefSeen *next;
+};
+
+typedef struct ImportStack ImportStack;
+struct ImportStack {
+	const char *path;
+	ImportStack *next;
+};
+
+typedef enum {
+	IMPORT_KIND_INVALID = -1,
+	IMPORT_KIND_NONE = 0,
+	IMPORT_KIND_FILE = 1,
+	IMPORT_KIND_OFFICIAL = 2
+} ImportKind;
+
+static void defseen_free_all(DefSeen *seen) {
+	DefSeen *next;
+	while (seen != NULL) {
+		next = seen->next;
+		free(seen->name);
+		free(seen->path);
+		free(seen);
+		seen = next;
+	}
+}
+
+static int pp_is_ident_start_byte(unsigned char c) {
+	return isalpha(c) || c == '_' || c >= 0x80;
+}
+
+static int pp_is_ident_part_byte(unsigned char c) {
+	return isalnum(c) || c == '_' || c >= 0x80;
+}
+
+static int pp_is_ident_span(const char *start, size_t length) {
+	size_t i;
+
+	if (start == NULL || length == 0) {
+		return 0;
+	}
+	if (!pp_is_ident_start_byte((unsigned char)start[0])) {
+		return 0;
+	}
+	for (i = 1; i < length; i++) {
+		if (!pp_is_ident_part_byte((unsigned char)start[i])) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+typedef struct {
+	int is_definition;
+	char *name;
+} PreDefScan;
+
+static int pp_parse_definition_name(const char *line, PreDefScan *out) {
+	const char *p = line;
+	const char *lhs_start;
+	const char *lhs_end;
+	const char *eq;
+
+	out->is_definition = 0;
+	out->name = NULL;
+
+	while (*p != '\0' && isspace((unsigned char)*p)) {
+		p++;
+	}
+	if (*p == '\0' || *p == ';' || (*p == '-' && p[1] == '-')) {
+		return 1;
+	}
+
+	lhs_start = p;
+	eq = strchr(p, '=');
+	while (eq != NULL) {
+		if (!(eq > lhs_start && eq[-1] == '<' && eq[1] == '>')) {
+			break;
+		}
+		eq = strchr(eq + 1, '=');
+	}
+
+	if (eq == NULL) {
+		return 1;
+	}
+
+	lhs_end = eq;
+	if (eq > lhs_start) {
+		switch (eq[-1]) {
+		case '+':
+		case '-':
+		case '*':
+		case '/':
+		case '%':
+			lhs_end = eq - 1;
+			break;
+		default:
+			break;
+		}
+	}
+
+	while (lhs_end > lhs_start && isspace((unsigned char)lhs_end[-1])) {
+		lhs_end--;
+	}
+
+	if (!pp_is_ident_span(lhs_start, (size_t)(lhs_end - lhs_start))) {
+		return 1;
+	}
+
+	out->name = ls_strdup("");
+	if (out->name == NULL) {
+		return 0;
+	}
+	free(out->name);
+	out->name = (char *)malloc((size_t)(lhs_end - lhs_start) + 1);
+	if (out->name == NULL) {
+		return 0;
+	}
+	memcpy(out->name, lhs_start, (size_t)(lhs_end - lhs_start));
+	out->name[lhs_end - lhs_start] = '\0';
+	out->is_definition = 1;
+	return 1;
+}
+
+static int defseen_add_unique(DefSeen **seen, const char *name, const char *path, size_t line) {
+	DefSeen *it;
+	DefSeen *node;
+
+	for (it = *seen; it != NULL; it = it->next) {
+		if (strcmp(it->name, name) == 0) {
+			err_set("duplicate definition '%s' at %s:%zu (already defined at %s:%zu)",
+			        name, path, line, it->path, it->line);
+			return 0;
+		}
+	}
+
+	node = (DefSeen *)calloc(1, sizeof(*node));
+	if (node == NULL) {
+		err_set("out of memory");
+		return 0;
+	}
+
+	node->name = ls_strdup(name);
+	node->path = ls_strdup(path != NULL ? path : "<input>");
+	node->line = line;
+
+	if (node->name == NULL || node->path == NULL) {
+		free(node->name);
+		free(node->path);
+		free(node);
+		err_set("out of memory");
+		return 0;
+	}
+
+	node->next = *seen;
+	*seen = node;
+	return 1;
+}
+
+static int scan_duplicate_definitions_in_source(const char *source) {
+	const char *line_start = source;
+	const char *cursor = source;
+	size_t line_no = 1;
+	DefSeen *seen = NULL;
+
+	while (1) {
+		if (*cursor != '\n' && *cursor != '\0') {
+			cursor++;
+			continue;
+		}
+
+		{
+			char *raw_line = (char *)malloc((size_t)(cursor - line_start) + 1);
+			PreDefScan scan;
+			int ok;
+
+			if (raw_line == NULL) {
+				defseen_free_all(seen);
+				err_set("out of memory");
+				return 0;
+			}
+
+			memcpy(raw_line, line_start, (size_t)(cursor - line_start));
+			raw_line[cursor - line_start] = '\0';
+
+			ok = pp_parse_definition_name(raw_line, &scan);
+			free(raw_line);
+			if (!ok) {
+				defseen_free_all(seen);
+				err_set("out of memory");
+				return 0;
+			}
+
+			if (scan.is_definition) {
+				ok = defseen_add_unique(&seen, scan.name, "<merged>", line_no);
+				free(scan.name);
+				if (!ok) {
+					defseen_free_all(seen);
+					err_set("line %zu: %s", line_no, err_get());
+					return 0;
+				}
+			}
+		}
+
+		if (*cursor == '\0') {
+			break;
+		}
+		cursor++;
+		line_start = cursor;
+		line_no++;
+	}
+
+	defseen_free_all(seen);
+	return 1;
+}
+
+static char *dup_span(const char *start, size_t len) {
+	char *copy = (char *)malloc(len + 1);
+
+	if (copy == NULL) {
+		return NULL;
+	}
+
+	memcpy(copy, start, len);
+	copy[len] = '\0';
+	return copy;
+}
+
+static ImportKind parse_import_line(const char *trimmed, char **out_target) {
+	const char *p = trimmed;
+	const char *start;
+	const char *end;
+	char *target;
+
+	*out_target = NULL;
+
+	if (strncmp(p, "import", 6) != 0 || !isspace((unsigned char)p[6])) {
+		return IMPORT_KIND_NONE;
+	}
+
+	p += 6;
+	while (*p != '\0' && isspace((unsigned char)*p)) {
+		p++;
+	}
+
+	if (*p == '"') {
+		p++;
+		start = p;
+
+		while (*p != '\0' && *p != '"') {
+			if (*p == '\\' && p[1] != '\0') {
+				p += 2;
+				continue;
+			}
+			p++;
+		}
+
+		if (*p != '"') {
+			return IMPORT_KIND_INVALID;
+		}
+
+		end = p;
+		p++;
+
+		while (*p != '\0' && isspace((unsigned char)*p)) {
+			p++;
+		}
+		if (*p != '\0') {
+			return IMPORT_KIND_INVALID;
+		}
+
+		target = dup_span(start, (size_t)(end - start));
+		if (target == NULL) {
+			err_set("out of memory");
+			return IMPORT_KIND_INVALID;
+		}
+
+		*out_target = target;
+		return IMPORT_KIND_FILE;
+	}
+
+	if (*p == '{') {
+		p++;
+		while (*p != '\0' && isspace((unsigned char)*p)) {
+			p++;
+		}
+
+		start = p;
+		while (*p != '\0' && pp_is_ident_part_byte((unsigned char)*p)) {
+			p++;
+		}
+		end = p;
+
+		while (*p != '\0' && isspace((unsigned char)*p)) {
+			p++;
+		}
+		if (*p != '}' || !pp_is_ident_span(start, (size_t)(end - start))) {
+			return IMPORT_KIND_INVALID;
+		}
+		p++;
+
+		while (*p != '\0' && isspace((unsigned char)*p)) {
+			p++;
+		}
+		if (*p != '\0') {
+			return IMPORT_KIND_INVALID;
+		}
+
+		target = dup_span(start, (size_t)(end - start));
+		if (target == NULL) {
+			err_set("out of memory");
+			return IMPORT_KIND_INVALID;
+		}
+
+		*out_target = target;
+		return IMPORT_KIND_OFFICIAL;
+	}
+
+	return IMPORT_KIND_INVALID;
+}
+
+static char *dirname_from_path(const char *path) {
+	const char *slash;
+	size_t len;
+	char *dir;
+
+	slash = strrchr(path, '/');
+	if (slash == NULL) {
+		return ls_strdup(".");
+	}
+
+	len = (size_t)(slash - path);
+	if (len == 0) {
+		return ls_strdup("/");
+	}
+
+	dir = (char *)malloc(len + 1);
+	if (dir == NULL) {
+		return NULL;
+	}
+	memcpy(dir, path, len);
+	dir[len] = '\0';
+	return dir;
+}
+
+static char *join_path(const char *dir, const char *rel) {
+	size_t dlen = strlen(dir);
+	size_t rlen = strlen(rel);
+	char *out = (char *)malloc(dlen + 1 + rlen + 1);
+
+	if (out == NULL) {
+		return NULL;
+	}
+
+	memcpy(out, dir, dlen);
+	out[dlen] = '/';
+	memcpy(out + dlen + 1, rel, rlen);
+	out[dlen + 1 + rlen] = '\0';
+	return out;
+}
+
+static char *join_path_with_suffix(const char *dir, const char *name, const char *suffix) {
+	size_t dlen = strlen(dir);
+	size_t nlen = strlen(name);
+	size_t slen = strlen(suffix);
+	char *out = (char *)malloc(dlen + 1 + nlen + slen + 1);
+
+	if (out == NULL) {
+		return NULL;
+	}
+
+	memcpy(out, dir, dlen);
+	out[dlen] = '/';
+	memcpy(out + dlen + 1, name, nlen);
+	memcpy(out + dlen + 1 + nlen, suffix, slen);
+	out[dlen + 1 + nlen + slen] = '\0';
+	return out;
+}
+
+static char *resolve_user_import_path(const char *importing_name, const char *import_path) {
+	char *dir;
+	char *joined;
+
+	if (import_path[0] == '/') {
+		return canonicalize_path_or_keep(ls_strdup(import_path));
+	}
+
+	if (importing_name == NULL || importing_name[0] == '<') {
+		err_set("relative import '%s' requires a file-backed source", import_path);
+		return NULL;
+	}
+
+	dir = dirname_from_path(importing_name);
+	if (dir == NULL) {
+		err_set("out of memory");
+		return NULL;
+	}
+
+	joined = join_path(dir, import_path);
+	free(dir);
+	if (joined == NULL) {
+		err_set("out of memory");
+		return NULL;
+	}
+
+	return canonicalize_path_or_keep(joined);
+}
+
+static char *resolve_official_import_path(const char *library_dir, const char *library_name) {
+	char *base_dir = NULL;
+	char *candidate = NULL;
+
+	if (!ls_is_ident_text(library_name)) {
+		err_set("invalid official library name '%s'", library_name);
+		return NULL;
+	}
+
+	if (library_dir == NULL || library_dir[0] == '\0') {
+		base_dir = ls_default_library_dir();
+		if (base_dir == NULL) {
+			err_set("out of memory");
+			return NULL;
+		}
+		library_dir = base_dir;
+	}
+
+	candidate = join_path_with_suffix(library_dir, library_name, ".ls");
+	if (candidate == NULL) {
+		free(base_dir);
+		err_set("out of memory");
+		return NULL;
+	}
+	if (file_exists(candidate)) {
+		free(base_dir);
+		return canonicalize_path_or_keep(candidate);
+	}
+	free(candidate);
+
+	candidate = join_path(library_dir, library_name);
+	if (candidate == NULL) {
+		free(base_dir);
+		err_set("out of memory");
+		return NULL;
+	}
+	if (file_exists(candidate)) {
+		free(base_dir);
+		return canonicalize_path_or_keep(candidate);
+	}
+	free(candidate);
+
+	err_set("official library '%s' not found in '%s'", library_name, library_dir);
+	free(base_dir);
+	return NULL;
+}
+
+static int import_stack_contains(const ImportStack *stack, const char *path) {
+	while (stack != NULL) {
+		if (strcmp(stack->path, path) == 0) {
+			return 1;
+		}
+		stack = stack->next;
+	}
+	return 0;
+}
+
+static int preprocess_source_recursive(const char *source,
+                                       const char *source_name,
+                                       const char *library_dir,
+                                       int library_mode,
+                                       DefSeen **seen_defs,
+                                       const ImportStack *stack,
+                                       LsBuf *out);
+
+static int append_line_with_newline(LsBuf *out, const char *start, size_t len) {
+	return buf_append_n(out, start, len) && buf_append(out, "\n");
+}
+
+static int preprocess_source_recursive(const char *source,
+                                       const char *source_name,
+                                       const char *library_dir,
+                                       int library_mode,
+                                       DefSeen **seen_defs,
+                                       const ImportStack *stack,
+                                       LsBuf *out) {
+	const char *line_start = source;
+	const char *cursor = source;
+	size_t line_no = 1;
+
+	while (1) {
+		char *raw_line;
+		char *trimmed;
+		char *import_path = NULL;
+		int import_kind;
+		PreDefScan scan;
+		int ok;
+
+		if (*cursor != '\n' && *cursor != '\0') {
+			cursor++;
+			continue;
+		}
+
+		raw_line = (char *)malloc((size_t)(cursor - line_start) + 1);
+		if (raw_line == NULL) {
+			err_set("out of memory");
+			return 0;
+		}
+		memcpy(raw_line, line_start, (size_t)(cursor - line_start));
+		raw_line[cursor - line_start] = '\0';
+
+		trimmed = raw_line;
+		while (*trimmed != '\0' && isspace((unsigned char)*trimmed)) {
+			trimmed++;
+		}
+		{
+			size_t len = strlen(trimmed);
+			while (len > 0 && isspace((unsigned char)trimmed[len - 1])) {
+				trimmed[--len] = '\0';
+			}
+		}
+
+		if (trimmed[0] == '\0' || trimmed[0] == ';' || (trimmed[0] == '-' && trimmed[1] == '-')) {
+			ok = append_line_with_newline(out, line_start, (size_t)(cursor - line_start));
+			free(raw_line);
+			if (!ok) {
+				err_set("out of memory");
+				return 0;
+			}
+		} else {
+			import_kind = parse_import_line(trimmed, &import_path);
+			if (import_kind == IMPORT_KIND_FILE || import_kind == IMPORT_KIND_OFFICIAL) {
+				char *resolved;
+				char *child_source;
+				ImportStack child_stack;
+
+				if (import_kind == IMPORT_KIND_FILE) {
+					resolved = resolve_user_import_path(source_name, import_path);
+				} else {
+					resolved = resolve_official_import_path(library_dir, import_path);
+				}
+				free(import_path);
+				import_path = NULL;
+
+				if (resolved == NULL) {
+					free(raw_line);
+					return 0;
+				}
+				if (import_stack_contains(stack, resolved)) {
+					err_set("import cycle detected involving '%s'", resolved);
+					free(resolved);
+					free(raw_line);
+					return 0;
+				}
+
+				child_source = read_file_text(resolved);
+				if (child_source == NULL) {
+					err_set("failed to read import '%s'", resolved);
+					free(resolved);
+					free(raw_line);
+					return 0;
+				}
+
+				child_stack.path = resolved;
+				child_stack.next = (ImportStack *)stack;
+				ok = preprocess_source_recursive(child_source, resolved, library_dir, 1, seen_defs, &child_stack, out);
+				free(child_source);
+				free(resolved);
+				free(raw_line);
+				if (!ok) {
+					return 0;
+				}
+			} else {
+				if (import_kind == IMPORT_KIND_INVALID) {
+					err_set("%s:%zu: invalid import syntax", source_name != NULL ? source_name : "<input>", line_no);
+					free(raw_line);
+					return 0;
+				}
+
+				scan.is_definition = 0;
+				scan.name = NULL;
+				ok = pp_parse_definition_name(trimmed, &scan);
+				if (!ok) {
+					free(raw_line);
+					err_set("out of memory");
+					return 0;
+				}
+
+				if (scan.is_definition) {
+					ok = defseen_add_unique(seen_defs, scan.name, source_name != NULL ? source_name : "<input>", line_no);
+					free(scan.name);
+					if (!ok) {
+						free(raw_line);
+						return 0;
+					}
+				} else if (library_mode) {
+					err_set("%s:%zu: imported files may only contain definitions, comments, blank lines, and imports",
+					        source_name != NULL ? source_name : "<input>", line_no);
+					free(raw_line);
+					return 0;
+				}
+
+				ok = append_line_with_newline(out, line_start, (size_t)(cursor - line_start));
+				free(raw_line);
+				if (!ok) {
+					err_set("out of memory");
+					return 0;
+				}
+			}
+		}
+
+		if (*cursor == '\0') {
+			break;
+		}
+		cursor++;
+		line_start = cursor;
+		line_no++;
+	}
+
+	return 1;
+}
+
+static char *preprocess_imports(const char *source, const char *source_name, const char *library_dir) {
+	LsBuf out = {0};
+	DefSeen *seen = NULL;
+	ImportStack root;
+
+	root.path = source_name != NULL ? source_name : "<input>";
+	root.next = NULL;
+
+	if (!preprocess_source_recursive(source, source_name, library_dir, 0, &seen, &root, &out)) {
+		defseen_free_all(seen);
+		free(out.data);
+		return NULL;
+	}
+
+	defseen_free_all(seen);
+	if (out.data == NULL) {
+		return ls_strdup("");
+	}
+	return out.data;
+}
 
 static const char *LS_PRELUDE =
 	"I = \\x.x\n"
@@ -141,6 +798,55 @@ char *ls_read_all_stream(FILE *fp) {
 
 	buffer[length] = '\0';
 	return buffer;
+}
+
+static char *ls_default_library_dir(void) {
+	const char *override = getenv("LAMBDASCRIPT_LIB_DIR");
+	const char *xdg = getenv("XDG_DATA_HOME");
+	const char *home = getenv("HOME");
+	char *dir;
+
+	if (override != NULL && override[0] != '\0') {
+		return ls_strdup(override);
+	}
+	if (xdg != NULL && xdg[0] != '\0') {
+		dir = join_path(xdg, "lambdascript/lib");
+		if (dir != NULL) {
+			return dir;
+		}
+	}
+	if (home != NULL && home[0] != '\0') {
+		dir = join_path(home, ".lambdascript/lib");
+		if (dir != NULL) {
+			return dir;
+		}
+	}
+	return ls_strdup(".lambdascript/lib");
+}
+
+static int file_exists(const char *path) {
+	FILE *fp = fopen(path, "rb");
+
+	if (fp == NULL) {
+		return 0;
+	}
+
+	fclose(fp);
+	return 1;
+}
+
+static char *canonicalize_path_or_keep(char *path) {
+#if defined(_POSIX_VERSION)
+	char *resolved;
+
+	resolved = realpath(path, NULL);
+	if (resolved != NULL) {
+		free(path);
+		return resolved;
+	}
+#endif
+
+	return path;
 }
 
 static char *read_file_text(const char *path) {
@@ -269,7 +975,8 @@ if (!buf_append(buf,
                 "\n"
                 "; LambdaScript argument builtins\n"
                 "NIL = \\c.\\n.n\n"
-                "CONS = \\h.\\t.\\c.\\n.c h t\n")) {
+                "CONS = \\h.\\t.\\c.\\n.c h t\n"
+                "BOOLS = CONS (\\t.\\f.t) (CONS (\\t.\\f.f) NIL)\n")) {
     return 0;
 }
 	if (!buf_append_symbol_def(buf, "ARG0", source_name)) {
@@ -317,9 +1024,26 @@ if (!buf_append(buf,
 	return buf_append(buf, "\n\n");
 }
 
-static char *merge_source_with_builtins(const char *source, const ls_Options *options) {
+static size_t count_newlines_n(const char *text, size_t length) {
+	size_t i;
+	size_t count = 0;
+
+	for (i = 0; i < length; i++) {
+		if (text[i] == '\n') {
+			count++;
+		}
+	}
+
+	return count;
+}
+
+static char *merge_source_with_builtins(const char *source, const ls_Options *options, size_t *injected_lines) {
 	LsBuf buf = {0};
 	int use_prelude = options == NULL || options->use_prelude;
+
+	if (injected_lines != NULL) {
+		*injected_lines = 0;
+	}
 
 	if (use_prelude && !buf_append(&buf, LS_PRELUDE)) {
 		free(buf.data);
@@ -329,6 +1053,10 @@ static char *merge_source_with_builtins(const char *source, const ls_Options *op
 	if (!buf_append_arg_builtins(&buf, options)) {
 		free(buf.data);
 		return NULL;
+	}
+
+	if (injected_lines != NULL) {
+		*injected_lines = count_newlines_n(buf.data, buf.length);
 	}
 
 	if (!buf_append(&buf, source)) {
@@ -341,6 +1069,21 @@ static char *merge_source_with_builtins(const char *source, const ls_Options *op
 	}
 
 	return buf.data;
+}
+
+static void rebase_parse_error_lines(size_t injected_lines) {
+	const char *msg;
+	size_t line_no;
+	char detail[512];
+
+	if (injected_lines == 0) {
+		return;
+	}
+
+	msg = err_get();
+	if (sscanf(msg, "line %zu: %511[^\n]", &line_no, detail) == 2 && line_no > injected_lines) {
+		err_set("line %zu: %s", line_no - injected_lines, detail);
+	}
 }
 
 static Value *reduce_with_trace(const Value *term, size_t max_steps, size_t *steps_taken, int *reached_limit, char **trace_out) {
@@ -455,6 +1198,7 @@ void ls_options_init(ls_Options *options) {
 	options->source_name = NULL;
 	options->argc = 0;
 	options->argv = NULL;
+	options->library_dir = NULL;
 }
 
 void ls_result_init(ls_Result *result) {
@@ -480,6 +1224,7 @@ void ls_result_free(ls_Result *result) {
 int ls_eval_string(ls_State *L, const char *source, const ls_Options *options, ls_Result *result) {
 	ls_Options local_options;
 	ls_Options effective_options;
+	size_t injected_lines = 0;
 	char *merged = NULL;
 	Program *program = NULL;
 	Value *term = NULL;
@@ -507,14 +1252,27 @@ int ls_eval_string(ls_State *L, const char *source, const ls_Options *options, l
 
 	ls_result_free(result);
 
-	merged = merge_source_with_builtins(source, options);
+	{
+		char *preprocessed = preprocess_imports(source, options->source_name, options->library_dir);
+		if (preprocessed == NULL) {
+			goto fail;
+		}
+		merged = merge_source_with_builtins(preprocessed, options, &injected_lines);
+		free(preprocessed);
+	}
 	if (merged == NULL) {
 		err_set("out of memory");
 		goto fail;
 	}
 
+	if (!scan_duplicate_definitions_in_source(merged)) {
+		rebase_parse_error_lines(injected_lines);
+		goto fail;
+	}
+
 	program = parser_parse_program(merged);
 	if (program == NULL) {
+		rebase_parse_error_lines(injected_lines);
 		goto fail;
 	}
 

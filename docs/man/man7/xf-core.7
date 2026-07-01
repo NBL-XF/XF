@@ -1,0 +1,57 @@
+.Dd June 29, 2026
+.Dt XF-CORE 7
+.Os
+.Sh NAME
+.Nm xf-core
+.Nd built-in XF core module namespaces
+.Sh DESCRIPTION
+XF ships a built-in
+.Ic core
+namespace tree rather than requiring each facility to be imported from separate files.
+Available namespaces observed in the source tree include:
+.Bl -tag -width Ds
+.It Ic core.math
+Math functions and constants such as
+.Ic pi ,
+.Ic e ,
+.Ic INF ,
+.Ic NAN ,
+and complex-number helpers.
+.It Ic core.str
+String manipulation helpers.
+.It Ic core.os
+Operating-system and filesystem helpers.
+.It Ic core.ds
+Data-structure helpers.
+.It Ic core.regex
+Regular-expression helpers.
+.It Ic core.edit
+Editing and text-transformation helpers.
+.It Ic core.format
+Formatting helpers.
+.It Ic core.process
+Process-management helpers.
+.It Ic core.lambda
+Bridge into embedded LambdaScript.
+.It Ic core.byte
+Bridge into embedded ByteLang.
+.It Ic core.img
+Image-processing helpers.
+.It Ic core.generics
+Generic support utilities.
+.El
+.Sh EMBEDDED BRIDGES
+.Bl -tag -width Ds
+.It Ic core.lambda
+Provides access to LambdaScript evaluation and file execution.
+.It Ic core.byte
+Provides access to ByteLang check, run, or evaluation facilities.
+.El
+.Sh DESIGN
+The core tree gives XF a broad standard environment while keeping the main language surface compact.
+Core facilities are implemented in C and exposed as built-ins.
+.Sh SEE ALSO
+.Xr xf 1 ,
+.Xr xf-lang 7 ,
+.Xr lambdascript 7 ,
+.Xr bytelang 7

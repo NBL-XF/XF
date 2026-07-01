@@ -1,0 +1,54 @@
+.Dd June 29, 2026
+.Dt LAMBDASCRIPT 7
+.Os
+.Sh NAME
+.Nm lambdascript
+.Nd LambdaScript language overview
+.Sh DESCRIPTION
+LambdaScript is a lambda-calculus-oriented language with arithmetic, boolean logic, symbolic operators, set-membership syntax, quantified forms, and reduction tracing.
+.Sh LANGUAGE FEATURES
+.Bl -bullet
+.It
+lambda abstractions and application
+.It
+numeric literals and arithmetic
+.It
+boolean constants and connectives
+.It
+symbolic forms such as equivalence and implication
+.It
+quantifiers, summation, integral, and limit-style syntax
+.It
+set-membership forms
+.It
+official and user-defined imports
+.El
+.Sh REDUCTION
+Evaluation is normal-order oriented and can be traced from the CLI.
+.Sh IMPORTS
+LambdaScript expands imports before parse and evaluation.
+Duplicate imports are skipped and cyclic imports are rejected.
+Official libraries are imported with brace syntax and user files with quoted paths.
+.Sh OFFICIAL LIBRARIES
+.Bl -tag -width Ds
+.It Ic Logic
+Provides
+.Ic NAND ,
+.Ic NOR ,
+and
+.Ic XOR
+in terms of built-in boolean operations.
+.It Ic Vector
+Provides a functional sequence API including
+.Ic PUSH ,
+.Ic HEAD ,
+.Ic TAIL ,
+.Ic MAP ,
+.Ic FILTER ,
+.Ic LENGTH ,
+.Ic CONCAT ,
+and
+.Ic FOLD .
+.El
+.Sh SEE ALSO
+.Xr lambdascript 1

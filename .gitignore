@@ -1,3 +1,13 @@
-bin/*
-obj/*
-lib/*.alib/release/static/libxf.a
+.DS_Store
+bin/
+obj/
+lib/
+build/
+dist/
+mnt/
+releases/*.tar.gz
+vendor/byteLang/build/
+
+comments/*
+!comments/v1.0.3/
+!comments/v1.0.3/**

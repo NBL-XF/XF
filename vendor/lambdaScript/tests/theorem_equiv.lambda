@@ -1,0 +1,4 @@
+SHOW = \b.b True False
+MK = \h.\t.cons h t
+R = MK (SHOW ((TRUE -> ⌐TRUE) <=> (⌐TRUE v ⌐TRUE))) (MK (SHOW ((FALSE -> ⌐FALSE) ≡ (⌐FALSE v ⌐FALSE))) nil)
+R

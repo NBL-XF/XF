@@ -1,0 +1,326 @@
+num fn rnn_tanh_num(num x) {
+    num e = core.math.exp(2 * x)
+    return (e - 1) / (e + 1)
+}
+
+num fn rnn_dtanh_from_h(num h) {
+    return 1 - h * h
+}
+
+map fn rnn_one_hot(num idx, num size) {
+    map out = tensor_zeros([size])
+    if (idx >= 0) {
+        if (idx < size) {
+            tensor_set1(out, idx, 1)
+        }
+    }
+    return out
+}
+
+arr fn rnn_encode_indices(arr idxs, num vocab_size) {
+    arr seq = []
+    for (idx in idxs) {
+        push(seq, rnn_one_hot(idx, vocab_size))
+    }
+    return seq
+}
+
+map fn rnn_init(num input_size, num hidden_size, num output_size, num scale) {
+    return {
+        "__kind": "RNN",
+        "input_size": input_size,
+        "hidden_size": hidden_size,
+        "output_size": output_size,
+        "Wxh": tensor_rand([hidden_size, input_size], scale),
+        "Whh": tensor_rand([hidden_size, hidden_size], scale),
+        "bh": tensor_zeros([hidden_size]),
+        "Why": tensor_rand([output_size, hidden_size], scale),
+        "by": tensor_zeros([output_size])
+    }
+}
+
+map fn rnn_step(map model, map x, map h_prev) {
+    map a = tensor_matvec(model["Wxh"], x)
+    map b = tensor_matvec(model["Whh"], h_prev)
+    map z = tensor_add(tensor_add(a, b), model["bh"])
+    map h = tensor_zeros([model["hidden_size"]])
+
+    num i = 0
+    while (i < model["hidden_size"]) {
+        tensor_set1(h, i, rnn_tanh_num(tensor_get1(z, i)))
+        i = i + 1
+    }
+
+    return {
+        "z": z,
+        "h": h
+    }
+}
+
+map fn rnn_forward(map model, arr seq) {
+    arr hs = []
+    arr zs = []
+
+    push(hs, tensor_zeros([model["hidden_size"]]))
+
+    num t = 0
+    while (t < seq.len) {
+        map prev_h = hs[t]
+        map step = rnn_step(model, seq[t], prev_h)
+        push(zs, step["z"])
+        push(hs, step["h"])
+        t = t + 1
+    }
+
+    map final_h = hs[hs.len - 1]
+    map logits = tensor_add(tensor_matvec(model["Why"], final_h), model["by"])
+    map probs = tensor_softmax1(logits)
+    num pred = tensor_argmax1(probs)
+
+    return {
+        "hs": hs,
+        "zs": zs,
+        "final_h": final_h,
+        "logits": logits,
+        "probs": probs,
+        "pred": pred,
+        "confidence": tensor_get1(probs, pred)
+    }
+}
+
+map fn rnn_predict(map model, arr seq) {
+    return rnn_forward(model, seq)
+}
+
+map fn rnn_train_seq(map model, arr seq, num label, num lr) {
+    map fw = rnn_forward(model, seq)
+    map probs = fw["probs"]
+    arr hs = fw["hs"]
+    map final_h = fw["final_h"]
+
+    map dlogits = tensor_clone(probs)
+    tensor_set1(dlogits, label, tensor_get1(dlogits, label) - 1)
+
+    num loss = -core.math.ln(tensor_get1(probs, label) + 0.000000001)
+    map dWhy = tensor_outer(dlogits, final_h)
+    map dby = tensor_clone(dlogits)
+
+    map dh = tensor_zeros([model["hidden_size"]])
+    num j = 0
+    while (j < model["hidden_size"]) {
+        num s = 0
+        num o = 0
+        while (o < model["output_size"]) {
+            s = s + tensor_get2(model["Why"], o, j) * tensor_get1(dlogits, o)
+            o = o + 1
+        }
+        tensor_set1(dh, j, s)
+        j = j + 1
+    }
+
+    map dWxh = tensor_zeros([model["hidden_size"], model["input_size"]])
+    map dWhh = tensor_zeros([model["hidden_size"], model["hidden_size"]])
+    map dbh = tensor_zeros([model["hidden_size"]])
+
+    num t = seq.len
+    while (t > 0) {
+        t = t - 1
+
+        map x_t = seq[t]
+        map h_prev = hs[t]
+        map h_t = hs[t + 1]
+        map dz = tensor_zeros([model["hidden_size"]])
+
+        num i = 0
+        while (i < model["hidden_size"]) {
+            num hval = tensor_get1(h_t, i)
+            tensor_set1(dz, i, tensor_get1(dh, i) * rnn_dtanh_from_h(hval))
+            i = i + 1
+        }
+
+        i = 0
+        while (i < model["hidden_size"]) {
+            tensor_set1(dbh, i, tensor_get1(dbh, i) + tensor_get1(dz, i))
+            i = i + 1
+        }
+
+        map gx = tensor_outer(dz, x_t)
+        map gh = tensor_outer(dz, h_prev)
+
+        i = 0
+        while (i < dWxh["shape"][0]) {
+            num k = 0
+            while (k < dWxh["shape"][1]) {
+                tensor_set2(dWxh, i, k, tensor_get2(dWxh, i, k) + tensor_get2(gx, i, k))
+                k = k + 1
+            }
+            i = i + 1
+        }
+
+        i = 0
+        while (i < dWhh["shape"][0]) {
+            num k2 = 0
+            while (k2 < dWhh["shape"][1]) {
+                tensor_set2(dWhh, i, k2, tensor_get2(dWhh, i, k2) + tensor_get2(gh, i, k2))
+                k2 = k2 + 1
+            }
+            i = i + 1
+        }
+
+        map new_dh = tensor_zeros([model["hidden_size"]])
+
+        num col = 0
+        while (col < model["hidden_size"]) {
+            num s2 = 0
+            num row = 0
+            while (row < model["hidden_size"]) {
+                s2 = s2 + tensor_get2(model["Whh"], row, col) * tensor_get1(dz, row)
+                row = row + 1
+            }
+            tensor_set1(new_dh, col, s2)
+            col = col + 1
+        }
+
+        dh = new_dh
+    }
+
+    num r = 0
+    while (r < model["hidden_size"]) {
+        num c = 0
+        while (c < model["input_size"]) {
+            tensor_set2(
+                model["Wxh"],
+                r,
+                c,
+                tensor_get2(model["Wxh"], r, c) - lr * tensor_get2(dWxh, r, c)
+            )
+            c = c + 1
+        }
+        r = r + 1
+    }
+
+    r = 0
+    while (r < model["hidden_size"]) {
+        num c2 = 0
+        while (c2 < model["hidden_size"]) {
+            tensor_set2(
+                model["Whh"],
+                r,
+                c2,
+                tensor_get2(model["Whh"], r, c2) - lr * tensor_get2(dWhh, r, c2)
+            )
+            c2 = c2 + 1
+        }
+
+        tensor_set1(
+            model["bh"],
+            r,
+            tensor_get1(model["bh"], r) - lr * tensor_get1(dbh, r)
+        )
+
+        r = r + 1
+    }
+
+    num o = 0
+    while (o < model["output_size"]) {
+        num h = 0
+        while (h < model["hidden_size"]) {
+            tensor_set2(
+                model["Why"],
+                o,
+                h,
+                tensor_get2(model["Why"], o, h) - lr * tensor_get2(dWhy, o, h)
+            )
+            h = h + 1
+        }
+
+        tensor_set1(
+            model["by"],
+            o,
+            tensor_get1(model["by"], o) - lr * tensor_get1(dby, o)
+        )
+
+        o = o + 1
+    }
+
+    num correct = 0
+    if (fw["pred"] == label) {
+        correct = 1
+    }
+
+    return {
+        "loss": loss,
+        "pred": fw["pred"],
+        "confidence": fw["confidence"],
+        "correct": correct
+    }
+}
+
+map fn rnn_evaluate(map model, arr samples) {
+    num hits = 0
+    num n = 0
+    num conf_sum = 0
+
+    for (sample in samples) {
+        map fw = rnn_forward(model, sample["x"])
+        conf_sum = conf_sum + fw["confidence"]
+        if (fw["pred"] == sample["label"]) {
+            hits = hits + 1
+        }
+        n = n + 1
+    }
+
+    num acc = 0
+    num avg_conf = 0
+
+    if (n > 0) {
+        acc = hits / n
+        avg_conf = conf_sum / n
+    }
+
+    return {
+        "count": n,
+        "hits": hits,
+        "acc": acc,
+        "avg_confidence": avg_conf
+    }
+}
+
+map fn rnn_train(map model, arr samples, num epochs, num lr) {
+    num epoch = 0
+
+    while (epoch < epochs) {
+        num total_loss = 0
+        num hits = 0
+        num seen = 0
+        num conf_sum = 0
+
+        for (sample in samples) {
+            map step = rnn_train_seq(model, sample["x"], sample["label"], lr)
+            total_loss = total_loss + step["loss"]
+            hits = hits + step["correct"]
+            conf_sum = conf_sum + step["confidence"]
+            seen = seen + 1
+        }
+
+        num train_loss = 0
+        num train_acc = 0
+        num avg_conf = 0
+
+        if (seen > 0) {
+            train_loss = total_loss / seen
+            train_acc = hits / seen
+            avg_conf = conf_sum / seen
+        }
+
+        print "rnn epoch " .. (epoch + 1) ..
+              " loss " .. train_loss ..
+              " acc " .. train_acc ..
+              " avg_conf " .. avg_conf ..
+              " seen " .. seen
+
+        epoch = epoch + 1
+    }
+
+    return model
+}

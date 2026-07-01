@@ -1,0 +1,81 @@
+.Dd June 29, 2026
+.Dt BYTELANG 7
+.Os
+.Sh NAME
+.Nm bytelang
+.Nd ByteLang language overview
+.Sh DESCRIPTION
+ByteLang is a programmable scripting language built around deliberate lack of ready-made abstraction.
+It favors a small core, explicit state, low-level buffers and arrays, named functions, and user-defined conventions over a large preset worldview.
+.Sh CURRENT CORE
+The implementation includes:
+.Bl -bullet
+.It
+integers and strings
+.It
+buffers and arrays
+.It
+variables and assignment
+.It
+arithmetic and comparison
+.It
+if/else and while
+.It
+named functions
+.It
+manual allocation-oriented operations
+.It
+parser hooks for macro and native-extension forms
+.El
+.Sh VALUES AND TRUTHINESS
+Falsey values include
+.Ic null ,
+integer zero, empty strings, and empty buffers or arrays.
+Everything else is truthy.
+.Sh BUILTINS
+Builtins include:
+.Bl -tag -width Ds
+.It Ic print , Ic println
+Output helpers.
+.It Ic assert
+Runtime assertion.
+.It Ic len
+Length of strings, buffers, or arrays.
+.It Ic string_new , Ic string_eq
+String helpers.
+.It Ic array_new , Ic array_grow , Ic array_set , Ic array_get , Ic array_len
+Array helpers.
+.It Ic malloc , Ic realloc
+Allocation forms.
+.El
+.Sh IMPORTS
+ByteLang supports local imports by path and official imports from the global library directory.
+.Sh OFFICIAL LIBRARIES
+.Bl -tag -width Ds
+.It Ic String
+Low-level pointer-oriented string interface exposed as
+.Ic String.concat ,
+.Ic String.cmp ,
+and
+.Ic String.length .
+.It Ic Array
+Fixed-size mutable container interface.
+.It Ic Vector
+Growable sequence interface layered over
+.Ic Array .
+.It Ic Tensor
+Flat-storage tensor interface with shape and rank metadata.
+.El
+.Sh EXAMPLE
+.Bd -literal -offset indent
+import {String}
+
+new String a = "abc";
+new String b = "def";
+new String c = String.concat(a, b);
+
+println(String.length(c));
+println(String.cmp(c, "abcdef"));
+.Ed
+.Sh SEE ALSO
+.Xr bytelang 1
