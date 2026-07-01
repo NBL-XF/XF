@@ -2,18 +2,8 @@
 
 .DEFAULT_GOAL := all
 
-UNAME_S := $(shell uname -s)
-
-LLVM_PREFIX ?= /opt/homebrew/opt/llvm/bin
-CC ?= $(LLVM_PREFIX)/clang
-
-ifeq ($(UNAME_S),Darwin)
-	AR := /usr/bin/ar
-	RANLIB := /usr/bin/ranlib
-else
-	AR ?= $(LLVM_PREFIX)/llvm-ar
-	RANLIB ?= ranlib
-endif
+CC      = /opt/homebrew/opt/llvm/bin/clang
+AR      = /opt/homebrew/opt/llvm/bin/llvm-ar
 
 WARNFLAGS    = -Wall -Wextra -Wpedantic -std=c11
 DEBUGFLAGS   = -O0 -g -fsanitize=address,leak,undefined -fno-omit-frame-pointer
@@ -33,35 +23,16 @@ else
 	LDFLAGS =
 endif
 
-LDLIBS ?= -lm -lpthread -lreadline
-
+LDLIBS  ?= -lm -lpthread -lreadline
 PREFIX  ?= /usr/local
 DESTDIR ?=
 
-MANDIR      := $(PREFIX)/share/man
-DOC_MANDIR  ?= docs/man
-MAN1_SRC    := $(wildcard $(DOC_MANDIR)/man1/*.1)
-MAN3_SRC    := $(wildcard $(DOC_MANDIR)/man3/*.3)
-MAN5_SRC    := $(wildcard $(DOC_MANDIR)/man5/*.5)
-MAN7_SRC    := $(wildcard $(DOC_MANDIR)/man7/*.7)
-MAN1_DST    := $(addprefix $(DESTDIR)$(MANDIR)/man1/,$(notdir $(MAN1_SRC)))
-MAN3_DST    := $(addprefix $(DESTDIR)$(MANDIR)/man3/,$(notdir $(MAN3_SRC)))
-MAN5_DST    := $(addprefix $(DESTDIR)$(MANDIR)/man5/,$(notdir $(MAN5_SRC)))
-MAN7_DST    := $(addprefix $(DESTDIR)$(MANDIR)/man7/,$(notdir $(MAN7_SRC)))
+OBJDIR  = obj/$(MODE)
+BINDIR  = bin/$(MODE)
+LIBDIR  = lib/$(MODE)
 
-OBJDIR = obj/$(MODE)
-BINDIR = bin/$(MODE)
-LIBDIR = lib/$(MODE)
-
-BIN   = $(BINDIR)/xf
-LIBXF = $(LIBDIR)/static/libxf.a
-
-VENDOR_DIR ?= vendor
-
-LS_ROOT   ?= $(VENDOR_DIR)/lambdaScript
-LS_INC    ?= -I$(LS_ROOT)/include
-LS_OBJDIR ?= $(OBJDIR)/lambdaScript
-LS_LIB    ?= $(LS_OBJDIR)/libls.a
+BIN     = $(BINDIR)/xf
+LIBXF   = $(LIBDIR)/static/libxf.a
 
 BYTE_ROOT ?= $(VENDOR_DIR)/byteLang
 BYTE_INC  ?= -I$(BYTE_ROOT)
@@ -79,9 +50,11 @@ CORE_SRCS = \
 	src/core/ds.c \
 	src/core/edit.c \
 	src/core/process.c \
-	src/core/img.c \
-	src/core/lambda.c \
-	src/core/byte.c
+	src/core/img.c
+
+LIB_API_SRCS = \
+	lib/driver.c \
+	lib/api.c
 
 RUNTIME_SRCS = \
 	src/ast.c \
@@ -101,23 +74,14 @@ CLI_SRCS = \
 	src/main.c \
 	src/repl.c \
 	src/simd.c
-
-LS_SRCS = \
-	$(LS_ROOT)/src/ast.c \
-	$(LS_ROOT)/src/err.c \
-	$(LS_ROOT)/src/interp.c \
-	$(LS_ROOT)/src/lexer.c \
-	$(LS_ROOT)/src/ls.c \
-	$(LS_ROOT)/src/parser.c \
-	$(LS_ROOT)/src/symTable.c \
-	$(LS_ROOT)/src/value.c
+	src/repl.c
 
 RUNTIME_OBJS = $(patsubst %.c,$(OBJDIR)/%.o,$(RUNTIME_SRCS))
 CLI_OBJS     = $(patsubst %.c,$(OBJDIR)/%.o,$(CLI_SRCS))
-LS_OBJS      = $(patsubst $(LS_ROOT)/src/%.c,$(LS_OBJDIR)/%.o,$(LS_SRCS))
 
 all: $(LIBXF) $(BIN)
 
+# Rebuild core objs when shared internal header changes
 $(patsubst %.c,$(OBJDIR)/%.o,$(CORE_SRCS)): src/core/internal.h
 
 run: $(BIN)
@@ -136,43 +100,29 @@ $(LIBXF): $(RUNTIME_OBJS)
 	$(AR) rcs $@ $^
 	$(RANLIB) $@
 
-$(BIN): $(CLI_OBJS) $(LIBXF) $(LS_LIB) $(BYTE_LIB)
+$(BIN): $(CLI_OBJS) $(LIBXF)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -o $@ $(CLI_OBJS) $(LIBXF) $(LS_LIB) $(BYTE_LIB) $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $(CLI_OBJS) $(LIBXF) $(LDFLAGS) $(LDLIBS)
 
-$(BYTE_LIB):
-	$(MAKE) -C $(BYTE_ROOT)
-
-$(LS_LIB): $(LS_OBJS)
+$(OBJDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(AR) rcs $@ $^
-	$(RANLIB) $@
-
-$(LS_OBJDIR)/%.o: $(LS_ROOT)/src/%.c
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LS_INC) -c $< -o $@
-
-$(OBJDIR)/src/%.o: src/%.c
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LS_INC) $(BYTE_INC) -c $< -o $@
-
-$(OBJDIR)/src/core/%.o: src/core/%.c
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LS_INC) $(BYTE_INC) -c $< -o $@
-
-$(OBJDIR)/lib/%.o: lib/%.c
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LS_INC) $(BYTE_INC) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@
 
 install: $(LIBXF) $(BIN) install-man
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -d $(DESTDIR)$(PREFIX)/lib
 	install -d $(DESTDIR)$(PREFIX)/include/xf
+
 	install -m 755 $(BIN)   $(DESTDIR)$(PREFIX)/bin/xf
 	install -m 644 $(LIBXF) $(DESTDIR)$(PREFIX)/lib/libxf.a
-	install -m 644 include/core.h include/value.h include/symTable.h \
-	               lib/driver.h \
-	               $(DESTDIR)$(PREFIX)/include/xf/
+
+	install -m 644 \
+		include/core.h \
+		include/value.h \
+		include/symTable.h \
+		lib/api.h \
+		lib/driver.h \
+		$(DESTDIR)$(PREFIX)/include/xf/
 
 install-man:
 	@if [ -n "$(MAN1_SRC)$(MAN3_SRC)$(MAN5_SRC)$(MAN7_SRC)" ]; then \
