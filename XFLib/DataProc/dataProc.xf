@@ -1,0 +1,257 @@
+bool fn dataproc_is_missing_num_cell(map row, str col) {
+    if (row[col] == NAV) {
+        return TRUE
+    }
+    if (row[col] == NULL) {
+        return TRUE
+    }
+    if ((row[col] .. "") == "") {
+        return TRUE
+    }
+    return FALSE
+}
+
+map fn dataproc_fill_missing_num(map t, str column, num fallback) {
+    arr rows = []
+
+    for (src in t["rows"]) {
+        map row = table_copy_row(src)
+        if (dataproc_is_missing_num_cell(row, column)) {
+            row[column] = fallback
+        }
+        push(rows, row)
+    }
+
+    return table_new(t["columns"], rows)
+}
+
+map fn dataproc_fill_missing_str(map t, str column, str fallback) {
+    arr rows = []
+
+    for (src in t["rows"]) {
+        map row = table_copy_row(src)
+        if (row[column] == NAV || row[column] == NULL || core.str.trim(row[column] .. "") == "") {
+            row[column] = fallback
+        }
+        push(rows, row)
+    }
+
+    return table_new(t["columns"], rows)
+}
+
+map fn dataproc_minmax(map t, str column) {
+    num found = 0
+    num minv = 0
+    num maxv = 0
+
+    for (row in t["rows"]) {
+        if (!dataproc_is_missing_num_cell(row, column)) {
+            num v = row[column] + 0
+            if (found == 0) {
+                minv = v
+                maxv = v
+                found = 1
+            } else {
+                if (v < minv) {
+                    minv = v
+                }
+                if (v > maxv) {
+                    maxv = v
+                }
+            }
+        }
+    }
+
+    return {
+        "found": found,
+        "min": minv,
+        "max": maxv,
+        "span": maxv - minv
+    }
+}
+
+map fn dataproc_stats(map t, str column) {
+    num n = 0
+    num sum = 0
+
+    for (row in t["rows"]) {
+        if (!dataproc_is_missing_num_cell(row, column)) {
+            num v = row[column] + 0
+            sum = sum + v
+            n = n + 1
+        }
+    }
+
+    num mean = 0
+    if (n > 0) {
+        mean = sum / n
+    }
+
+    num sq = 0
+    for (row in t["rows"]) {
+        if (!dataproc_is_missing_num_cell(row, column)) {
+            num v = row[column] + 0
+            num d = v - mean
+            sq = sq + d * d
+        }
+    }
+
+    num var = 0
+    num std = 0
+    if (n > 0) {
+        var = sq / n
+        std = core.math.sqrt(var)
+    }
+
+    return {
+        "count": n,
+        "mean": mean,
+        "var": var,
+        "std": std
+    }
+}
+
+map fn dataproc_normalize_minmax(map t, str column, str out_column) {
+    map mm = dataproc_minmax(t, column)
+    arr columns = table_copy_arr(t["columns"])
+
+    if (!table_has_column(t, out_column)) {
+        push(columns, out_column)
+    }
+
+    arr rows = []
+    for (src in t["rows"]) {
+        map row = table_copy_row(src)
+
+        if (dataproc_is_missing_num_cell(row, column) || mm["span"] == 0) {
+            row[out_column] = 0
+        } else {
+            num v = row[column] + 0
+            row[out_column] = (v - mm["min"]) / mm["span"]
+        }
+
+        push(rows, row)
+    }
+
+    return table_new(columns, rows)
+}
+
+map fn dataproc_standardize(map t, str column, str out_column) {
+    map st = dataproc_stats(t, column)
+    arr columns = table_copy_arr(t["columns"])
+
+    if (!table_has_column(t, out_column)) {
+        push(columns, out_column)
+    }
+
+    arr rows = []
+    for (src in t["rows"]) {
+        map row = table_copy_row(src)
+
+        if (dataproc_is_missing_num_cell(row, column) || st["std"] == 0) {
+            row[out_column] = 0
+        } else {
+            num v = row[column] + 0
+            row[out_column] = (v - st["mean"]) / st["std"]
+        }
+
+        push(rows, row)
+    }
+
+    return table_new(columns, rows)
+}
+
+map fn dataproc_label_encode(map t, str column, str out_column) {
+    map vocab = {}
+    arr inverse = []
+    arr columns = table_copy_arr(t["columns"])
+
+    if (!table_has_column(t, out_column)) {
+        push(columns, out_column)
+    }
+
+    arr rows = []
+    for (src in t["rows"]) {
+        map row = table_copy_row(src)
+        str key = row[column] .. ""
+
+        if (!has(vocab, key)) {
+            vocab[key] = inverse.len
+            push(inverse, key)
+        }
+
+        row[out_column] = vocab[key]
+        push(rows, row)
+    }
+
+    return {
+        "table": table_new(columns, rows),
+        "vocab": vocab,
+        "inverse": inverse,
+        "classes": inverse.len
+    }
+}
+
+arr fn dataproc_one_hot(num idx, num classes) {
+    arr out = []
+    num i = 0
+    while (i < classes) {
+        if (i == idx) {
+            push(out, 1)
+        } else {
+            push(out, 0)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+map fn dataproc_split(map t, num train_ratio) {
+    if (train_ratio < 0) {
+        train_ratio = 0
+    }
+    if (train_ratio > 1) {
+        train_ratio = 1
+    }
+
+    num cut = core.math.floor(t["rows"].len * train_ratio)
+    arr train_rows = []
+    arr test_rows = []
+
+    num i = 0
+    while (i < t["rows"].len) {
+        if (i < cut) {
+            push(train_rows, table_copy_row(t["rows"][i]))
+        } else {
+            push(test_rows, table_copy_row(t["rows"][i]))
+        }
+        i = i + 1
+    }
+
+    return {
+        "train": table_new(t["columns"], train_rows),
+        "test": table_new(t["columns"], test_rows)
+    }
+}
+
+arr fn dataproc_rows_to_xy(map t, arr feature_cols, str label_col) {
+    arr out = []
+
+    for (row in t["rows"]) {
+        arr x = []
+        for (col in feature_cols) {
+            push(x, row[col] + 0)
+        }
+
+        push(out, {
+            "x": x,
+            "y": row[label_col] + 0
+        })
+    }
+
+    return out
+}
+
+map fn dataproc_from_csv_path(str path) {
+    return table_from_csv_path(path)
+}

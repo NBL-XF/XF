@@ -1,0 +1,402 @@
+arr fn tensor_copy_shape(arr shape) {
+    arr out = []
+    for (d in shape) {
+        push(out, d)
+    }
+    return out
+}
+
+num fn tensor_size_from_shape(arr shape) {
+    if (shape.len == 0) {
+        return 0
+    }
+
+    num prod = 1
+    for (d in shape) {
+        prod = prod * d
+    }
+    return prod
+}
+
+arr fn tensor_fill_arr(num size, num value) {
+    arr out = []
+    num i = 0
+    while (i < size) {
+        push(out, value)
+        i = i + 1
+    }
+    return out
+}
+
+arr fn tensor_copy_data(arr data) {
+    arr out = []
+    for (x in data) {
+        push(out, x + 0)
+    }
+    return out
+}
+
+map fn tensor_new(arr shape, arr data) {
+    return {
+        "__kind": "Tensor",
+        "shape": tensor_copy_shape(shape),
+        "size": tensor_size_from_shape(shape),
+        "data": tensor_copy_data(data)
+    }
+}
+
+bool fn tensor_is(map t) {
+    return t["__kind"] == "Tensor"
+}
+
+map fn tensor_zeros(arr shape) {
+    num size = tensor_size_from_shape(shape)
+    return {
+        "__kind": "Tensor",
+        "shape": tensor_copy_shape(shape),
+        "size": size,
+        "data": tensor_fill_arr(size, 0)
+    }
+}
+
+map fn tensor_ones(arr shape) {
+    num size = tensor_size_from_shape(shape)
+    return {
+        "__kind": "Tensor",
+        "shape": tensor_copy_shape(shape),
+        "size": size,
+        "data": tensor_fill_arr(size, 1)
+    }
+}
+
+map fn tensor_rand(arr shape, num scale) {
+    num size = tensor_size_from_shape(shape)
+    arr data = []
+    num i = 0
+    while (i < size) {
+        push(data, (core.math.rand() * 2 - 1) * scale)
+        i = i + 1
+    }
+    return tensor_new(shape, data)
+}
+
+map fn tensor_clone(map t) {
+    return tensor_new(t["shape"], t["data"])
+}
+
+bool fn tensor_same_shape(map a, map b) {
+    if (a["shape"].len != b["shape"].len) {
+        return FALSE
+    }
+
+    num i = 0
+    while (i < a["shape"].len) {
+        if (a["shape"][i] != b["shape"][i]) {
+            return FALSE
+        }
+        i = i + 1
+    }
+
+    return TRUE
+}
+
+num fn tensor_get1(map t, num i) {
+    return t["data"][i]
+}
+
+void fn tensor_set1(map t, num i, num v) {
+    t["data"][i] = v
+}
+
+num fn tensor_index2(map t, num i, num j) {
+    return i * t["shape"][1] + j
+}
+
+num fn tensor_get2(map t, num i, num j) {
+    return t["data"][tensor_index2(t, i, j)]
+}
+
+void fn tensor_set2(map t, num i, num j, num v) {
+    t["data"][tensor_index2(t, i, j)] = v
+}
+
+map fn tensor_from_arr(arr xs) {
+    arr out = []
+    for (x in xs) {
+        push(out, x + 0)
+    }
+    return tensor_new([out.len], out)
+}
+
+arr fn tensor_to_arr(map t) {
+    return tensor_copy_data(t["data"])
+}
+
+map fn tensor_from_grid(map grid, num h, num w) {
+    map out = tensor_zeros([h, w])
+    num y = 0
+    while (y < h) {
+        num x = 0
+        while (x < w) {
+            tensor_set2(out, y, x, grid[y][x] + 0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return out
+}
+
+map fn tensor_to_grid(map t) {
+    map grid = {}
+    num h = t["shape"][0]
+    num w = t["shape"][1]
+
+    num y = 0
+    while (y < h) {
+        map row = {}
+        num x = 0
+        while (x < w) {
+            row[x] = tensor_get2(t, y, x)
+            x = x + 1
+        }
+        grid[y] = row
+        y = y + 1
+    }
+
+    return grid
+}
+
+map fn tensor_add(map a, map b) {
+    map out = tensor_zeros(a["shape"])
+    num i = 0
+    while (i < a["size"]) {
+        tensor_set1(out, i, tensor_get1(a, i) + tensor_get1(b, i))
+        i = i + 1
+    }
+    return out
+}
+
+map fn tensor_sub(map a, map b) {
+    map out = tensor_zeros(a["shape"])
+    num i = 0
+    while (i < a["size"]) {
+        tensor_set1(out, i, tensor_get1(a, i) - tensor_get1(b, i))
+        i = i + 1
+    }
+    return out
+}
+
+map fn tensor_hadamard(map a, map b) {
+    map out = tensor_zeros(a["shape"])
+    num i = 0
+    while (i < a["size"]) {
+        tensor_set1(out, i, tensor_get1(a, i) * tensor_get1(b, i))
+        i = i + 1
+    }
+    return out
+}
+
+map fn tensor_mul_scalar(map t, num s) {
+    map out = tensor_zeros(t["shape"])
+    num i = 0
+    while (i < t["size"]) {
+        tensor_set1(out, i, tensor_get1(t, i) * s)
+        i = i + 1
+    }
+    return out
+}
+
+map fn tensor_div_scalar(map t, num s) {
+    map out = tensor_zeros(t["shape"])
+    num i = 0
+    while (i < t["size"]) {
+        tensor_set1(out, i, tensor_get1(t, i) / s)
+        i = i + 1
+    }
+    return out
+}
+
+num fn tensor_sum(map t) {
+    num s = 0
+    num i = 0
+    while (i < t["size"]) {
+        s = s + tensor_get1(t, i)
+        i = i + 1
+    }
+    return s
+}
+
+num fn tensor_mean(map t) {
+    if (t["size"] == 0) {
+        return 0
+    }
+    return tensor_sum(t) / t["size"]
+}
+
+num fn tensor_argmax1(map t) {
+    num best_i = 0
+    num best_v = tensor_get1(t, 0)
+    num i = 1
+    while (i < t["size"]) {
+        num v = tensor_get1(t, i)
+        if (v > best_v) {
+            best_v = v
+            best_i = i
+        }
+        i = i + 1
+    }
+    return best_i
+}
+
+map fn tensor_relu(map t) {
+    map out = tensor_zeros(t["shape"])
+    num i = 0
+    while (i < t["size"]) {
+        num v = tensor_get1(t, i)
+        if (v > 0) {
+            tensor_set1(out, i, v)
+        } else {
+            tensor_set1(out, i, 0)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+map fn tensor_softmax1(map t) {
+    num maxv = tensor_get1(t, 0)
+    num i = 1
+    while (i < t["size"]) {
+        num v = tensor_get1(t, i)
+        if (v > maxv) {
+            maxv = v
+        }
+        i = i + 1
+    }
+
+    map out = tensor_zeros(t["shape"])
+    num sumexp = 0
+
+    i = 0
+    while (i < t["size"]) {
+        num e = core.math.exp(tensor_get1(t, i) - maxv)
+        tensor_set1(out, i, e)
+        sumexp = sumexp + e
+        i = i + 1
+    }
+
+    i = 0
+    while (i < t["size"]) {
+        tensor_set1(out, i, tensor_get1(out, i) / sumexp)
+        i = i + 1
+    }
+
+    return out
+}
+
+map fn tensor_transpose2(map t) {
+    num rows = t["shape"][0]
+    num cols = t["shape"][1]
+    map out = tensor_zeros([cols, rows])
+
+    num i = 0
+    while (i < rows) {
+        num j = 0
+        while (j < cols) {
+            tensor_set2(out, j, i, tensor_get2(t, i, j))
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    return out
+}
+
+map fn tensor_matmul(map a, map b) {
+    num ar = a["shape"][0]
+    num ac = a["shape"][1]
+    num br = b["shape"][0]
+    num bc = b["shape"][1]
+    map out = tensor_zeros([ar, bc])
+
+    if (ac != br) {
+        return out
+    }
+
+    num i = 0
+    while (i < ar) {
+        num j = 0
+        while (j < bc) {
+            num s = 0
+            num k = 0
+            while (k < ac) {
+                s = s + tensor_get2(a, i, k) * tensor_get2(b, k, j)
+                k = k + 1
+            }
+            tensor_set2(out, i, j, s)
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    return out
+}
+
+map fn tensor_matvec(map a, map x) {
+    num rows = a["shape"][0]
+    num cols = a["shape"][1]
+    map out = tensor_zeros([rows])
+
+    num i = 0
+    while (i < rows) {
+        num s = 0
+        num j = 0
+        while (j < cols) {
+            s = s + tensor_get2(a, i, j) * tensor_get1(x, j)
+            j = j + 1
+        }
+        tensor_set1(out, i, s)
+        i = i + 1
+    }
+
+    return out
+}
+
+map fn tensor_outer(map a, map b) {
+    num m = a["shape"][0]
+    num n = b["shape"][0]
+    map out = tensor_zeros([m, n])
+
+    num i = 0
+    while (i < m) {
+        num j = 0
+        while (j < n) {
+            tensor_set2(out, i, j, tensor_get1(a, i) * tensor_get1(b, j))
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    return out
+}
+
+map fn tensor_from_image_map_gray(map img) {
+    num h = img["height"] + 0
+    num w = img["width"] + 0
+    arr data = []
+    num i = 0
+
+    while (i < img["data"].len) {
+        tuple pix = img["data"][i]
+        num v = (pix[0] + pix[1] + pix[2]) / 3
+        push(data, v)
+        i = i + 1
+    }
+
+    return tensor_new([h, w], data)
+}
+
+map fn tensor_from_image_path_gray(str path, num normalized) {
+    map img = core.img.vectorize(path, "rgb", normalized)
+    return tensor_from_image_map_gray(img)
+}
