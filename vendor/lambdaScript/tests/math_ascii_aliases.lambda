@@ -1,0 +1,7 @@
+A = sqrt 16
+B = ln euler
+C = inf
+D = INFINITY
+E = SQRT 25
+F = LN EULER
+cons A (cons B (cons C (cons D (cons E (cons F nil)))))

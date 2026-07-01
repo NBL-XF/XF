@@ -1,0 +1,24 @@
+-- Path: Libraries/vector.ls
+
+EMPTY = NIL
+PUSH = CONS
+IS_EMPTY = \seq.seq (\head tail.FALSE) TRUE
+FIRST_OR = \fallback seq.seq (\head tail.head) fallback
+REST_OR = \fallback seq.seq (\head tail.tail) fallback
+FIRST = FIRST_OR NIL
+REST = REST_OR NIL
+HEAD = FIRST
+TAIL = REST
+HAS = \item seq.item in seq
+CONTAINS = HAS
+ALL = \seq pred.forall item in seq : pred item
+ANY = \seq pred.exists item in seq : pred item
+FIX = \f.(\x.f (x x)) (\x.f (x x))
+LENGTH = FIX (\self seq.seq (\head tail.1 + self tail) 0)
+APPEND = FIX (\self left right.left (\head tail.CONS head (self tail right)) right)
+CONCAT = APPEND
+MAP = FIX (\self f seq.seq (\head tail.CONS (f head) (self f tail)) NIL)
+FILTER = FIX (\self pred seq.seq (\head tail.((pred head) (CONS head (self pred tail))) (self pred tail)) NIL)
+FOLD = FIX (\self f acc seq.seq (\head tail.self f (f acc head) tail) acc)
+REVERSE = \seq.FOLD (\acc item.CONS item acc) NIL seq
+SNOC = \seq item.APPEND seq (CONS item NIL)

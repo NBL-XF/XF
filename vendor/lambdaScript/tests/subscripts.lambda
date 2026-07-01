@@ -1,0 +1,8 @@
+A = Nₑ
+B = N_e
+C = N(ᵢ,ⱼ)
+D = N_(i,j)
+x₀ = 8
+E = x₀**(-1/3)
+F = Σ i = 0 to n . xᵢ
+cons A (cons B (cons C (cons D (cons E (cons F nil)))))

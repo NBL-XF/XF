@@ -1,0 +1,200 @@
+diff --git a/mnt/data/lexer.h b/mnt/data/work_bl_dotted/lexer.h
+index 3963f44..2010834 100644
+--- a/mnt/data/lexer.h
++++ b/mnt/data/work_bl_dotted/lexer.h
+@@ -29,6 +29,7 @@ typedef enum {
+     TOK_RBRACE,
+     TOK_LBRACKET,
+     TOK_RBRACKET,
++    TOK_DOT,
+     TOK_COMMA,
+     TOK_SEMI,
+     TOK_EQUAL,
+diff --git a/mnt/data/lexer.c b/mnt/data/work_bl_dotted/lexer.c
+index 742fb25..c4c70f6 100644
+--- a/mnt/data/lexer.c
++++ b/mnt/data/work_bl_dotted/lexer.c
+@@ -145,6 +145,7 @@ BLToken bl_lexer_next(BLLexer *lexer) {
+         case '}': return bl_make_token(TOK_RBRACE, start, 1, line, column);
+         case '[': return bl_make_token(TOK_LBRACKET, start, 1, line, column);
+         case ']': return bl_make_token(TOK_RBRACKET, start, 1, line, column);
++        case '.': return bl_make_token(TOK_DOT, start, 1, line, column);
+         case ',': return bl_make_token(TOK_COMMA, start, 1, line, column);
+         case ';': return bl_make_token(TOK_SEMI, start, 1, line, column);
+         case '+': return bl_make_token(TOK_PLUS, start, 1, line, column);
+diff --git a/mnt/data/parser.c b/mnt/data/work_bl_dotted/parser.c
+index bd9e4af..3f76cd0 100644
+--- a/mnt/data/parser.c
++++ b/mnt/data/work_bl_dotted/parser.c
+@@ -91,6 +91,37 @@ static int bl_expect(BLParser *parser, BLTokenKind kind, const char *message) {
+     return 0;
+ }
+ 
++static char *bl_join_qualified_name(char *base, BLToken part) {
++    size_t base_len = strlen(base);
++    size_t part_len = part.length;
++    char *name = (char *)realloc(base, base_len + 1 + part_len + 1);
++    if (!name) {
++        perror("realloc");
++        exit(1);
++    }
++    name[base_len] = '.';
++    memcpy(name + base_len + 1, part.start, part_len);
++    name[base_len + 1 + part_len] = '\0';
++    return name;
++}
++
++static char *bl_parse_qualified_name(BLParser *parser, const char *message) {
++    BLToken part = parser->current;
++    if (!bl_expect(parser, TOK_IDENT, message)) return NULL;
++
++    char *name = bl_token_text(part);
++    while (bl_match(parser, TOK_DOT)) {
++        BLToken next = parser->current;
++        if (!bl_expect(parser, TOK_IDENT, "expected identifier after '.'")) {
++            free(name);
++            return NULL;
++        }
++        name = bl_join_qualified_name(name, next);
++    }
++    return name;
++}
++
++
+ static BLNode *bl_parse_statement(BLParser *parser);
+ static BLNode *bl_parse_expression(BLParser *parser);
+ 
+@@ -127,9 +158,10 @@ static BLNode *bl_parse_primary(BLParser *parser) {
+         return node;
+     }
+ 
+-    if (bl_match(parser, TOK_IDENT)) {
++    if (parser->current.kind == TOK_IDENT) {
+         BLNode *node = bl_new_node(parser, AST_IDENT, token.line, token.column);
+-        node->as.ident.name = bl_token_text(token);
++        node->as.ident.name = bl_parse_qualified_name(parser, "expected identifier");
++        if (!node->as.ident.name) return NULL;
+         return node;
+     }
+ 
+@@ -305,18 +337,23 @@ static BLNode *bl_parse_expression(BLParser *parser) {
+ 
+ static BLNode *bl_parse_fn_definition(BLParser *parser) {
+     BLToken name = parser->current;
+-    if (!bl_expect(parser, TOK_IDENT, "expected function name")) return NULL;
++    char *fn_name = bl_parse_qualified_name(parser, "expected function name");
++    if (!fn_name) return NULL;
+ 
+     if (parser->current.kind == TOK_STRING) {
+         bl_advance(parser);
+-        if (!bl_expect(parser, TOK_SEMI, "expected ';' after native definition")) return NULL;
++        if (!bl_expect(parser, TOK_SEMI, "expected ';' after native definition")) {
++            free(fn_name);
++            return NULL;
++        }
++        free(fn_name);
+         return NULL;
+     }
+ 
+     if (!bl_expect(parser, TOK_LPAREN, "expected '(' after function name")) return NULL;
+ 
+     BLNode *node = bl_new_node(parser, AST_FN_DEF, name.line, name.column);
+-    node->as.fn_def.name = bl_token_text(name);
++    node->as.fn_def.name = fn_name;
+ 
+     while (!parser->error && parser->current.kind != TOK_RPAREN) {
+         BLToken param = parser->current;
+@@ -384,11 +421,17 @@ static BLNode *bl_parse_statement(BLParser *parser) {
+     if (bl_match(parser, TOK_HASH)) {
+         if (!bl_expect(parser, TOK_DEFINE, "expected define after '#'")) return NULL;
+         if (!bl_expect(parser, TOK_FN, "expected fn after '#define'")) return NULL;
+-        BLToken name = parser->current;
+-        if (!bl_expect(parser, TOK_IDENT, "expected function name")) return NULL;
+-        if (!bl_expect(parser, TOK_STRING, "expected native snippet string")) return NULL;
+-        if (!bl_expect(parser, TOK_SEMI, "expected ';' after native snippet")) return NULL;
+-        (void)name;
++        char *native_name = bl_parse_qualified_name(parser, "expected function name");
++        if (!native_name) return NULL;
++        if (!bl_expect(parser, TOK_STRING, "expected native snippet string")) {
++            free(native_name);
++            return NULL;
++        }
++        if (!bl_expect(parser, TOK_SEMI, "expected ';' after native snippet")) {
++            free(native_name);
++            return NULL;
++        }
++        free(native_name);
+         return NULL;
+     }
+ 
+diff --git a/mnt/data/vm.c b/mnt/data/work_bl_dotted/vm.c
+index e1db888..bab9c26 100644
+--- a/mnt/data/vm.c
++++ b/mnt/data/work_bl_dotted/vm.c
+@@ -193,6 +193,56 @@ static BLValue bl_builtin_string_eq(BLVM *vm, BLNode *call_node, BLValue *args,
+     return bl_value_int(bl_value_compare_eq(args[0], args[1]));
+ }
+ 
++
++static BLValue bl_builtin_string_concat(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
++    if (argc != 2) {
++        return bl_runtime_error(vm, call_node, "String.concat expects two arguments");
++    }
++
++    char *a = bl_value_to_cstring(args[0]);
++    char *b = bl_value_to_cstring(args[1]);
++    size_t len_a = strlen(a);
++    size_t len_b = strlen(b);
++    char *buffer = (char *)calloc(len_a + len_b + 1, 1);
++    if (!buffer) {
++        perror("calloc");
++        exit(1);
++    }
++
++    memcpy(buffer, a, len_a);
++    memcpy(buffer + len_a, b, len_b + 1);
++
++    BLValue result = bl_value_string_copy(buffer);
++    free(buffer);
++    free(a);
++    free(b);
++    return result;
++}
++
++static BLValue bl_builtin_string_cmp(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
++    if (argc != 2) {
++        return bl_runtime_error(vm, call_node, "String.cmp expects two arguments");
++    }
++
++    char *a = bl_value_to_cstring(args[0]);
++    char *b = bl_value_to_cstring(args[1]);
++    int cmp = strcmp(a, b);
++    free(a);
++    free(b);
++    return bl_value_int((long long)cmp);
++}
++
++static BLValue bl_builtin_string_length(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
++    if (argc != 1) {
++        return bl_runtime_error(vm, call_node, "String.length expects one argument");
++    }
++    if (!bl_value_is_string(args[0])) {
++        return bl_runtime_error(vm, call_node, "String.length expects string");
++    }
++    BLString *string = bl_value_as_string(args[0]);
++    return bl_value_int((long long)string->size);
++}
++
+ static BLValue bl_builtin_len(BLVM *vm, BLNode *call_node, BLValue *args, size_t argc) {
+     if (argc < 1) {
+         return bl_runtime_error(vm, call_node, "len expects one argument");
+@@ -384,6 +434,9 @@ static BLValue bl_call_user_function(BLVM *vm, BLNode *call_node, BLNode *fn_nod
+ static BLValue bl_builtin_call(BLVM *vm, BLNode *call_node, const char *name, BLValue *args, size_t argc) {
+     if (strcmp(name, "string_new") == 0) return bl_builtin_string_new(vm, call_node, args, argc);
+     if (strcmp(name, "string_eq") == 0) return bl_builtin_string_eq(vm, call_node, args, argc);
++    if (strcmp(name, "String.concat") == 0) return bl_builtin_string_concat(vm, call_node, args, argc);
++    if (strcmp(name, "String.cmp") == 0) return bl_builtin_string_cmp(vm, call_node, args, argc);
++    if (strcmp(name, "String.length") == 0) return bl_builtin_string_length(vm, call_node, args, argc);
+     if (strcmp(name, "len") == 0) return bl_builtin_len(vm, call_node, args, argc);
+     if (strcmp(name, "array_new") == 0) return bl_builtin_array_new(vm, call_node, args, argc);
+     if (strcmp(name, "array_grow") == 0) return bl_builtin_array_grow(vm, call_node, args, argc);

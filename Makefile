@@ -1,3 +1,5 @@
+# File: Makefile
+
 .DEFAULT_GOAL := all
 
 CC      = /opt/homebrew/opt/llvm/bin/clang
@@ -31,6 +33,10 @@ LIBDIR  = lib/$(MODE)
 
 BIN     = $(BINDIR)/xf
 LIBXF   = $(LIBDIR)/static/libxf.a
+
+BYTE_ROOT ?= $(VENDOR_DIR)/byteLang
+BYTE_INC  ?= -I$(BYTE_ROOT)
+BYTE_LIB  ?= $(BYTE_ROOT)/build/bin/libbl.a
 
 CORE_SRCS = \
 	src/core.c \
@@ -80,7 +86,7 @@ $(patsubst %.c,$(OBJDIR)/%.o,$(CORE_SRCS)): src/core/internal.h
 
 run: $(BIN)
 ifeq ($(MODE),debug)
-	ASAN_SYMBOLIZER_PATH=/opt/homebrew/opt/llvm/bin/llvm-symbolizer \
+	ASAN_SYMBOLIZER_PATH=$(LLVM_PREFIX)/llvm-symbolizer \
 	ASAN_OPTIONS=symbolize=1:detect_leaks=1:halt_on_error=1:abort_on_error=1 \
 	LSAN_OPTIONS=verbosity=1:report_objects=1 \
 	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
@@ -92,6 +98,7 @@ endif
 $(LIBXF): $(RUNTIME_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
+	$(RANLIB) $@
 
 $(BIN): $(CLI_OBJS) $(LIBXF)
 	@mkdir -p $(dir $@)
@@ -101,7 +108,7 @@ $(OBJDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-install: $(LIBXF) $(BIN)
+install: $(LIBXF) $(BIN) install-man
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -d $(DESTDIR)$(PREFIX)/lib
 	install -d $(DESTDIR)$(PREFIX)/include/xf
@@ -117,15 +124,40 @@ install: $(LIBXF) $(BIN)
 		lib/driver.h \
 		$(DESTDIR)$(PREFIX)/include/xf/
 
-uninstall:
+install-man:
+	@if [ -n "$(MAN1_SRC)$(MAN3_SRC)$(MAN5_SRC)$(MAN7_SRC)" ]; then \
+		install -d $(DESTDIR)$(MANDIR); \
+	fi
+	@if [ -n "$(MAN1_SRC)" ]; then \
+		install -d $(DESTDIR)$(MANDIR)/man1; \
+		install -m 644 $(MAN1_SRC) $(DESTDIR)$(MANDIR)/man1/; \
+	fi
+	@if [ -n "$(MAN3_SRC)" ]; then \
+		install -d $(DESTDIR)$(MANDIR)/man3; \
+		install -m 644 $(MAN3_SRC) $(DESTDIR)$(MANDIR)/man3/; \
+	fi
+	@if [ -n "$(MAN5_SRC)" ]; then \
+		install -d $(DESTDIR)$(MANDIR)/man5; \
+		install -m 644 $(MAN5_SRC) $(DESTDIR)$(MANDIR)/man5/; \
+	fi
+	@if [ -n "$(MAN7_SRC)" ]; then \
+		install -d $(DESTDIR)$(MANDIR)/man7; \
+		install -m 644 $(MAN7_SRC) $(DESTDIR)$(MANDIR)/man7/; \
+	fi
+
+uninstall: uninstall-man
 	rm -f  $(DESTDIR)$(PREFIX)/bin/xf
 	rm -f  $(DESTDIR)$(PREFIX)/lib/libxf.a
 	rm -rf $(DESTDIR)$(PREFIX)/include/xf
 
+uninstall-man:
+	rm -f $(MAN1_DST) $(MAN3_DST) $(MAN5_DST) $(MAN7_DST)
+
 clean:
 	rm -rf obj/* bin/*
 	rm -rf lib/debug lib/release lib/thread
+	-$(MAKE) -C $(BYTE_ROOT) clean
 
-export ASAN_SYMBOLIZER_PATH=/opt/homebrew/opt/llvm/bin/llvm-symbolizer
+export ASAN_SYMBOLIZER_PATH=$(LLVM_PREFIX)/llvm-symbolizer
 
-.PHONY: all run install uninstall clean
+.PHONY: all run install install-man uninstall uninstall-man clean

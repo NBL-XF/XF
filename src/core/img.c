@@ -213,6 +213,41 @@ static xf_Value ci_vectorize(xf_Value *args, size_t argc) {
     return v;
 }
 
+
+static bool img_ext_eq(const char *path, const char *ext) {
+    if (!path || !ext) return false;
+
+    const char *dot = strrchr(path, '.');
+    if (!dot) return false;
+
+    while (*dot && *ext) {
+        unsigned char a = (unsigned char)*dot++;
+        unsigned char b = (unsigned char)*ext++;
+        if (tolower(a) != tolower(b)) return false;
+    }
+
+    return *dot == '\0' && *ext == '\0';
+}
+
+static int img_write_by_path(const char *path, int width, int height, const unsigned char *buf) {
+    if (!path || !buf || width <= 0 || height <= 0) return 0;
+
+    if (img_ext_eq(path, ".png")) {
+        return stbi_write_png(path, width, height, 3, buf, width * 3);
+    }
+    if (img_ext_eq(path, ".jpg") || img_ext_eq(path, ".jpeg")) {
+        return stbi_write_jpg(path, width, height, 3, buf, 90);
+    }
+    if (img_ext_eq(path, ".bmp")) {
+        return stbi_write_bmp(path, width, height, 3, buf);
+    }
+    if (img_ext_eq(path, ".tga")) {
+        return stbi_write_tga(path, width, height, 3, buf);
+    }
+
+    return stbi_write_png(path, width, height, 3, buf, width * 3);
+}
+
 static xf_Value ci_unvectorize(xf_Value *args, size_t argc) {
     NEED(2);
 
@@ -317,11 +352,7 @@ static xf_Value ci_unvectorize(xf_Value *args, size_t argc) {
 
     int wrote = 0;
     if (valid) {
-        /*
-         * v1: write PNG regardless of extension.
-         * Easy to extend later to jpg/bmp/tga by sniffing path suffix.
-         */
-        wrote = stbi_write_png(path, (int)width, (int)height, 3, buf, (int)(width * 3));
+        wrote = img_write_by_path(path, (int)width, (int)height, buf);
     }
 
     free(buf);

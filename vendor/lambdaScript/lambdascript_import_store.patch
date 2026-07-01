@@ -1,0 +1,602 @@
+--- /mnt/data/work_ls/orig/include/ls.h	2026-06-27 18:14:13.412593721 +0000
++++ /mnt/data/work_ls/include/ls.h	2026-06-27 18:13:45.673769714 +0000
+@@ -43,6 +43,19 @@
+ 	const char *source_name;
+ 	size_t argc;
+ 	const char *const *argv;
++
++	/*
++	 * Global official-library directory used by:
++	 *
++	 *   import {math}
++	 *
++	 * When NULL, LambdaScript falls back to:
++	 *   1. $LAMBDASCRIPT_LIB_DIR
++	 *   2. $XDG_DATA_HOME/lambdascript/lib
++	 *   3. $HOME/.lambdascript/lib
++	 *   4. ./.lambdascript/lib
++	 */
++	const char *library_dir;
+ } ls_Options;
+ 
+ typedef struct {
+--- /mnt/data/work_ls/orig/src/ls.c	2026-06-27 18:14:13.405180236 +0000
++++ /mnt/data/work_ls/src/ls.c	2026-06-27 18:13:45.674702275 +0000
+@@ -26,6 +26,10 @@
+ static int buf_append_n(LsBuf *buf, const char *text, size_t len);
+ static int buf_append(LsBuf *buf, const char *text);
+ static char *read_file_text(const char *path);
++static int ls_is_ident_text(const char *s);
++static char *ls_default_library_dir(void);
++static char *canonicalize_path_or_keep(char *path);
++static int file_exists(const char *path);
+ 
+ 
+ typedef struct DefSeen DefSeen;
+@@ -42,6 +46,13 @@
+ 	ImportStack *next;
+ };
+ 
++typedef enum {
++	IMPORT_KIND_INVALID = -1,
++	IMPORT_KIND_NONE = 0,
++	IMPORT_KIND_FILE = 1,
++	IMPORT_KIND_OFFICIAL = 2
++} ImportKind;
++
+ static void defseen_free_all(DefSeen *seen) {
+ 	DefSeen *next;
+ 	while (seen != NULL) {
+@@ -242,17 +253,28 @@
+ 	return 1;
+ }
+ 
+-static int parse_import_line(const char *trimmed, char **out_path) {
++static char *dup_span(const char *start, size_t len) {
++	char *copy = (char *)malloc(len + 1);
++
++	if (copy == NULL) {
++		return NULL;
++	}
++
++	memcpy(copy, start, len);
++	copy[len] = '\0';
++	return copy;
++}
++
++static ImportKind parse_import_line(const char *trimmed, char **out_target) {
+ 	const char *p = trimmed;
+ 	const char *start;
+ 	const char *end;
+-	size_t len;
+-	char *path;
++	char *target;
+ 
+-	*out_path = NULL;
++	*out_target = NULL;
+ 
+ 	if (strncmp(p, "import", 6) != 0 || !isspace((unsigned char)p[6])) {
+-		return 0;
++		return IMPORT_KIND_NONE;
+ 	}
+ 
+ 	p += 6;
+@@ -260,46 +282,80 @@
+ 		p++;
+ 	}
+ 
+-	if (*p != '"') {
+-		return -1;
+-	}
+-	p++;
+-	start = p;
++	if (*p == '"') {
++		p++;
++		start = p;
+ 
+-	while (*p != '\0' && *p != '"') {
+-		if (*p == '\\' && p[1] != '\0') {
+-			p += 2;
+-			continue;
++		while (*p != '\0' && *p != '"') {
++			if (*p == '\\' && p[1] != '\0') {
++				p += 2;
++				continue;
++			}
++			p++;
++		}
++
++		if (*p != '"') {
++			return IMPORT_KIND_INVALID;
+ 		}
++
++		end = p;
+ 		p++;
+-	}
+ 
+-	if (*p != '"') {
+-		return -1;
++		while (*p != '\0' && isspace((unsigned char)*p)) {
++			p++;
++		}
++		if (*p != '\0') {
++			return IMPORT_KIND_INVALID;
++		}
++
++		target = dup_span(start, (size_t)(end - start));
++		if (target == NULL) {
++			err_set("out of memory");
++			return IMPORT_KIND_INVALID;
++		}
++
++		*out_target = target;
++		return IMPORT_KIND_FILE;
+ 	}
+ 
+-	end = p;
+-	p++;
++	if (*p == '{') {
++		p++;
++		while (*p != '\0' && isspace((unsigned char)*p)) {
++			p++;
++		}
+ 
+-	while (*p != '\0' && isspace((unsigned char)*p)) {
++		start = p;
++		while (*p != '\0' && pp_is_ident_part_byte((unsigned char)*p)) {
++			p++;
++		}
++		end = p;
++
++		while (*p != '\0' && isspace((unsigned char)*p)) {
++			p++;
++		}
++		if (*p != '}' || !pp_is_ident_span(start, (size_t)(end - start))) {
++			return IMPORT_KIND_INVALID;
++		}
+ 		p++;
+-	}
+ 
+-	if (*p != '\0') {
+-		return -1;
+-	}
++		while (*p != '\0' && isspace((unsigned char)*p)) {
++			p++;
++		}
++		if (*p != '\0') {
++			return IMPORT_KIND_INVALID;
++		}
+ 
+-	len = (size_t)(end - start);
+-	path = (char *)malloc(len + 1);
+-	if (path == NULL) {
+-		err_set("out of memory");
+-		return -1;
++		target = dup_span(start, (size_t)(end - start));
++		if (target == NULL) {
++			err_set("out of memory");
++			return IMPORT_KIND_INVALID;
++		}
++
++		*out_target = target;
++		return IMPORT_KIND_OFFICIAL;
+ 	}
+ 
+-	memcpy(path, start, len);
+-	path[len] = '\0';
+-	*out_path = path;
+-	return 1;
++	return IMPORT_KIND_INVALID;
+ }
+ 
+ static char *dirname_from_path(const char *path) {
+@@ -342,12 +398,30 @@
+ 	return out;
+ }
+ 
+-static char *resolve_import_path(const char *importing_name, const char *import_path) {
++static char *join_path_with_suffix(const char *dir, const char *name, const char *suffix) {
++	size_t dlen = strlen(dir);
++	size_t nlen = strlen(name);
++	size_t slen = strlen(suffix);
++	char *out = (char *)malloc(dlen + 1 + nlen + slen + 1);
++
++	if (out == NULL) {
++		return NULL;
++	}
++
++	memcpy(out, dir, dlen);
++	out[dlen] = '/';
++	memcpy(out + dlen + 1, name, nlen);
++	memcpy(out + dlen + 1 + nlen, suffix, slen);
++	out[dlen + 1 + nlen + slen] = '\0';
++	return out;
++}
++
++static char *resolve_user_import_path(const char *importing_name, const char *import_path) {
+ 	char *dir;
+ 	char *joined;
+ 
+ 	if (import_path[0] == '/') {
+-		return ls_strdup(import_path);
++		return canonicalize_path_or_keep(ls_strdup(import_path));
+ 	}
+ 
+ 	if (importing_name == NULL || importing_name[0] == '<') {
+@@ -368,15 +442,54 @@
+ 		return NULL;
+ 	}
+ 
+-#if defined(_POSIX_VERSION)
+-	resolved = realpath(joined, NULL);
+-	if (resolved != NULL) {
+-		free(joined);
+-		return resolved;
++	return canonicalize_path_or_keep(joined);
++}
++
++static char *resolve_official_import_path(const char *library_dir, const char *library_name) {
++	char *base_dir = NULL;
++	char *candidate = NULL;
++
++	if (!ls_is_ident_text(library_name)) {
++		err_set("invalid official library name '%s'", library_name);
++		return NULL;
+ 	}
+-#endif
+ 
+-	return joined;
++	if (library_dir == NULL || library_dir[0] == '\0') {
++		base_dir = ls_default_library_dir();
++		if (base_dir == NULL) {
++			err_set("out of memory");
++			return NULL;
++		}
++		library_dir = base_dir;
++	}
++
++	candidate = join_path_with_suffix(library_dir, library_name, ".ls");
++	if (candidate == NULL) {
++		free(base_dir);
++		err_set("out of memory");
++		return NULL;
++	}
++	if (file_exists(candidate)) {
++		free(base_dir);
++		return canonicalize_path_or_keep(candidate);
++	}
++	free(candidate);
++
++	candidate = join_path(library_dir, library_name);
++	if (candidate == NULL) {
++		free(base_dir);
++		err_set("out of memory");
++		return NULL;
++	}
++	if (file_exists(candidate)) {
++		free(base_dir);
++		return canonicalize_path_or_keep(candidate);
++	}
++	free(candidate);
++
++	err_set("official library '%s' not found in '%s'", library_name, library_dir);
++	free(base_dir);
++	return NULL;
+ }
+ 
+ static int import_stack_contains(const ImportStack *stack, const char *path) {
+@@ -391,6 +504,7 @@
+ 
+ static int preprocess_source_recursive(const char *source,
+                                        const char *source_name,
++                                       const char *library_dir,
+                                        int library_mode,
+                                        DefSeen **seen_defs,
+                                        const ImportStack *stack,
+@@ -402,6 +516,7 @@
+ 
+ static int preprocess_source_recursive(const char *source,
+                                        const char *source_name,
++                                       const char *library_dir,
+                                        int library_mode,
+                                        DefSeen **seen_defs,
+                                        const ImportStack *stack,
+@@ -451,11 +566,16 @@
+ 			}
+ 		} else {
+ 			import_kind = parse_import_line(trimmed, &import_path);
+-			if (import_kind == 1) {
+-				char *resolved = resolve_import_path(source_name, import_path);
++			if (import_kind == IMPORT_KIND_FILE || import_kind == IMPORT_KIND_OFFICIAL) {
++				char *resolved;
+ 				char *child_source;
+ 				ImportStack child_stack;
+ 
++				if (import_kind == IMPORT_KIND_FILE) {
++					resolved = resolve_user_import_path(source_name, import_path);
++				} else {
++					resolved = resolve_official_import_path(library_dir, import_path);
++				}
+ 				free(import_path);
+ 				import_path = NULL;
+ 
+@@ -480,7 +600,7 @@
+ 
+ 				child_stack.path = resolved;
+ 				child_stack.next = (ImportStack *)stack;
+-				ok = preprocess_source_recursive(child_source, resolved, 1, seen_defs, &child_stack, out);
++				ok = preprocess_source_recursive(child_source, resolved, library_dir, 1, seen_defs, &child_stack, out);
+ 				free(child_source);
+ 				free(resolved);
+ 				free(raw_line);
+@@ -488,7 +608,7 @@
+ 					return 0;
+ 				}
+ 			} else {
+-				if (import_kind < 0) {
++				if (import_kind == IMPORT_KIND_INVALID) {
+ 					err_set("%s:%zu: invalid import syntax", source_name != NULL ? source_name : "<input>", line_no);
+ 					free(raw_line);
+ 					return 0;
+@@ -537,7 +657,7 @@
+ 	return 1;
+ }
+ 
+-static char *preprocess_imports(const char *source, const char *source_name) {
++static char *preprocess_imports(const char *source, const char *source_name, const char *library_dir) {
+ 	LsBuf out = {0};
+ 	DefSeen *seen = NULL;
+ 	ImportStack root;
+@@ -545,7 +665,7 @@
+ 	root.path = source_name != NULL ? source_name : "<input>";
+ 	root.next = NULL;
+ 
+-	if (!preprocess_source_recursive(source, source_name, 0, &seen, &root, &out)) {
++	if (!preprocess_source_recursive(source, source_name, library_dir, 0, &seen, &root, &out)) {
+ 		defseen_free_all(seen);
+ 		free(out.data);
+ 		return NULL;
+@@ -680,6 +800,55 @@
+ 	return buffer;
+ }
+ 
++static char *ls_default_library_dir(void) {
++	const char *override = getenv("LAMBDASCRIPT_LIB_DIR");
++	const char *xdg = getenv("XDG_DATA_HOME");
++	const char *home = getenv("HOME");
++	char *dir;
++
++	if (override != NULL && override[0] != '\0') {
++		return ls_strdup(override);
++	}
++	if (xdg != NULL && xdg[0] != '\0') {
++		dir = join_path(xdg, "lambdascript/lib");
++		if (dir != NULL) {
++			return dir;
++		}
++	}
++	if (home != NULL && home[0] != '\0') {
++		dir = join_path(home, ".lambdascript/lib");
++		if (dir != NULL) {
++			return dir;
++		}
++	}
++	return ls_strdup(".lambdascript/lib");
++}
++
++static int file_exists(const char *path) {
++	FILE *fp = fopen(path, "rb");
++
++	if (fp == NULL) {
++		return 0;
++	}
++
++	fclose(fp);
++	return 1;
++}
++
++static char *canonicalize_path_or_keep(char *path) {
++#if defined(_POSIX_VERSION)
++	char *resolved;
++
++	resolved = realpath(path, NULL);
++	if (resolved != NULL) {
++		free(path);
++		return resolved;
++	}
++#endif
++
++	return path;
++}
++
+ static char *read_file_text(const char *path) {
+ 	FILE *fp;
+ 	char *source;
+@@ -1029,6 +1198,7 @@
+ 	options->source_name = NULL;
+ 	options->argc = 0;
+ 	options->argv = NULL;
++	options->library_dir = NULL;
+ }
+ 
+ void ls_result_init(ls_Result *result) {
+@@ -1083,7 +1253,7 @@
+ 	ls_result_free(result);
+ 
+ 	{
+-		char *preprocessed = preprocess_imports(source, options->source_name);
++		char *preprocessed = preprocess_imports(source, options->source_name, options->library_dir);
+ 		if (preprocessed == NULL) {
+ 			goto fail;
+ 		}
+--- /mnt/data/work_ls/orig/src/main.c	2026-06-27 18:14:13.413036471 +0000
++++ /mnt/data/work_ls/src/main.c	2026-06-27 18:13:45.675322224 +0000
+@@ -4,6 +4,8 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/stat.h>
++#include <sys/types.h>
+ 
+ extern char *ls_read_all_stream(FILE *fp);
+ 
+@@ -21,6 +23,112 @@
+ 	return 1;
+ }
+ 
++static char *main_strdup(const char *src) {
++	size_t len;
++	char *copy;
++
++	if (src == NULL) {
++		return NULL;
++	}
++
++	len = strlen(src);
++	copy = (char *)malloc(len + 1);
++	if (copy == NULL) {
++		return NULL;
++	}
++
++	memcpy(copy, src, len + 1);
++	return copy;
++}
++
++static char *join_path(const char *left, const char *right) {
++	size_t llen = strlen(left);
++	size_t rlen = strlen(right);
++	char *path = (char *)malloc(llen + 1 + rlen + 1);
++
++	if (path == NULL) {
++		return NULL;
++	}
++
++	memcpy(path, left, llen);
++	path[llen] = '/';
++	memcpy(path + llen + 1, right, rlen);
++	path[llen + 1 + rlen] = '\0';
++	return path;
++}
++
++static int ensure_directory_exists(const char *path) {
++	char *copy;
++	char *p;
++
++	if (path == NULL || path[0] == '\0') {
++		return 0;
++	}
++
++	copy = main_strdup(path);
++	if (copy == NULL) {
++		return 0;
++	}
++
++	for (p = copy + 1; *p != '\0'; p++) {
++		struct stat st;
++
++		if (*p != '/') {
++			continue;
++		}
++
++		*p = '\0';
++		if (copy[0] != '\0' && stat(copy, &st) != 0) {
++			if (mkdir(copy, 0755) != 0 && errno != EEXIST) {
++				free(copy);
++				return 0;
++			}
++		}
++		*p = '/';
++	}
++
++	{
++		struct stat st;
++
++		if (stat(copy, &st) != 0) {
++			if (mkdir(copy, 0755) != 0 && errno != EEXIST) {
++				free(copy);
++				return 0;
++			}
++		}
++	}
++
++	free(copy);
++	return 1;
++}
++
++static char *default_library_dir(void) {
++	const char *override = getenv("LAMBDASCRIPT_LIB_DIR");
++	const char *xdg = getenv("XDG_DATA_HOME");
++	const char *home = getenv("HOME");
++	char *path;
++
++	if (override != NULL && override[0] != '\0') {
++		return main_strdup(override);
++	}
++
++	if (xdg != NULL && xdg[0] != '\0') {
++		path = join_path(xdg, "lambdascript/lib");
++		if (path != NULL) {
++			return path;
++		}
++	}
++
++	if (home != NULL && home[0] != '\0') {
++		path = join_path(home, ".lambdascript/lib");
++		if (path != NULL) {
++			return path;
++		}
++	}
++
++	return main_strdup(".lambdascript/lib");
++}
++
+ static void usage(const char *argv0) {
+ 	fprintf(stderr, "usage: %s [-q] [-t] [-n STEPS] [-e EXPR] [FILE] [-- ARGS...]\n", argv0);
+ 	fprintf(stderr, "\n");
+@@ -36,6 +144,8 @@
+ 	fprintf(stderr, "program format:\n");
+ 	fprintf(stderr, "  one definition per line: NAME = EXPR\n");
+ 	fprintf(stderr, "  final non-definition line is the program expression\n");
++	fprintf(stderr, "  imports: import {LIB} for official libs, import \"path/to/file\" for user files\n");
++	fprintf(stderr, "  official libs live in $LAMBDASCRIPT_LIB_DIR or ~/.lambdascript/lib\n");
+ 	fprintf(stderr, "  script args are exposed as ARG1, ARG2, ..., ARGC, and ARGS\n");
+ 	fprintf(stderr, "  logic aliases: ~ or ⌐ or ¬, -> or →, <-> or <=> or ↔ or ≣\n");
+ 	fprintf(stderr, "  math aliases: sqrt or √, ln or ㏑, inf or infinity or ∞, euler or ℯ\n");
+@@ -48,6 +158,8 @@
+ 	fprintf(stderr, "  %s -e 'ID = \\\\x.x\nID z'\n", argv0);
+ 	fprintf(stderr, "  %s file.ls alpha beta\n", argv0);
+ 	fprintf(stderr, "  %s -e 'ARG1' -- alpha\n", argv0);
++	fprintf(stderr, "  %s -e 'import {math}\\nmath_id'\n", argv0);
++	fprintf(stderr, "  %s -e 'import \"./shared/list.ls\"\\nmain'\n", argv0);
+ }
+ 
+ 
+@@ -57,6 +169,7 @@
+ 	const char *const *script_argv = NULL;
+ 	size_t script_argc = 0;
+ 	char *stdin_source = NULL;
++	char *library_dir = NULL;
+ 	ls_State *L = NULL;
+ 	ls_Options options;
+ 	ls_Result result;
+@@ -138,8 +251,20 @@
+ 		return 1;
+ 	}
+ 
++	library_dir = default_library_dir();
++	if (library_dir == NULL) {
++		fprintf(stderr, "fatal: out of memory\n");
++		return 1;
++	}
++	if (!ensure_directory_exists(library_dir)) {
++		fprintf(stderr, "fatal: failed to create library store '%s'\n", library_dir);
++		free(library_dir);
++		return 1;
++	}
++
+ 	options.argc = script_argc;
+ 	options.argv = script_argv;
++	options.library_dir = library_dir;
+ 	if (expr != NULL) {
+ 		options.source_name = "<eval>";
+ 	} else if (file_path != NULL) {

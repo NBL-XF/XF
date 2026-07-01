@@ -1,0 +1,11 @@
+.Dd June 29, 2026
+.Dt XF-GC 7
+.Os
+.Sh NAME
+.Nm xf-gc
+.Nd XF garbage-collection and cleanup support
+.Sh DESCRIPTION
+XF includes a GC and cleanup layer used by runtime values and VM-managed objects.
+The source tree exposes GC statistics and threshold checks, indicating an explicit memory-management subsystem rather than ad hoc freeing alone.
+.Sh SEE ALSO
+.Xr xf-vm 7

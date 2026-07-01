@@ -1,0 +1,9 @@
+; symbolic math forms for LambdaScript
+
+LIST3 = \a b c.cons a (cons b (cons c nil))
+
+SIGMA_EX = Σ i = 0 to N . mul i i
+INTEGRAL_EX = Integral x = 0 to 1 . mul x x
+LIMIT_EX = lim x -> 0 . div (sin x) x
+
+LIST3 SIGMA_EX INTEGRAL_EX LIMIT_EX

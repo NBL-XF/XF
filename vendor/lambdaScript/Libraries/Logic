@@ -1,0 +1,3 @@
+NAND = \p.\q. NOT (AND p q)
+NOR  = \p.\q. NOT (OR p q)
+XOR  = \p.\q. NOT (p <=> q)

@@ -1,0 +1,24 @@
+import "Table/loader.xf"
+
+arr rows = [
+  {"id": 1, "name": "user1", "age": 19, "score": 33, "_checked": 1, "_parallel": 1},
+  {"id": 2, "name": "user2", "age": 30, "score": 2,  "_checked": 1, "_parallel": 1},
+  {"id": 3, "name": "user3", "age": 21, "score": 55, "_checked": 1, "_parallel": 1}
+]
+
+map t0 = table_from_tree(rows)
+print table_headers(t0)
+print table_column(t0, "name")
+print table_column(t0, "_checked")
+
+map t1 = table_set_headers(t0, ["user_id", "full_name", "age_years", "points"])
+print table_headers(t1)
+print table_column(t1, "_parallel")
+
+map t2 = table_filter(t1, fn(map row) {
+    return row["points"] >= 30
+})
+
+map t3 = table_sort(t2, "points", "desc")
+
+print table_render(t3)

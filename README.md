@@ -1,26 +1,29 @@
 # XF
 
-A practical, AWK-inspired scripting language for text processing, structured data transformation, regex workflows, dataset manipulation, and concurrent chunk processing. XF compiles to a bytecode VM and ships with a REPL, a multithreaded record dispatcher, SIMD-accelerated field splitting, and a rich standard library.
+XF is a practical programmable scripting language for text processing, structured data transformation, regex workflows, dataset manipulation, orchestration, and concurrent chunk processing. It compiles to a bytecode VM and ships with a REPL, a multithreaded record dispatcher, SIMD-accelerated field splitting, and a rich standard library.
+
+In the broader stack, **ByteLang** is the programmable low-level substrate with very few ready-made abstractions, **XF** is the batteries-included workflow language for real scripts and data pipelines, and **LambdaScript** is the tiny symbolic reduction engine for logic and lambda-calculus work. XF is the layer that ties practical scripting, structure, and runtime tooling together.
 
 ---
 
 ## Table of Contents
 
 1. [Why XF](#why-xf)
-2. [Building](#building)
-3. [CLI Usage](#cli-usage)
-4. [REPL](#repl)
-5. [Language Basics](#language-basics)
-6. [Types](#types)
-7. [Runtime States](#runtime-states)
-8. [Variables](#variables)
-9. [Functions](#functions)
-10. [Expressions and Operators](#expressions-and-operators)
-11. [Collections](#collections)
-12. [Shorthand Syntax](#shorthand-syntax)
-13. [AWK-style Record Processing](#awk-style-record-processing)
-14. [Concurrency — spawn / join](#concurrency--spawn--join)
-15. [Standard Library](#standard-library)
+2. [XF in the Language Stack](#xf-in-the-language-stack)
+3. [Building](#building)
+4. [CLI Usage](#cli-usage)
+5. [REPL](#repl)
+6. [Language Basics](#language-basics)
+7. [Types](#types)
+8. [Runtime States](#runtime-states)
+9. [Variables](#variables)
+10. [Functions](#functions)
+11. [Expressions and Operators](#expressions-and-operators)
+12. [Collections](#collections)
+13. [Shorthand Syntax](#shorthand-syntax)
+14. [AWK-style Record Processing](#awk-style-record-processing)
+15. [Concurrency — spawn / join](#concurrency--spawn--join)
+16. [Standard Library](#standard-library)
     - [core.math](#coremath)
     - [core.str](#corestr)
     - [core.regex](#coreregex)
@@ -32,30 +35,57 @@ A practical, AWK-inspired scripting language for text processing, structured dat
     - [core.edit](#coreedit)
     - [core.img](#coreimg)
     - [core.lambda](#corelambda)
-16. [Common Algorithms](#common-algorithms)
-17. [Worked Examples](#worked-examples)
-18. [Tips](#tips)
-19. [Troubleshooting](#troubleshooting)
-20. [Known Limitations](#known-limitations)
+17. [Common Algorithms](#common-algorithms)
+18. [Worked Examples](#worked-examples)
+19. [Tips](#tips)
+20. [Troubleshooting](#troubleshooting)
+21. [Known Limitations](#known-limitations)
 
 ---
 
 ## Why XF
 
-XF is built for scripts where structure, data flow, and observability matter.
+XF is built for scripts where structure, data flow, and observability matter — and where you want more built-in leverage than ByteLang's deliberately minimal surface, without dropping all the way down to raw C.
 
 It works especially well for:
 
 - CSV and line-based record processing
 - regex-heavy transformation pipelines
 - turning raw rows into structured maps
-- collection filtering and mapping
-- grouping, sorting, and flattening datasets
+- collection filtering, mapping, grouping, and flattening
+- file, shell, and editing workflows
 - splitting work into parallel chunks
 - experimenting in a REPL before committing to a full script
-- running LambdaScript (untyped lambda calculus) expressions from within a data pipeline
+- using LambdaScript as a symbolic sub-language inside a larger practical script
 
-XF is concise and explicit. Runtime states make failures visible without exceptions.
+A useful way to think about it:
+
+- **ByteLang** is for hand-rolled abstraction, programmable syntax, and staying close to the machine.
+- **XF** is for practical scripting with ready-made structure, standard modules, record processing, and orchestration.
+- **LambdaScript** is for symbolic reduction, logic, and lambda-calculus expressions.
+
+XF is concise and explicit. Runtime states make failures visible without exceptions, and the standard library gives you a lot of practical surface area without forcing you into a large framework.
+
+---
+
+## XF in the Language Stack
+
+The three languages are complementary, not interchangeable.
+
+```text
+C / native runtime
+├── ByteLang      -> programmable substrate, minimal built-in abstraction
+├── XF            -> practical scripting, data pipelines, orchestration
+└── LambdaScript  -> symbolic reduction, logic, model expressions
+```
+
+In practice:
+
+- **ByteLang** is the place to hand-roll abstraction layers, experiment with custom syntax, and mix low-level control with higher-level helpers you define yourself.
+- **XF** is the place to process records, shape datasets, run regex workflows, orchestrate files and commands, and build readable production scripts quickly.
+- **LambdaScript** is the small symbolic blade: a tiny lambda-calculus core for reduction experiments, Church encodings, logic, and model structure.
+
+Today, XF already exposes LambdaScript directly through `core.lambda`. ByteLang is currently documented as a sibling language in the broader toolkit rather than an embedded XF module. That means the README should distinguish **what XF is good at now** from the wider design direction of the stack.
 
 ---
 
@@ -865,17 +895,17 @@ core.img.unvectorize(img, "out.png")
 
 ### core.lambda
 
-Evaluates LambdaScript (untyped lambda calculus) expressions from within XF scripts. The evaluator uses de Bruijn indices and a normal-order reducer.
+Evaluates LambdaScript (untyped lambda calculus) expressions from within XF scripts. This is the symbolic/small-core side of the stack: LambdaScript handles reduction, logic, Church encodings, and model expressions while XF handles orchestration around it.
 
 ```xf
 # evaluate a lambda expression and get the reduced string
-str result = core.lambda.eval("(\\x.x) z")
+str result = core.lambda.eval("(\x.x) z")
 
 # evaluate from a file
 str result = core.lambda.file("church.ls")
 
 # get full result map
-map r = core.lambda.run("(\\x.x) z")
+map r = core.lambda.run("(\x.x) z")
 # r: {ok, output, trace, steps, reached_limit, error}
 
 map r = core.lambda.run_file("church.ls")
@@ -887,11 +917,35 @@ print(r["trace"])
 
 Optional arguments: `core.lambda.eval(source, max_steps, use_prelude)`.
 
-The prelude (enabled by default) defines `I`, `K`, `S`, `TRUE`, `FALSE`, `AND`, `OR`, `NOT`, `IMP`, `IFF`.
+The prelude (enabled by default) defines `I`, `K`, `S`, `TRUE`, `FALSE`, `AND`, `OR`, `NOT`, `IMP`, and `IFF`.
 
-Both `\` and Unicode `λ` are accepted as lambda binders.
+Accepted LambdaScript syntax includes:
+
+```ls
+\x.x
+λx.x
+
+~TRUE
+⌐TRUE
+¬TRUE
+
+TRUE ^ FALSE
+TRUE v FALSE
+TRUE -> FALSE
+TRUE <-> FALSE
+TRUE <=> FALSE
+
+TRUE ∧ FALSE
+TRUE ∨ FALSE
+TRUE → FALSE
+TRUE ↔ FALSE
+TRUE ≣ FALSE
+```
+
+That means XF can host both the ASCII and Unicode operator spellings documented in the LambdaScript README.
 
 ---
+
 
 ## Common Algorithms
 
@@ -1142,3 +1196,19 @@ print(core.regex.test("AAAB", /a.*b/i))
 ```
 
 **Worker function not running in parallel** — `core.process.run` only creates pthreads for native functions. XF-language functions run inline. Use `-j N` with `spawn`/`join` for language-level parallelism, or `core.process.run` for native-only parallel chunks.
+
+---
+
+## Known Limitations
+
+XF is practical, but it is not trying to collapse the whole stack into one language.
+
+Current boundaries to keep in mind:
+
+- **ByteLang-style programmable syntax is not XF's main job.** XF has a rich surface and shorthand syntax, but it is not the intentionally low-abstraction substrate that ByteLang is aiming to be.
+- **LambdaScript remains the symbolic specialist.** Use `core.lambda` when you want reduction, Church encodings, or logic-calculus style expressions rather than trying to recreate that style directly in XF.
+- **`core.process.run` only creates pthread workers for native functions.** XF-language workers execute inline on the calling thread.
+- **Record-parallel execution requires care with shared globals.** XF provides the runtime machinery, but script design still matters.
+- **The README describes a large standard-library surface.** Some modules are naturally more mature than others as the runtime evolves.
+
+The practical rule of thumb is: use ByteLang when you want to design the abstraction layer, use XF when you want to get practical work done with structure and tooling, and use LambdaScript when the problem is fundamentally symbolic.

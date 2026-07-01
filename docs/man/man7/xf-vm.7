@@ -1,0 +1,27 @@
+.Dd June 29, 2026
+.Dt XF-VM 7
+.Os
+.Sh NAME
+.Nm xf-vm
+.Nd XF virtual machine and execution model
+.Sh DESCRIPTION
+XF compiles parsed source into a VM-oriented intermediate form and then executes it in a runtime that supports scalar values, collections, formatting, records, and core built-ins.
+.Sh RUNTIME FEATURES
+.Bl -bullet
+.It
+stack-based or opcode-driven execution
+.It
+special record-processing variables
+.It
+core built-in namespaces
+.It
+garbage-collection support
+.It
+optional multithreaded helpers
+.It
+SIMD support in selected code paths
+.El
+.Sh SEE ALSO
+.Xr xf-lang 7 ,
+.Xr xf-gc 7 ,
+.Xr xf-mt 7

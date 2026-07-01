@@ -1,0 +1,195 @@
+--- a/src/core/process.c
++++ b/src/core/process.c
+@@ -1,21 +1,32 @@
+ // process.c
+ #include "internal.h"
++#include "../../include/vm.h"
++#include "../../include/mt.h"
+ 
+ typedef struct {
+-    xf_fn_t  *fn;
+-    xf_arr_t *chunk;
+-    xf_Value  result;
+-    bool      done;
++    xf_fn_t        *fn;
++    xf_arr_t       *chunk;
++    VM             *vm;
++    xf_fn_caller_t  caller;
++    void           *syms;
++    xf_Value        result;
++    bool            done;
+ } ProcCtx;
+ 
+ static void *cp_thread_fn(void *arg) {
+     ProcCtx *ctx = (ProcCtx *)arg;
+     xf_Value chunk_val = xf_val_ok_arr(ctx->chunk);
++
++    if (ctx->caller && ctx->vm) {
++        core_set_fn_caller(ctx->vm, ctx->syms, ctx->caller);
++    }
+ 
+     if (!ctx->fn) {
+         ctx->result = xf_val_null();
+     } else if (ctx->fn->is_native && ctx->fn->native_v) {
+         ctx->result = ctx->fn->native_v(&chunk_val, 1);
++    } else if (ctx->caller && ctx->vm) {
++        ctx->result = ctx->caller(ctx->vm, ctx->syms, ctx->fn, &chunk_val, 1);
+     } else {
+         ctx->result = xf_val_nav(XF_TYPE_FN);
+     }
+@@ -287,10 +298,18 @@
+     xf_Str *k_fn = xf_str_from_cstr("fn");
+     xf_Str *k_data = xf_str_from_cstr("data");
+ 
++    VM *coord_vm = (VM *)core_get_fn_caller_vm();
++    xf_fn_caller_t caller = core_get_fn_caller();
++    void *root_syms = core_get_root_syms();
++    xf_pool_t *owned_pool = NULL;
++
++    if (coord_vm && caller && !coord_vm->pool && nw > 1) {
++        owned_pool = xf_pool_create(coord_vm, (int)nw);
++    }
++
+     for (size_t i = 0; i < nw; i++) {
+         xf_Value wv = workers->items[i];
+         if (wv.state != XF_STATE_OK || wv.type != XF_TYPE_MAP || !wv.data.map) {
+-            ctxs[i].fn = NULL;
+             ctxs[i].chunk = xf_arr_new();
+             ctxs[i].result = xf_val_nav(XF_TYPE_MAP);
+             ctxs[i].done = true;
+@@ -305,8 +324,11 @@
+         xf_fn_t *fn = (fv.state == XF_STATE_OK && fv.type == XF_TYPE_FN) ? fv.data.fn : NULL;
+         xf_arr_t *data = (dv.state == XF_STATE_OK && dv.type == XF_TYPE_ARR) ? dv.data.arr : NULL;
+ 
+-        ctxs[i].fn = fn;
++        ctxs[i].fn = fn ? xf_fn_retain(fn) : NULL;
+         ctxs[i].chunk = data ? (xf_arr_retain(data), data) : xf_arr_new();
++        ctxs[i].vm = NULL;
++        ctxs[i].caller = caller;
++        ctxs[i].syms = root_syms;
+         ctxs[i].done = false;
+         ctxs[i].result = xf_val_null();
+         tids[i] = 0;
+@@ -314,22 +336,34 @@
+         xf_value_release(fv);
+         xf_value_release(dv);
+ 
+-        if (!fn) {
++        if (!ctxs[i].chunk) {
++            ctxs[i].result = xf_val_nav(XF_TYPE_ARR);
++            ctxs[i].done = true;
++            continue;
++        }
++
++        if (!ctxs[i].fn) {
+             ctxs[i].result = xf_val_nav(XF_TYPE_FN);
+             ctxs[i].done = true;
+             continue;
+         }
+ 
+-        if (!fn->is_native) {
+-            xf_fn_caller_t caller = core_get_fn_caller();
+-            void *vm = core_get_fn_caller_vm();
+-            void *sy = core_get_root_syms();
+-
++        if (!coord_vm || !caller) {
+             xf_Value cv = xf_val_ok_arr(ctxs[i].chunk);
+-            ctxs[i].result = (caller && vm)
+-                ? caller(vm, sy, fn, &cv, 1)
++            ctxs[i].result = ctxs[i].fn->is_native && ctxs[i].fn->native_v
++                ? ctxs[i].fn->native_v(&cv, 1)
+                 : xf_val_nav(XF_TYPE_FN);
+-
++            xf_value_release(cv);
++            ctxs[i].done = true;
++            continue;
++        }
++
++        ctxs[i].vm = vm_clone(coord_vm, coord_vm->pool);
++        if (!ctxs[i].vm) {
++            xf_Value cv = xf_val_ok_arr(ctxs[i].chunk);
++            ctxs[i].result = ctxs[i].fn->is_native && ctxs[i].fn->native_v
++                ? ctxs[i].fn->native_v(&cv, 1)
++                : caller(coord_vm, root_syms, ctxs[i].fn, &cv, 1);
+             xf_value_release(cv);
+             ctxs[i].done = true;
+             continue;
+@@ -340,38 +374,51 @@
+         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+ 
+         if (pthread_create(&tids[i], &attr, cp_thread_fn, &ctxs[i]) != 0) {
+-            tids[i] = 0;
+-            ctxs[i].result = xf_val_null();
++            xf_Value cv = xf_val_ok_arr(ctxs[i].chunk);
++            core_set_fn_caller(coord_vm, root_syms, caller);
++            ctxs[i].result = ctxs[i].fn->is_native && ctxs[i].fn->native_v
++                ? ctxs[i].fn->native_v(&cv, 1)
++                : caller(coord_vm, root_syms, ctxs[i].fn, &cv, 1);
++            xf_value_release(cv);
++            vm_clone_free(ctxs[i].vm);
++            ctxs[i].vm = NULL;
+             ctxs[i].done = true;
+         }
+ 
+         pthread_attr_destroy(&attr);
+     }
+-// process.c
+-// replace the final result loop in cp_run()
+-
+-xf_arr_t *out = xf_arr_new();
+-for (size_t i = 0; i < nw; i++) {
+-    if (tids[i]) {
+-        pthread_join(tids[i], NULL);
+-    }
+-
+-    xf_arr_push(out, ctxs[i].result);
+-    xf_value_release(ctxs[i].result);
+-
+-    if (ctxs[i].chunk) {
+-        xf_arr_release(ctxs[i].chunk);
+-    }
+-}
+-
+-xf_str_release(k_fn);
+-xf_str_release(k_data);
+-free(ctxs);
+-free(tids);
+-
+-xf_Value v = xf_val_ok_arr(out);
+-xf_arr_release(out);
+-return v;
++
++    xf_arr_t *out = xf_arr_new();
++    for (size_t i = 0; i < nw; i++) {
++        if (tids[i]) {
++            pthread_join(tids[i], NULL);
++        }
++
++        xf_arr_push(out, ctxs[i].result);
++        xf_value_release(ctxs[i].result);
++
++        if (ctxs[i].vm) {
++            vm_clone_free(ctxs[i].vm);
++        }
++        if (ctxs[i].fn) {
++            xf_fn_release(ctxs[i].fn);
++        }
++        if (ctxs[i].chunk) {
++            xf_arr_release(ctxs[i].chunk);
++        }
++    }
++
++    xf_str_release(k_fn);
++    xf_str_release(k_data);
++    if (owned_pool) {
++        xf_pool_destroy(owned_pool);
++    }
++    free(ctxs);
++    free(tids);
++
++    xf_Value v = xf_val_ok_arr(out);
++    xf_arr_release(out);
++    return v;
+ }
+ 
+ xf_module_t *build_process(void) {

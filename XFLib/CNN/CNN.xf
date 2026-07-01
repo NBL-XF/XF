@@ -1,0 +1,309 @@
+map fn cnn_sample(map x, num label) {
+    return {
+        "x": x,
+        "label": label
+    }
+}
+
+map fn cnn_init(num filters, num classes, num scale) {
+    arr kernels = []
+    num f = 0
+    while (f < filters) {
+        push(kernels, tensor_rand([3, 3], scale))
+        f = f + 1
+    }
+
+    return {
+        "__kind": "CNN",
+        "filters": filters,
+        "classes": classes,
+        "kernels": kernels,
+        "kb": tensor_zeros([filters]),
+        "W": tensor_rand([classes, filters], scale),
+        "b": tensor_zeros([classes])
+    }
+}
+
+map fn cnn_conv_single(map img, map kernel, num bias) {
+    num h = img["shape"][0]
+    num w = img["shape"][1]
+    num oh = h - 2
+    num ow = w - 2
+
+    map z = tensor_zeros([oh, ow])
+    map a = tensor_zeros([oh, ow])
+    num sum_a = 0
+
+    num y = 0
+    while (y < oh) {
+        num x = 0
+        while (x < ow) {
+            num s = bias
+            num ky = 0
+            while (ky < 3) {
+                num kx = 0
+                while (kx < 3) {
+                    s = s + tensor_get2(kernel, ky, kx) * tensor_get2(img, y + ky, x + kx)
+                    kx = kx + 1
+                }
+                ky = ky + 1
+            }
+
+            tensor_set2(z, y, x, s)
+
+            if (s > 0) {
+                tensor_set2(a, y, x, s)
+                sum_a = sum_a + s
+            } else {
+                tensor_set2(a, y, x, 0)
+            }
+
+            x = x + 1
+        }
+        y = y + 1
+    }
+
+    num g = 0
+    if (oh * ow > 0) {
+        g = sum_a / (oh * ow)
+    }
+
+    return {
+        "z": z,
+        "a": a,
+        "g": g,
+        "oh": oh,
+        "ow": ow
+    }
+}
+
+map fn cnn_forward(map model, map img) {
+    num filters = model["filters"]
+    num classes = model["classes"]
+    map feats = tensor_zeros([filters])
+    arr conv = []
+
+    num f = 0
+    while (f < filters) {
+        map one = cnn_conv_single(img, model["kernels"][f], tensor_get1(model["kb"], f))
+        tensor_set1(feats, f, one["g"])
+        push(conv, one)
+        f = f + 1
+    }
+
+    map logits = tensor_zeros([classes])
+    num c = 0
+    while (c < classes) {
+        num s = tensor_get1(model["b"], c)
+        f = 0
+        while (f < filters) {
+            s = s + tensor_get2(model["W"], c, f) * tensor_get1(feats, f)
+            f = f + 1
+        }
+        tensor_set1(logits, c, s)
+        c = c + 1
+    }
+
+    map probs = tensor_softmax1(logits)
+    num pred = tensor_argmax1(probs)
+
+    return {
+        "feats": feats,
+        "conv": conv,
+        "logits": logits,
+        "probs": probs,
+        "pred": pred,
+        "confidence": tensor_get1(probs, pred)
+    }
+}
+
+map fn cnn_predict(map model, map img) {
+    return cnn_forward(model, img)
+}
+
+map fn cnn_train_one(map model, map img, num label, num lr) {
+    map fw = cnn_forward(model, img)
+    map feats = fw["feats"]
+    arr conv = fw["conv"]
+    map probs = fw["probs"]
+    num filters = model["filters"]
+    num classes = model["classes"]
+
+    map dlogits = tensor_clone(probs)
+    tensor_set1(dlogits, label, tensor_get1(dlogits, label) - 1)
+
+    num loss = -core.math.ln(tensor_get1(probs, label) + 0.000000001)
+    map dg = tensor_zeros([filters])
+
+    num c = 0
+    while (c < classes) {
+        num f = 0
+        while (f < filters) {
+            num oldw = tensor_get2(model["W"], c, f)
+            tensor_set1(dg, f, tensor_get1(dg, f) + tensor_get1(dlogits, c) * oldw)
+            tensor_set2(model["W"], c, f, oldw - lr * tensor_get1(dlogits, c) * tensor_get1(feats, f))
+            f = f + 1
+        }
+
+        tensor_set1(model["b"], c, tensor_get1(model["b"], c) - lr * tensor_get1(dlogits, c))
+        c = c + 1
+    }
+
+    num f = 0
+    while (f < filters) {
+        map cache = conv[f]
+        map z = cache["z"]
+        num oh = cache["oh"]
+        num ow = cache["ow"]
+        num area = oh * ow
+        num scale = 0
+
+        if (area > 0) {
+            scale = tensor_get1(dg, f) / area
+        }
+
+        map gk = tensor_zeros([3, 3])
+        num gb = 0
+
+        num y = 0
+        while (y < oh) {
+            num x = 0
+            while (x < ow) {
+                num dz = 0
+                if (tensor_get2(z, y, x) > 0) {
+                    dz = scale
+                }
+
+                gb = gb + dz
+
+                num ky = 0
+                while (ky < 3) {
+                    num kx = 0
+                    while (kx < 3) {
+                        tensor_set2(
+                            gk,
+                            ky,
+                            kx,
+                            tensor_get2(gk, ky, kx) + dz * tensor_get2(img, y + ky, x + kx)
+                        )
+                        kx = kx + 1
+                    }
+                    ky = ky + 1
+                }
+
+                x = x + 1
+            }
+            y = y + 1
+        }
+
+        num ky2 = 0
+        while (ky2 < 3) {
+            num kx2 = 0
+            while (kx2 < 3) {
+                tensor_set2(
+                    model["kernels"][f],
+                    ky2,
+                    kx2,
+                    tensor_get2(model["kernels"][f], ky2, kx2) - lr * tensor_get2(gk, ky2, kx2)
+                )
+                kx2 = kx2 + 1
+            }
+            ky2 = ky2 + 1
+        }
+
+        tensor_set1(model["kb"], f, tensor_get1(model["kb"], f) - lr * gb)
+        f = f + 1
+    }
+
+    num correct = 0
+    if (fw["pred"] == label) {
+        correct = 1
+    }
+
+    return {
+        "loss": loss,
+        "pred": fw["pred"],
+        "confidence": fw["confidence"],
+        "correct": correct
+    }
+}
+
+map fn cnn_evaluate(map model, arr samples) {
+    num hits = 0
+    num n = 0
+    num conf_sum = 0
+    num correct_conf_sum = 0
+
+    for (sample in samples) {
+        map fw = cnn_forward(model, sample["x"])
+        num pred = fw["pred"]
+        num conf = fw["confidence"]
+
+        conf_sum = conf_sum + conf
+        if (pred == sample["label"]) {
+            hits = hits + 1
+            correct_conf_sum = correct_conf_sum + conf
+        }
+        n = n + 1
+    }
+
+    num acc = 0
+    num avg_conf = 0
+    num avg_correct_conf = 0
+
+    if (n > 0) {
+        acc = hits / n
+        avg_conf = conf_sum / n
+    }
+
+    if (hits > 0) {
+        avg_correct_conf = correct_conf_sum / hits
+    }
+
+    return {
+        "count": n,
+        "hits": hits,
+        "acc": acc,
+        "avg_confidence": avg_conf,
+        "avg_correct_confidence": avg_correct_conf
+    }
+}
+
+map fn cnn_train(map model, arr samples, num epochs, num lr) {
+    num epoch = 0
+
+    while (epoch < epochs) {
+        num total_loss = 0
+        num hits = 0
+        num seen = 0
+        num conf_sum = 0
+
+        for (sample in samples) {
+            map step = cnn_train_one(model, sample["x"], sample["label"], lr)
+            total_loss = total_loss + step["loss"]
+            hits = hits + step["correct"]
+            conf_sum = conf_sum + step["confidence"]
+            seen = seen + 1
+        }
+
+        num train_loss = 0
+        num train_acc = 0
+        num avg_conf = 0
+
+        if (seen > 0) {
+            train_loss = total_loss / seen
+            train_acc = hits / seen
+            avg_conf = conf_sum / seen
+        }
+
+        print "cnn epoch " .. (epoch + 1) ..
+              " loss " .. train_loss ..
+              " acc " .. train_acc ..
+              " avg_conf " .. avg_conf ..
+              " seen " .. seen
+
+        epoch = epoch + 1
+    }
+
+    return model
+}

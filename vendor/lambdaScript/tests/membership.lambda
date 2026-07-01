@@ -1,0 +1,8 @@
+SHOW = \b.b True False
+A = \t f.t
+SET = \x.OR (x True False) FALSE
+XS = CONS A (CONS A NIL)
+P_MEMBER = \x.elem x SET
+P_TRUE_ONLY = \x.x True False
+P_NOT_FALSE = \x.NOT (x False True)
+CONS (SHOW (A ∈ SET)) (CONS (SHOW (A memberof SET)) (CONS (SHOW (SET ∋ A)) (CONS (SHOW (SET ∍ A)) (CONS (SHOW (∀ x in XS. P_MEMBER x)) (CONS (SHOW (∃ x in XS. P_MEMBER x)) (CONS (SHOW (Ǝ x in XS. P_TRUE_ONLY x)) (CONS (SHOW (ǝ x in XS. P_NOT_FALSE x)) NIL)))))))
